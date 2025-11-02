@@ -1,5 +1,0 @@
-# Git attributes for handling file-specific merge strategies
-
-# version.env should use "ours" strategy during rebase to avoid conflicts
-# This allows clean rebasing while preserving the latest version information
-version.env merge=ours
