@@ -53,6 +53,9 @@ type deviceCodeResponse struct {
 	Message         string `json:"message"`
 }
 
+// DeviceCodeResponse is the public version of deviceCodeResponse
+type DeviceCodeResponse = deviceCodeResponse
+
 // FetchDeviceCode returns a device code for the user to input to authenticate
 //
 // Used for the OAuth2 device code grant

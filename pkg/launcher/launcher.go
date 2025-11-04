@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/dilllxd/theboyslauncher/internal/meta"
 	"github.com/dilllxd/theboyslauncher/internal/network"
@@ -68,15 +69,127 @@ type DownloadingEvent struct {
 // PostProcessingEvent is called when, usually Forge, pre-processing begins.
 type PostProcessingEvent struct{}
 
-// A Runner is a controller which manages the starting of the game.
-type Runner func(cmd *exec.Cmd) error
+// LaunchStartedEvent is called when the game launch process begins
+type LaunchStartedEvent struct{}
 
-// An ConsoleRunner is an implementation of Runner which logs game output to the console.
-func ConsoleRunner(cmd *exec.Cmd) error {
+// JavaDownloadEvent is called when Java is being downloaded
+type JavaDownloadEvent struct {
+	Progress int
+	Total    int
+}
+
+// FileDownloadEvent is called for individual file downloads
+type FileDownloadEvent struct {
+	Filename string
+	Progress int
+	Total    int
+}
+
+// LaunchCompletedEvent is called when the game successfully launches
+type LaunchCompletedEvent struct{}
+
+// A Runner is a controller which manages the starting of the game.
+type Runner interface {
+	Run(cmd *exec.Cmd) error
+}
+
+// ConsoleRunner is an implementation of Runner which logs game output to the console.
+type ConsoleRunner struct{}
+
+// NewConsoleRunner creates a new ConsoleRunner.
+func NewConsoleRunner() *ConsoleRunner {
+	return &ConsoleRunner{}
+}
+
+// Run implements the Runner interface for console execution.
+func (cr *ConsoleRunner) Run(cmd *exec.Cmd) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// GuiRunner runs a command silently without showing a console window and tracks the process.
+type GuiRunner struct {
+	Process *exec.Cmd
+}
+
+// NewGuiRunner creates a new GuiRunner.
+func NewGuiRunner() *GuiRunner {
+	return &GuiRunner{}
+}
+
+// Run implements the Runner interface for silent execution without console window.
+func (gr *GuiRunner) Run(cmd *exec.Cmd) error {
+	gr.Process = cmd
+
+	// Platform-specific process configuration
+	configureProcessAttributes(cmd)
+
+	// Redirect stdout/stderr to prevent console output
+	// On Unix systems, this helps detach from terminal
+	// On Windows, this is handled by CREATE_NO_WINDOW
+	if runtime.GOOS != "windows" {
+		// Redirect output to null device to hide console output
+		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err == nil {
+			cmd.Stdout = devNull
+			cmd.Stderr = devNull
+			// Don't set stdin as it might be needed for game input
+		}
+	}
+
+	// Start the process without waiting for it to complete
+	return cmd.Start()
+}
+
+// IsRunning returns true if the process is still running.
+func (gr *GuiRunner) IsRunning() bool {
+	if gr.Process == nil || gr.Process.Process == nil {
+		return false
+	}
+
+	// Cross-platform process status check
+	switch runtime.GOOS {
+	case "windows":
+		// On Windows, we can use the process exit code
+		// If the process has exited, ProcessState will be non-nil
+		return gr.Process.ProcessState == nil
+	case "linux", "darwin":
+		// On Unix-like systems, use signal 0 to check if process is alive
+		err := gr.Process.Process.Signal(syscall.Signal(0))
+		return err == nil
+	default:
+		// Default fallback - assume process is running if we can't determine status
+		return gr.Process.ProcessState == nil
+	}
+}
+
+// Kill terminates the running process.
+func (gr *GuiRunner) Kill() error {
+	if gr.Process == nil || gr.Process.Process == nil {
+		return nil
+	}
+
+	return gr.Process.Process.Kill()
+}
+
+// Wait waits for the process to complete.
+func (gr *GuiRunner) Wait() error {
+	if gr.Process == nil {
+		return nil
+	}
+
+	return gr.Process.Wait()
+}
+
+// Pid returns the process ID.
+func (gr *GuiRunner) Pid() int {
+	if gr.Process == nil || gr.Process.Process == nil {
+		return 0
+	}
+
+	return gr.Process.Process.Pid
 }
 
 // A LaunchEnvironment represents the information needed to start the game.
@@ -118,7 +231,7 @@ func Launch(launchEnv LaunchEnvironment, runner Runner) error {
 	javaArgs := append(launchEnv.JavaArgs, "-cp", strings.Join(launchEnv.Classpath, string(os.PathListSeparator)), launchEnv.MainClass)
 	cmd := exec.Command(launchEnv.Java, append(javaArgs, launchEnv.GameArgs...)...)
 	cmd.Dir = launchEnv.GameDir
-	return runner(cmd)
+	return runner.Run(cmd)
 }
 
 // Prepare prepares the instance to be launched, returning a LaunchEnvironment, with the provided options and sends events to watcher.
@@ -455,3 +568,4 @@ func copyFile(src, dst string) error {
 
 	return os.Chmod(dst, sourceInfo.Mode())
 }
+

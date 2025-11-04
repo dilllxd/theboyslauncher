@@ -13,7 +13,7 @@ import (
 
 // An Instance represents a full installation of Minecraft and its information.
 type Instance struct {
-	Name          string         `toml:"-" json:"-"`
+	Name          string         `toml:"-" json:"name"`
 	GameVersion   string         `toml:"game_version" json:"game_version"`
 	Loader        Loader         `toml:"mod_loader" json:"mod_loader"`
 	LoaderVersion string         `toml:"mod_loader_version,omitempty" json:"mod_loader_version,omitempty"`
@@ -42,17 +42,20 @@ func (inst *Instance) Rename(new string) error {
 	return nil
 }
 
+// WindowResolution represents the game window resolution
+type WindowResolution struct {
+	Width  int `toml:"width" json:"width"`
+	Height int `toml:"height" json:"height"`
+}
+
 // InstanceConfig represents the configurable values of an Instance.
 type InstanceConfig struct {
-	WindowResolution struct {
-		Width  int `toml:"width" json:"width"`
-		Height int `toml:"height" json:"height"`
-	} `toml:"resolution" json:"resolution"                comment:"Game window resolution"`
-	Java      string `toml:"java" json:"java"             comment:"Path to a Java executable. If blank, a Mojang-provided JVM will be downloaded."`
-	JavaArgs  string `toml:"java_args" json:"java_args"   comment:"Extra arguments to pass to the JVM"`
-	CustomJar string `toml:"custom_jar" json:"custom_jar" comment:"Path to a custom JAR to use instead of the normal Minecraft client"`
-	MinMemory int    `toml:"min_memory" json:"min_memory" comment:"Minimum game memory, in MB"`
-	MaxMemory int    `toml:"max_memory" json:"max_memory" comment:"Maximum game memory, in MB"`
+	WindowResolution WindowResolution `toml:"resolution" json:"resolution"                comment:"Game window resolution"`
+	Java            string          `toml:"java" json:"java"             comment:"Path to a Java executable. If blank, a Mojang-provided JVM will be downloaded."`
+	JavaArgs        string          `toml:"java_args" json:"java_args"   comment:"Extra arguments to pass to the JVM"`
+	CustomJar       string          `toml:"custom_jar" json:"custom_jar" comment:"Path to a custom JAR to use instead of the normal Minecraft client"`
+	MinMemory       int             `toml:"min_memory" json:"min_memory" comment:"Minimum game memory, in MB"`
+	MaxMemory       int             `toml:"max_memory" json:"max_memory" comment:"Maximum game memory, in MB"`
 
 	// Packwiz modpack information
 	Packwiz PackwizInfo `toml:"packwiz,omitempty" json:"packwiz,omitempty"`
@@ -126,6 +129,15 @@ func RemoveInstance(name string) error {
 		return fmt.Errorf("remove instance directory: %w", err)
 	}
 	return nil
+}
+
+// RenameInstance renames an instance to a new name.
+func RenameInstance(oldName string, newName string) error {
+	inst, err := FetchInstance(oldName)
+	if err != nil {
+		return err
+	}
+	return inst.Rename(newName)
 }
 
 // FetchInstance retrieves the instance with the specified name.

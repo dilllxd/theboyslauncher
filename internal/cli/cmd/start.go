@@ -224,5 +224,5 @@ func (c *StartCmd) Run(ctx *kong.Context, verbosity int) error {
 		}
 	}
 
-	return launcher.Launch(launchEnv, launcher.ConsoleRunner)
+	return launcher.Launch(launchEnv, launcher.NewConsoleRunner())
 }

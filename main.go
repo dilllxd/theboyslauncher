@@ -1,11 +1,15 @@
+//go:build !gui
+
 package main
 
 import (
+	"os"
+
 	"github.com/dilllxd/theboyslauncher/internal/cli"
 )
 
 func main() {
 	// Parse and run the main CLI.
-	exiter, code := cli.Run()
-	exiter(code)
+	_, code := cli.Run()
+	os.Exit(code)
 }

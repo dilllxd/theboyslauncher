@@ -1,0 +1,45 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "theboyslauncher",
+  "outputfilename": "theboyslauncher-gui",
+  "frontend": {
+    "dir": "./frontend_new",
+    "install": "echo 'No dependencies needed'",
+    "build": "echo 'Frontend built'",
+    "dev": "echo 'Frontend dev mode'",
+    "package": {
+      "manager": "npm"
+    }
+  },
+  "backend": {
+    "go": {
+      "main": "./main_gui.go",
+      "ldflags": "-s -w"
+    }
+  },
+  "author": {
+    "name": "Dylan",
+    "email": "support@dylanh.dev"
+  },
+  "info": {
+    "companyName": "Dylan",
+    "productName": "TheBoysLauncher",
+    "productVersion": "1.5.0",
+    "copyright": "Copyright 2025 Dylan. Based on cmd-launcher by telecter",
+    "comments": "A minimal Minecraft launcher with GUI support"
+  },
+  "nsisType": "multiple",
+  "obfuscated": false,
+  "garbleargs": "",
+  "upx": false,
+  "upxflags": "",
+  "runNonNativeBuildHooks": false,
+  "buildMode": "",
+  "windows": {
+    "info": {
+      "productName": "TheBoysLauncher"
+    },
+    "icon": "build/windows/icon.ico"
+  },
+  "icon": "build/appicon.png"
+}

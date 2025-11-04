@@ -1,0 +1,2934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://modpacks.dylan.lol">
+    <title>TheBoysLauncher</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0E0E10 0%, #1A1A1D 100%);
+            color: #E4E4E7;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+
+        .sidebar {
+            width: 280px;
+            background: #1A1A1D;
+            border-right: 1px solid #2A2A2D;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 30px;
+            font-family: 'Courier New', monospace;
+            font-size: 18px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 20px;
+        }
+
+        .nav {
+            list-style: none;
+            flex: 1;
+        }
+
+        .nav li {
+            margin-bottom: 8px;
+        }
+
+        .nav button {
+            width: 100%;
+            padding: 12px 16px;
+            background: transparent;
+            border: 1px solid #2A2A2D;
+            border-radius: 8px;
+            color: #A1A1AA;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-align: left;
+        }
+
+        .nav button:hover {
+            background: #232326;
+            border-color: #3EB489;
+            color: #E4E4E7;
+            transform: translateY(-1px);
+        }
+
+        .nav button.active {
+            background: #3EB489;
+            border-color: #3EB489;
+            color: white;
+        }
+
+        .create-btn {
+            width: 100%;
+            padding: 12px 16px;
+            background: linear-gradient(135deg, #3EB489 0%, #22C55E 100%);
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin-top: 20px;
+        }
+
+        .create-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(62, 180, 137, 0.4);
+        }
+
+        .account-section {
+            margin-top: 20px;
+            border-top: 1px solid #2A2A2D;
+            padding-top: 20px;
+        }
+
+        .account-switcher {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            background: #1F1F23;
+            border: 1px solid #2A2A2D;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .account-switcher:hover {
+            background: #2A2A2D;
+            border-color: #3EB489;
+        }
+
+        .account-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #3EB489;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            color: white;
+            flex-shrink: 0;
+        }
+
+        .account-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .account-username {
+            font-weight: 600;
+            color: #E4E4E7;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: 14px;
+        }
+
+        .account-status {
+            font-size: 12px;
+            color: #9CA3AF;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .account-dropdown {
+            color: #6B7280;
+            font-size: 12px;
+            transition: transform 0.2s ease;
+        }
+
+        .account-switcher:hover .account-dropdown {
+            transform: rotate(180deg);
+        }
+
+        .main {
+            flex: 1;
+            padding: 30px;
+            overflow-y: auto;
+        }
+
+        .header {
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            color: #A1A1AA;
+            font-size: 16px;
+        }
+
+        .instances-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .instance-card {
+            background: #1A1A1D;
+            border: 1px solid #2A2A2D;
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.2s ease;
+        }
+
+        .instance-card:hover {
+            transform: translateY(-2px);
+            border-color: #3EB489;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        }
+
+        .instance-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 15px;
+        }
+
+        .instance-name {
+            font-size: 18px;
+            font-weight: 600;
+            color: #E4E4E7;
+        }
+
+        .instance-status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .status-running {
+            background: #22C55E;
+            color: white;
+        }
+
+        .status-stopped {
+            background: #232326;
+            color: #A1A1AA;
+            border: 1px solid #2A2A2D;
+        }
+
+        .instance-info {
+            color: #A1A1AA;
+            font-size: 14px;
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }
+
+        .instance-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .instance-actions .btn {
+            font-size: 12px;
+            padding: 6px 12px;
+            min-width: 80px;
+            justify-content: center;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #2A2A2D;
+            border-radius: 6px;
+            background: transparent;
+            color: #E4E4E7;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn:hover {
+            background: #232326;
+        }
+
+        .btn-primary {
+            background: #3EB489;
+            border-color: #3EB489;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #349876;
+        }
+
+        .btn-danger {
+            color: #EF4444;
+            border-color: #EF4444;
+        }
+
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.1);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+        }
+
+        .empty-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+
+        .empty-title {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .empty-text {
+            color: #A1A1AA;
+            margin-bottom: 30px;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 99999;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal[style*="flex"] {
+            display: flex !important;
+        }
+
+        .modal-content {
+            background: #1A1A1D;
+            border: 1px solid #2A2A2D;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 500px;
+            width: 90%;
+            min-width: 400px;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+        }
+
+        .modal-header {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #A1A1AA;
+        }
+
+        .form-input, .form-select {
+            width: 100%;
+            padding: 10px 12px;
+            background: #232326;
+            border: 1px solid #2A2A2D;
+            border-radius: 6px;
+            color: #E4E4E7;
+            font-size: 14px;
+        }
+
+        .form-input:focus, .form-select:focus {
+            outline: none;
+            border-color: #3EB489;
+            box-shadow: 0 0 0 3px rgba(62, 180, 137, 0.1);
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 30px;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #A1A1AA;
+        }
+
+        /* Progress Modal Styles */
+        .progress-container {
+            min-width: 400px;
+        }
+
+        .progress-info {
+            margin-bottom: 20px;
+        }
+
+        .progress-stage {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 8px;
+        }
+
+        .progress-message {
+            font-size: 14px;
+            color: #888;
+            margin-bottom: 12px;
+        }
+
+        .progress-percentage {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--text-primary);
+            text-align: right;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--accent));
+            width: 0%;
+            transition: width 0.3s ease;
+            border-radius: 4px;
+        }
+
+        .progress-details {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .progress-step-info {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 4px;
+        }
+
+        .progress-file {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: monospace;
+            word-break: break-all;
+        }
+
+        /* Account Manager Styles */
+        .account-modal-content {
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .account-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #2A2A2D;
+        }
+
+        .account-tab {
+            background: none;
+            border: none;
+            color: #9CA3AF;
+            padding: 12px 20px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s ease;
+        }
+
+        .account-tab:hover {
+            color: #E4E4E7;
+            background: rgba(62, 180, 137, 0.1);
+        }
+
+        .account-tab.active {
+            color: #3EB489;
+            border-bottom-color: #3EB489;
+        }
+
+        .account-tab-content {
+            margin-top: 20px;
+        }
+
+        .accounts-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .account-item {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 15px;
+            background: #1F1F23;
+            border: 2px solid #2A2A2D;
+            border-radius: 8px;
+            transition: all 0.2s ease;
+            position: relative;
+        }
+
+        .account-item:hover {
+            border-color: #3EB489;
+            background: #2A2A2D;
+        }
+
+        .account-item.active {
+            border-color: #3EB489;
+            background: rgba(62, 180, 137, 0.1);
+        }
+
+        .account-item-avatar {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #3EB489 0%, #22C55E 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            color: white;
+            flex-shrink: 0;
+        }
+
+        .account-item-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .account-item-username {
+            font-weight: 600;
+            color: #E4E4E7;
+            font-size: 16px;
+            margin-bottom: 4px;
+        }
+
+        .account-item-details {
+            font-size: 12px;
+            color: #9CA3AF;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .account-item-status {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #10B981;
+        }
+
+        .status-indicator.warning {
+            background: #F59E0B;
+        }
+
+        .account-item-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .account-btn {
+            background: none;
+            border: 1px solid #2A2A2D;
+            color: #9CA3AF;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s ease;
+        }
+
+        .account-btn:hover {
+            background: #2A2A2D;
+            border-color: #3EB489;
+            color: #E4E4E7;
+        }
+
+        .account-btn.primary {
+            background: #3EB489;
+            border-color: #3EB489;
+            color: white;
+        }
+
+        .account-btn.danger {
+            border-color: #EF4444;
+            color: #EF4444;
+        }
+
+        .account-btn.danger:hover {
+            background: #EF4444;
+            color: white;
+        }
+
+        .add-account-options {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .account-option-btn {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 20px;
+            background: #1F1F23;
+            border: 2px solid #2A2A2D;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            width: 100%;
+            text-align: left;
+        }
+
+        .account-option-btn:hover {
+            border-color: #3EB489;
+            background: #2A2A2D;
+            transform: translateY(-2px);
+        }
+
+        .account-option-icon {
+            font-size: 32px;
+            width: 60px;
+            height: 60px;
+            background: #2A2A2D;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .account-option-content {
+            flex: 1;
+        }
+
+        .account-option-title {
+            font-weight: 600;
+            color: #E4E4E7;
+            font-size: 16px;
+            margin-bottom: 4px;
+        }
+
+        .account-option-desc {
+            font-size: 14px;
+            color: #9CA3AF;
+        }
+
+        /* Microsoft Login Modal Styles */
+        .login-instructions h3 {
+            color: #E4E4E7;
+            margin-bottom: 15px;
+        }
+
+        .login-instructions p {
+            margin-bottom: 10px;
+            color: #9CA3AF;
+        }
+
+        .device-code-display {
+            background: #1F1F23;
+            border: 2px solid #3EB489;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 15px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .device-code-display code {
+            font-family: 'Courier New', monospace;
+            font-size: 18px;
+            color: #3EB489;
+            font-weight: bold;
+            flex: 1;
+        }
+
+        .login-progress {
+            margin-top: 20px;
+            padding: 15px;
+            background: #1F1F23;
+            border-radius: 8px;
+            border: 1px solid #2A2A2D;
+        }
+
+        .login-progress p {
+            margin: 0;
+            color: #E4E4E7;
+        }
+
+        /* Form Styles */
+        .form-input {
+            width: 100%;
+            padding: 12px;
+            background: #1F1F23;
+            border: 2px solid #2A2A2D;
+            border-radius: 8px;
+            color: #E4E4E7;
+            font-size: 14px;
+            margin: 10px 0;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: #3EB489;
+            background: #2A2A2D;
+        }
+
+        .help-text {
+            font-size: 12px;
+            color: #9CA3AF;
+            margin-top: 5px;
+        }
+
+        .btn-small {
+            padding: 4px 8px;
+            font-size: 12px;
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            color: #9CA3AF;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+        }
+
+        .close-btn:hover {
+            color: #E4E4E7;
+            background: #2A2A2D;
+        }
+
+        .device-url-display {
+            background: #2A2A2D;
+            border: 1px solid #3A3A3D;
+            border-radius: 6px;
+            padding: 12px;
+            margin: 10px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .device-url-display code {
+            background: none;
+            padding: 0;
+            color: #3EB489;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            flex: 1;
+            word-break: break-all;
+        }
+
+        /* Settings Styles */
+        .settings-container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .settings-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #2A2A2D;
+        }
+
+        .settings-tab {
+            background: none;
+            border: none;
+            color: #9CA3AF;
+            padding: 12px 20px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s ease;
+            border-radius: 8px 8px 0 0;
+        }
+
+        .settings-tab:hover {
+            color: #E4E4E7;
+            background: rgba(62, 180, 137, 0.1);
+        }
+
+        .settings-tab.active {
+            color: #3EB489;
+            border-bottom-color: #3EB489;
+            background: rgba(62, 180, 137, 0.05);
+        }
+
+        .settings-tab-content {
+            margin-top: 20px;
+        }
+
+        .settings-section {
+            background: #2A2A2D;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .settings-section h3 {
+            margin: 0 0 20px 0;
+            color: #E4E4E7;
+            font-size: 18px;
+            font-weight: 600;
+            border-bottom: 1px solid #3A3A3D;
+            padding-bottom: 10px;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            font-weight: 500;
+            margin-bottom: 8px;
+        }
+
+        .checkbox-label input[type="checkbox"] {
+            margin-right: 12px;
+            width: 18px;
+            height: 18px;
+            accent-color: #3EB489;
+        }
+
+        .settings-actions {
+            display: flex;
+            gap: 15px;
+            margin-top: 30px;
+            padding: 20px;
+            background: #2A2A2D;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="logo">
+                <div class="logo-icon">
+                <img src="./icon.png" alt="Launcher Icon" style="width: 40px; height: 40px; border-radius: 8px;">
+            </div>
+                <div>TheBoys<br>Launcher</div>
+            </div>
+
+            <ul class="nav">
+                <li><button class="nav-btn active" data-view="instances">🎮 Instances</button></li>
+                <li><button class="nav-btn" data-view="browse">📦 Browse</button></li>
+                <li><button class="nav-btn" data-view="settings">⚙️ Settings</button></li>
+            </ul>
+
+            <!-- Account Switcher -->
+            <div class="account-section">
+                <div class="account-switcher" onclick="openAccountManager()">
+                    <div class="account-avatar" id="accountAvatar">👤</div>
+                    <div class="account-info">
+                        <div class="account-username" id="accountUsername">Offline</div>
+                        <div class="account-status" id="accountStatus">Click to login</div>
+                    </div>
+                    <div class="account-dropdown">▼</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="main" id="main">
+            <!-- Content will be loaded here -->
+        </div>
+    </div>
+
+    <!-- Create Instance Modal -->
+    <div class="modal" id="createModal">
+        <div class="modal-content">
+            <div class="modal-header">Create New Instance</div>
+
+            <div class="form-group">
+                <label class="form-label">Instance Name</label>
+                <input type="text" class="form-input" id="instanceName" placeholder="My Awesome World">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Minecraft Version</label>
+                <select class="form-select" id="minecraftVersion" onchange="loadModLoaderVersions()">
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Mod Loader</label>
+                <select class="form-select" id="modLoader" onchange="loadModLoaderVersions()">
+                    <option value="vanilla">Vanilla (No mods)</option>
+                    <option value="fabric">Fabric</option>
+                    <option value="forge">Forge</option>
+                    <option value="quilt">Quilt</option>
+                    <option value="neoforge">NeoForge</option>
+                </select>
+            </div>
+
+            <div class="form-group" id="modLoaderVersionGroup" style="display: none;">
+                <label class="form-label">Mod Loader Version</label>
+                <select class="form-select" id="modLoaderVersion">
+                    <option value="">Select mod loader version</option>
+                </select>
+            </div>
+
+            <div class="modal-actions">
+                <button class="btn" onclick="hideCreateInstance()">Cancel</button>
+                <button class="btn btn-primary" onclick="createInstance()">Create Instance</button>
+            </div>
+        </div>
+
+    <!-- Launch Progress Modal -->
+    <div class="modal" id="progressModal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Launching Instance</h3>
+            </div>
+            <div class="modal-body">
+                <div class="progress-container">
+                    <div class="progress-info">
+                        <div class="progress-stage" id="progressStage">Preparing...</div>
+                        <div class="progress-message" id="progressMessage">Getting ready to launch</div>
+                        <div class="progress-percentage" id="progressPercentage">0%</div>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <div class="progress-details" id="progressDetails" style="display: none;">
+                        <div class="progress-step-info">
+                            Step <span id="currentStep">0</span> of <span id="totalSteps">0</span>
+                        </div>
+                        <div class="progress-file" id="progressFile"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-danger" onclick="cancelLaunch()">Cancel Launch</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Account Manager Modal -->
+    <div class="modal" id="accountModal" style="display: none;">
+        <div class="modal-content account-modal-content">
+            <div class="modal-header">
+                Account Manager
+                <button class="close-btn" onclick="closeAccountManager()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="account-tabs">
+                    <button class="account-tab active" onclick="showAccountTab('accounts')">My Accounts</button>
+                    <button class="account-tab" onclick="showAccountTab('add')">Add Account</button>
+                </div>
+
+                <!-- Accounts Tab -->
+                <div id="accountsTab" class="account-tab-content">
+                    <div id="accountsList" class="accounts-list">
+                        <!-- Accounts will be populated here -->
+                    </div>
+                </div>
+
+                <!-- Add Account Tab -->
+                <div id="addTab" class="account-tab-content" style="display: none;">
+                    <div class="add-account-options">
+                        <button class="account-option-btn" onclick="startMicrosoftLogin()">
+                            <div class="account-option-icon">🔷</div>
+                            <div class="account-option-content">
+                                <div class="account-option-title">Microsoft Account</div>
+                                <div class="account-option-desc">Login with your Microsoft account</div>
+                            </div>
+                        </button>
+
+                        <button class="account-option-btn" onclick="showOfflineLogin()">
+                            <div class="account-option-icon">👤</div>
+                            <div class="account-option-content">
+                                <div class="account-option-title">Offline Mode</div>
+                                <div class="account-option-desc">Play offline with any username</div>
+                            </div>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Microsoft Login Modal -->
+    <div class="modal" id="microsoftLoginModal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                Microsoft Login
+                <button class="close-btn" onclick="closeMicrosoftLogin()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="loginInstructions" class="login-instructions">
+                    <h3>Microsoft Login</h3>
+                    <p><strong>To sign in:</strong></p>
+                    <p>1. Visit this website in your browser:</p>
+                    <div class="device-url-display">
+                        <code id="verificationUrl">Loading...</code>
+                        <button onclick="copyVerificationUrl()" class="btn btn-small">📋 Copy URL</button>
+                    </div>
+                    <p>2. Enter this code when prompted:</p>
+                    <div class="device-code-display">
+                        <code id="deviceCode">Loading...</code>
+                        <button onclick="copyDeviceCode()" class="btn btn-small">📋 Copy Code</button>
+                    </div>
+                    <p>3. Sign in to your Microsoft account</p>
+
+                    <button onclick="openMicrosoftLoginPage()" class="btn btn-primary">🌐 Open Login Page</button>
+
+                    <div class="login-progress">
+                        <p id="loginStatus">Waiting for you to sign in...</p>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeMicrosoftLogin()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Offline Login Modal -->
+    <div class="modal" id="offlineLoginModal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                Offline Mode
+                <button class="close-btn" onclick="closeOfflineLogin()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Enter a username for offline play:</p>
+                <input type="text" id="offlineUsername" placeholder="Enter username..." class="form-input" maxlength="16">
+                <p class="help-text">Note: You cannot join online servers in offline mode</p>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeOfflineLogin()">Cancel</button>
+                <button class="btn btn-primary" onclick="confirmOfflineLogin()">Login</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div class="modal" id="confirmModal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                Confirm Action
+                <button class="close-btn" onclick="closeConfirmModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="confirmMessage" class="confirm-message"></div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeConfirmModal()">Cancel</button>
+                <button class="btn btn-danger" id="confirmButton" onclick="executeConfirmCallback()">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global state
+        let currentView = 'instances';
+        let instances = [];
+        let statusRefreshInterval = null;
+
+        // Initialize the app
+        async function init() {
+            await loadInstances();
+            await loadMinecraftVersions();
+            await updateAccountDisplay(); // Initialize account display
+            showView('instances');
+            setupEventListeners();
+        }
+
+        // Setup event listeners
+        function setupEventListeners() {
+            // Navigation
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const view = btn.dataset.view;
+                    showView(view);
+
+                    // Update active state
+                    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                });
+            });
+        }
+
+        // View management
+        function showView(view) {
+            currentView = view;
+            const main = document.getElementById('main');
+
+            // Stop status refresh when leaving instances view
+            stopStatusRefresh();
+
+            switch(view) {
+                case 'instances':
+                    showInstances();
+                    break;
+                case 'browse':
+                    showBrowse();
+                    break;
+                case 'settings':
+                    showSettings();
+                    break;
+            }
+        }
+
+        // Load instances from backend
+        async function loadInstances() {
+            try {
+                if (!window.go || !window.go.main || !window.go.main.App) {
+                    console.log('Wails runtime not available yet, skipping instance load');
+                    instances = [];
+                    return;
+                }
+
+                const instanceData = await window.go.main.App.GetInstances();
+                const runningInstances = await window.go.main.App.GetRunningInstances() || [];
+
+                instances = instanceData.map(inst => ({
+                    name: inst.name,
+                    gameVersion: inst.game_version,
+                    modLoader: inst.mod_loader ? inst.mod_loader : 'Vanilla',
+                    running: Array.isArray(runningInstances) && runningInstances.includes(inst.name)
+                }));
+                            } catch (error) {
+                console.error('Failed to load instances:', error);
+                instances = [];
+            }
+        }
+
+        // Load Minecraft versions from backend
+        async function loadMinecraftVersions() {
+            try {
+                const versions = await window.go.main.App.GetMinecraftVersions({ release: true, snapshot: false, beta: false, alpha: false });
+                const versionSelect = document.getElementById('minecraftVersion');
+                versionSelect.innerHTML = '';
+
+                // Sort versions by release date (newest first)
+                versions.sort((a, b) => new Date(b.releaseTime) - new Date(a.releaseTime));
+
+                // Add versions to select
+                versions.forEach(version => {
+                    const option = document.createElement('option');
+                    option.value = version.id;
+                    option.textContent = version.id;
+                    versionSelect.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Failed to load Minecraft versions:', error);
+                // Fallback to common versions
+                const versionSelect = document.getElementById('minecraftVersion');
+                versionSelect.innerHTML = `
+                    <option value="1.20.1">1.20.1</option>
+                    <option value="1.20.0">1.20.0</option>
+                    <option value="1.19.4">1.19.4</option>
+                    <option value="1.19.3">1.19.3</option>
+                    <option value="1.19.2">1.19.2</option>
+                    <option value="1.18.2">1.18.2</option>
+                    <option value="1.18.1">1.18.1</option>
+                    <option value="1.17.1">1.17.1</option>
+                `;
+            }
+        }
+
+        // Load mod loader versions based on selected loader and Minecraft version
+        async function loadModLoaderVersions() {
+            const loader = document.getElementById('modLoader').value;
+            const mcVersion = document.getElementById('minecraftVersion').value;
+            const versionSelect = document.getElementById('modLoaderVersion');
+            const versionGroup = document.getElementById('modLoaderVersionGroup');
+
+            // Hide mod loader version selection for vanilla
+            if (loader === 'vanilla') {
+                versionGroup.style.display = 'none';
+                return;
+            }
+
+            versionGroup.style.display = 'block';
+            versionSelect.innerHTML = '<option value="">Loading...</option>';
+
+            try {
+                const versions = await window.go.main.App.GetLoaderVersions(loader, mcVersion);
+                versionSelect.innerHTML = '';
+
+                if (versions.length === 0) {
+                    versionSelect.innerHTML = '<option value="">No versions available</option>';
+                    return;
+                }
+
+                // Sort versions (usually newest first based on version parsing)
+                versions.sort((a, b) => {
+                    // Simple version comparison - can be improved
+                    const aNums = a.version.split('.').map(n => parseInt(n) || 0);
+                    const bNums = b.version.split('.').map(n => parseInt(n) || 0);
+                    for (let i = 0; i < Math.max(aNums.length, bNums.length); i++) {
+                        const aVal = aNums[i] || 0;
+                        const bVal = bNums[i] || 0;
+                        if (aVal !== bVal) return bVal - aVal; // descending order
+                    }
+                    return 0;
+                });
+
+                versions.forEach(version => {
+                    const option = document.createElement('option');
+                    option.value = version.version;
+                    option.textContent = `${version.version} ${version.recommended ? '(Recommended)' : ''}`;
+                    if (version.recommended) {
+                        option.selected = true;
+                    }
+                    versionSelect.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Failed to load mod loader versions:', error);
+                versionSelect.innerHTML = '<option value="">Failed to load versions</option>';
+            }
+        }
+
+        // Show instances view
+        function showInstances() {
+            const main = document.getElementById('main');
+
+            // Start auto-refresh for running status
+            startStatusRefresh();
+
+            if (instances.length === 0) {
+                main.innerHTML = `
+                    <div class="header" style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px;">
+                        <div>
+                            <h1>My Instances</h1>
+                            <p>Manage your Minecraft instances</p>
+                        </div>
+                        <button class="create-btn" onclick="showCreateInstance()" style="margin-top: 8px; width: auto;">➕ Create Instance</button>
+                    </div>
+                    <div class="empty-state">
+                        <div class="empty-icon">🎮</div>
+                        <div class="empty-title">No Instances Yet</div>
+                        <div class="empty-text">Create your first instance to get started!</div>
+                    </div>
+                `;
+                return;
+            }
+
+            const instancesHTML = instances.map(instance => `
+                <div class="instance-card">
+                    <div class="instance-header">
+                        <div class="instance-name">${instance.name}</div>
+                        <div class="instance-status ${instance.running ? 'status-running' : 'status-stopped'}">
+                            ${instance.running ? 'Running' : 'Stopped'}
+                        </div>
+                    </div>
+                    <div class="instance-info">
+                        Version: ${instance.gameVersion}<br>
+                        Mod Loader: ${instance.modLoader || 'Vanilla'}
+                    </div>
+                    <div class="instance-actions">
+                        ${instance.running ?
+                            `<button class="btn btn-danger" onclick="killInstance('${instance.name}')">
+                                ⛔ Kill
+                            </button>` :
+                            `<button class="btn btn-primary" onclick="launchInstance('${instance.name}')">
+                                Launch
+                            </button>`
+                        }
+                        <button class="btn" onclick="configureInstance('${instance.name}')" title="Configure instance settings">
+                            ⚙️ Settings
+                        </button>
+                        <button class="btn" onclick="showRenameInstanceModal('${instance.name}')" title="Rename instance">
+                            ✏️ Rename
+                        </button>
+                        <button class="btn btn-danger" onclick="deleteInstance('${instance.name}')" title="Delete instance" ${instance.running ? 'disabled' : ''}>
+                            🗑️ Delete
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+
+            main.innerHTML = `
+                <div class="header" style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px;">
+                    <div>
+                        <h1>My Instances</h1>
+                        <p>Manage your Minecraft instances</p>
+                    </div>
+                    <button class="create-btn" onclick="showCreateInstance()" style="margin-top: 8px; width: auto;">➕ Create Instance</button>
+                </div>
+                <div class="instances-grid">
+                    ${instancesHTML}
+                </div>
+            `;
+        }
+
+        // Show browse view
+        function showBrowse() {
+            const main = document.getElementById('main');
+            main.innerHTML = `
+                <div class="header">
+                    <h1>Browse Modpacks</h1>
+                    <p>Discover and install modpacks</p>
+                </div>
+                <div class="loading">
+                    <p>Loading modpacks...</p>
+                </div>
+            `;
+
+            loadModpacks();
+        }
+
+        // Show settings view
+        function showSettings() {
+            const main = document.getElementById('main');
+            main.innerHTML = `
+                <div class="header">
+                    <h1>Settings</h1>
+                    <p>Configure your launcher</p>
+                </div>
+                <div class="settings-container">
+                    <div class="settings-tabs">
+                        <button class="settings-tab active" onclick="showSettingsTab('global')">🌐 Global Settings</button>
+                        <button class="settings-tab" onclick="showSettingsTab('instances')">🎮 Instance Settings</button>
+                    </div>
+
+                    <!-- Global Settings Tab -->
+                    <div id="globalSettingsTab" class="settings-tab-content">
+                        <div class="settings-section">
+                            <h3>Java Settings</h3>
+                            <div class="form-group">
+                                <label class="form-label">Java Path (optional)</label>
+                                <input type="text" id="globalJavaPath" class="form-input" placeholder="Leave blank to use Mojang Java">
+                                <p class="help-text">Path to your Java executable. If blank, launcher will download Mojang-provided Java.</p>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label class="form-label">Default Min Memory (MB)</label>
+                                    <input type="number" id="globalMinMemory" class="form-input" min="512" max="16384">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Default Max Memory (MB)</label>
+                                    <input type="number" id="globalMaxMemory" class="form-input" min="512" max="16384">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="settings-section">
+                            <h3>Display Settings</h3>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label class="form-label">Default Window Width</label>
+                                    <input type="number" id="globalWindowWidth" class="form-input" min="640" max="3840">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Default Window Height</label>
+                                    <input type="number" id="globalWindowHeight" class="form-input" min="480" max="2160">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="settings-section">
+                            <h3>Launcher Behavior</h3>
+                            <div class="form-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="globalAutoUpdate">
+                                    <span class="checkmark"></span>
+                                    Enable automatic updates
+                                </label>
+                                <p class="help-text">Automatically check for and install launcher updates</p>
+                            </div>
+                            <div class="form-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="globalCloseOnLaunch">
+                                    <span class="checkmark"></span>
+                                    Close launcher on game launch
+                                </label>
+                                <p class="help-text">Automatically close the launcher when Minecraft starts</p>
+                            </div>
+                        </div>
+
+                        <div class="settings-actions">
+                            <button class="btn btn-primary" onclick="saveGlobalSettings()">💾 Save Global Settings</button>
+                            <button class="btn btn-secondary" onclick="resetGlobalSettings()">🔄 Reset to Defaults</button>
+                        </div>
+                    </div>
+
+                    <!-- Instance Settings Tab -->
+                    <div id="instanceSettingsTab" class="settings-tab-content" style="display: none;">
+                        <div class="settings-section">
+                            <h3>Select Instance</h3>
+                            <div class="form-group">
+                                <select id="instanceSelector" class="form-select" onchange="loadInstanceSettings()">
+                                    <option value="">Select an instance...</option>
+                                </select>
+                                <p class="help-text">Choose an instance to configure its specific settings</p>
+                            </div>
+                        </div>
+
+                        <div id="instanceSettingsContent" style="display: none;">
+                            <div class="settings-section">
+                                <h3>Java Settings</h3>
+                                <div class="form-group">
+                                    <label class="form-label">Java Path</label>
+                                    <input type="text" id="instanceJavaPath" class="form-input" placeholder="Override global Java path">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Java Arguments</label>
+                                    <input type="text" id="instanceJavaArgs" class="form-input" placeholder="Additional JVM arguments">
+                                    <p class="help-text">Extra arguments to pass to the JVM (e.g., -XX:+UseG1GC)</p>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label class="form-label">Min Memory (MB)</label>
+                                        <input type="number" id="instanceMinMemory" class="form-input" min="512" max="16384">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Max Memory (MB)</label>
+                                        <input type="number" id="instanceMaxMemory" class="form-input" min="512" max="16384">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="settings-section">
+                                <h3>Display Settings</h3>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label class="form-label">Window Width</label>
+                                        <input type="number" id="instanceWindowWidth" class="form-input" min="640" max="3840">
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label">Window Height</label>
+                                        <input type="number" id="instanceWindowHeight" class="form-input" min="480" max="2160">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="settings-actions">
+                                <button class="btn btn-primary" onclick="saveInstanceSettings()">💾 Save Instance Settings</button>
+                                <button class="btn btn-secondary" onclick="resetInstanceSettings()">🔄 Reset to Global Defaults</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Load settings when the view is shown
+            loadGlobalSettings();
+            loadInstancesForSettings();
+        }
+
+        // Load modpacks
+        async function loadModpacks() {
+            console.log('Starting to load modpacks...');
+            try {
+                console.log('Calling window.go.main.App.GetModpacks()...');
+                const modpacks = await window.go.main.App.GetModpacks();
+                console.log('GetModpacks returned:', modpacks);
+                displayModpacks(modpacks);
+            } catch (error) {
+                console.error('Failed to load modpacks:', error);
+                showNotification('Error loading modpacks: ' + error, 'error');
+                displayModpacks([]);
+            }
+        }
+
+        // Display modpacks
+        function displayModpacks(modpacks) {
+            const main = document.getElementById('main');
+
+            if (modpacks.length === 0) {
+                main.innerHTML = `
+                    <div class="header">
+                        <h1>Browse Modpacks</h1>
+                        <p>Discover and install modpacks</p>
+                    </div>
+                    <div class="empty-state">
+                        <div class="empty-icon">📦</div>
+                        <div class="empty-title">No Modpacks Available</div>
+                        <div class="empty-text">Unable to load modpacks. Please check your connection.</div>
+                    </div>
+                `;
+                return;
+            }
+
+            const modpacksHTML = modpacks.map(modpack => `
+                <div class="instance-card">
+                    <div class="instance-header">
+                        <div class="instance-name">${modpack.displayName || 'Unknown Modpack'}</div>
+                    </div>
+                    <div class="instance-info">
+                        by ${modpack.author || 'Unknown'}<br>
+                        ${modpack.description || 'No description available'}<br>
+                        <small>Tags: ${Array.isArray(modpack.tags) ? modpack.tags.join(', ') : 'None'}</small><br>
+                        <small>RAM: ${(modpack.minRam || 0) / 1024}GB min • Updated: ${modpack.lastUpdated || 'Unknown'}</small>
+                    </div>
+                    <div class="instance-actions">
+                        <button class="btn btn-primary" onclick="installModpack('${modpack.id}')">
+                            📦 Install
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+
+            main.innerHTML = `
+                <div class="header">
+                    <h1>Browse Modpacks</h1>
+                    <p>Discover and install modpacks</p>
+                </div>
+                <div class="instances-grid">
+                    ${modpacksHTML}
+                </div>
+            `;
+        }
+
+        // Instance actions
+        // Progress tracking
+        let progressInterval = null;
+
+        function showProgress(title = "Launching Instance") {
+            console.log('Showing progress overlay with title:', title);
+
+            // Remove ALL progress overlays and modals to prevent conflicts
+            document.querySelectorAll('[id*="progress"]').forEach(el => {
+                console.log('Removing element:', el.id);
+                el.remove();
+            });
+            document.querySelectorAll('.modal[id*="progress"]').forEach(el => {
+                console.log('Removing modal element:', el.id);
+                el.remove();
+            });
+
+            const overlay = document.createElement('div');
+            overlay.id = 'progressOverlay';
+            overlay.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0, 0, 0, 0.9);
+                z-index: 999999;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                font-family: system-ui, -apple-system, sans-serif;
+            `;
+
+            overlay.innerHTML = `
+                <div style="
+                    background: #1A1A1D;
+                    border: 1px solid #2A2A2D;
+                    border-radius: 12px;
+                    padding: 30px;
+                    max-width: 500px;
+                    width: 90%;
+                    min-width: 400px;
+                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+                    color: white;
+                ">
+                    <div style="font-size: 24px; font-weight: 600; margin-bottom: 20px; color: #3EB489;">
+                        ${title}
+                    </div>
+                    <div style="margin-bottom: 20px;">
+                        <div id="progressStage" style="font-size: 18px; font-weight: 600; color: #3EB489; margin-bottom: 8px;">Preparing...</div>
+                        <div id="progressMessage" style="font-size: 14px; color: #888; margin-bottom: 12px;">Getting ready to launch</div>
+                        <div id="progressPercentage" style="font-size: 24px; font-weight: bold; color: white; text-align: right;">0%</div>
+                    </div>
+                    <div style="
+                        width: 100%;
+                        height: 8px;
+                        background: rgba(255, 255, 255, 0.1);
+                        border-radius: 4px;
+                        overflow: hidden;
+                        margin-bottom: 16px;
+                    ">
+                        <div id="progressBar" style="
+                            height: 100%;
+                            background: linear-gradient(90deg, #3EB489, #FFD15C);
+                            width: 0%;
+                            transition: width 0.3s ease;
+                            border-radius: 4px;
+                        "></div>
+                    </div>
+                    <div id="progressDetails" style="display: none; background: rgba(255, 255, 255, 0.05); padding: 12px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.1);">
+                        <div style="font-size: 12px; color: #888; margin-bottom: 4px;">
+                            Step <span id="currentStep">0</span> of <span id="totalSteps">0</span>
+                        </div>
+                        <div id="progressFile" style="font-size: 12px; color: #AAA; font-family: monospace;"></div>
+                    </div>
+                    <div style="text-align: center; margin-top: 20px;">
+                        <button onclick="hideProgressOverlay()" style="
+                            background: #e74c3c;
+                            color: white;
+                            border: none;
+                            padding: 10px 20px;
+                            border-radius: 6px;
+                            cursor: pointer;
+                            font-size: 14px;
+                        ">Cancel</button>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(overlay);
+            console.log('Progress overlay created and appended to body');
+            console.log('Overlay dimensions:', overlay.offsetWidth, 'x', overlay.offsetHeight);
+
+            startProgressTracking();
+        }
+
+        function hideProgressOverlay() {
+            const overlay = document.getElementById('progressOverlay');
+            if (overlay) {
+                overlay.remove();
+            }
+            stopProgressTracking();
+        }
+
+        function hideProgress() {
+            document.getElementById('progressModal').style.display = 'none';
+            stopProgressTracking();
+        }
+
+        function startProgressTracking() {
+            console.log('Starting progress tracking...');
+            progressInterval = setInterval(async () => {
+                try {
+                    const progress = await window.go.main.App.GetLaunchProgress();
+                    console.log('Progress update:', progress);
+                    updateProgress(progress);
+                } catch (error) {
+                    console.error('Failed to get progress:', error);
+                }
+            }, 500); // Update every 500ms
+        }
+
+        function stopProgressTracking() {
+            if (progressInterval) {
+                clearInterval(progressInterval);
+                progressInterval = null;
+            }
+        }
+
+        function startStatusRefresh() {
+            // Clear existing interval
+            if (statusRefreshInterval) {
+                clearInterval(statusRefreshInterval);
+            }
+
+            // Only refresh if we're on the instances view
+            if (currentView !== 'instances') {
+                return;
+            }
+
+            // Refresh every 3 seconds
+            statusRefreshInterval = setInterval(async () => {
+                if (currentView === 'instances') {
+                    await loadInstances();
+                    showInstances();
+                }
+            }, 3000);
+        }
+
+        function stopStatusRefresh() {
+            if (statusRefreshInterval) {
+                clearInterval(statusRefreshInterval);
+                statusRefreshInterval = null;
+            }
+        }
+
+        function updateProgress(progress) {
+            console.log('Updating progress with data:', progress);
+
+            // Try to update the overlay first
+            const stageEl = document.getElementById('progressStage');
+            const messageEl = document.getElementById('progressMessage');
+            const percentageEl = document.getElementById('progressPercentage');
+            const barEl = document.getElementById('progressBar');
+
+            if (stageEl) stageEl.textContent = progress.stage || 'Unknown';
+            if (messageEl) messageEl.textContent = progress.message || 'Processing...';
+
+            // Make sure progress is a number and update both displays
+            const progressPercent = typeof progress.progress === 'number' ? progress.progress : 0;
+
+            console.log('Elements found:');
+            console.log('- stageEl:', !!stageEl);
+            console.log('- messageEl:', !!messageEl);
+            console.log('- percentageEl:', !!percentageEl);
+            console.log('- barEl:', !!barEl);
+            console.log('Progress percent:', progressPercent);
+
+            if (percentageEl) {
+                percentageEl.textContent = `${progressPercent}%`;
+                console.log('Percentage text set to:', percentageEl.textContent);
+            }
+            if (barEl) {
+                barEl.style.width = `${progressPercent}%`;
+                console.log('Bar width set to:', barEl.style.width);
+            }
+
+            console.log('Progress bar set to:', progressPercent + '%');
+
+            // Show detailed progress if available
+            if (progress.currentStep && progress.totalSteps) {
+                const detailsEl = document.getElementById('progressDetails');
+                const currentStepEl = document.getElementById('currentStep');
+                const totalStepsEl = document.getElementById('totalSteps');
+                const fileEl = document.getElementById('progressFile');
+
+                if (detailsEl) detailsEl.style.display = 'block';
+                if (currentStepEl) currentStepEl.textContent = progress.currentStep;
+                if (totalStepsEl) totalStepsEl.textContent = progress.totalSteps;
+                if (fileEl) fileEl.textContent = progress.fileName || '';
+            } else {
+                const detailsEl = document.getElementById('progressDetails');
+                if (detailsEl) detailsEl.style.display = 'none';
+            }
+
+            // Auto-hide when complete (optional)
+            if (progress.progress >= 100) {
+                setTimeout(() => {
+                    hideProgressOverlay();
+                }, 2000); // Hide after 2 seconds
+            }
+        }
+
+        async function cancelLaunch() {
+            let cancelMessage = 'Are you sure you want to cancel this operation?';
+
+            // If we're in the middle of creating/installing an instance, add cleanup warning
+            if (currentOperation && currentInstanceName) {
+                if (currentOperation === 'create') {
+                    cancelMessage = `Are you sure you want to cancel? The partially created instance "${currentInstanceName}" will be deleted.`;
+                } else if (currentOperation === 'install') {
+                    cancelMessage = `Are you sure you want to cancel? The partially installed instance "${currentInstanceName}" will be deleted.`;
+                }
+            }
+
+            showConfirmModal(
+                cancelMessage,
+                async () => {
+                    try {
+                        // Kill all running instances as a way to cancel the operation
+                        const runningInstances = await window.go.main.App.GetRunningInstances();
+
+                        for (const instanceName of runningInstances) {
+                            await window.go.main.App.KillInstance(instanceName);
+                        }
+
+                        // Clean up partially created/installed instance
+                        if (currentOperation && currentInstanceName) {
+                            console.log(`Cleaning up partially ${currentOperation}d instance: ${currentInstanceName}`);
+                            try {
+                                await window.go.main.App.DeleteInstance(currentInstanceName);
+                                showNotification(`Operation cancelled. Partial instance "${currentInstanceName}" has been cleaned up.`, 'info');
+                            } catch (cleanupError) {
+                                console.warn('Failed to clean up partial instance:', cleanupError);
+                                showNotification('Operation cancelled, but some files may remain.', 'warning');
+                            }
+                        } else {
+                            showNotification('Operation cancelled', 'info');
+                        }
+
+                        // Reset operation tracking
+                        currentOperation = null;
+                        currentInstanceName = null;
+
+                        hideProgress();
+                        await loadInstances();
+                        showInstances();
+                    } catch (error) {
+                        hideProgress();
+                        currentOperation = null;
+                        currentInstanceName = null;
+                        showNotification('Failed to cancel operation: ' + error, 'error');
+                    }
+                }
+            );
+        }
+
+        async function launchInstance(name) {
+            try {
+                if (!window.go || !window.go.main || !window.go.main.App) {
+                    showNotification('Wails runtime not available. Please refresh the page.', 'error');
+                    return;
+                }
+
+                // Check for active account first
+                let username = null;
+                try {
+                    const activeAccount = await window.go.main.App.GetActiveAccount();
+                    if (activeAccount) {
+                        username = activeAccount.username;
+                        console.log('Using active account:', username);
+                    }
+                } catch (error) {
+                    console.log('No active account found, will launch offline');
+                }
+
+                console.log('Launching instance:', name, 'with account:', username || 'offline');
+                showProgress();
+                await window.go.main.App.LaunchInstance(name, username || '');
+                console.log('Launch completed');
+
+                // Wait a moment then refresh to check running status
+                setTimeout(async () => {
+                    console.log('Checking running status after launch...');
+                    await loadInstances();
+                    showInstances();
+                }, 2000); // Wait 2 seconds
+
+                showInstances(); // Immediate refresh
+            } catch (error) {
+                console.error('Launch error:', error);
+                hideProgress();
+                showNotification('Failed to launch instance: ' + error, 'error');
+            }
+        }
+
+        async function killInstance(name) {
+            showConfirmModal(
+                `Are you sure you want to kill instance "${name}"? This will force close Minecraft.`,
+                async () => {
+                    try {
+                        await window.go.main.App.KillInstance(name);
+                        await loadInstances();
+                        showInstances();
+                    } catch (error) {
+                        showNotification('Failed to kill instance: ' + error, 'error');
+                    }
+                }
+            );
+        }
+
+        function configureInstance(name) {
+            // Switch to settings view
+            showView('settings');
+
+            // Small delay to ensure settings view is loaded
+            setTimeout(() => {
+                // Switch to instance settings tab
+                document.querySelectorAll('.settings-tab').forEach(btn => {
+                    btn.classList.remove('active');
+                });
+                document.querySelector('[onclick="showSettingsTab(\'instances\')"]').classList.add('active');
+                document.getElementById('globalSettingsTab').style.display = 'none';
+                document.getElementById('instanceSettingsTab').style.display = 'block';
+
+                // Select the specific instance
+                const selector = document.getElementById('instanceSelector');
+                selector.value = name;
+
+                // Trigger the change event to load the instance settings
+                const event = new Event('change', { bubbles: true });
+                selector.dispatchEvent(event);
+            }, 100);
+        }
+
+        async function deleteInstance(name) {
+            showConfirmModal(
+                `Are you sure you want to delete "${name}"? This action cannot be undone.`,
+                async () => {
+                    try {
+                        await window.go.main.App.DeleteInstance(name);
+                        await loadInstances(); // Reload instances
+                        showInstances();
+                        showNotification(`Instance "${name}" deleted successfully`, 'success');
+                    } catch (error) {
+                        showNotification('Failed to delete instance: ' + error, 'error');
+                    }
+                }
+            );
+        }
+
+        async function installModpack(id) {
+            try {
+                // Get all modpacks to find the one with matching ID
+                const modpacks = await window.go.main.App.GetModpacks();
+                const modpack = modpacks.find(m => m.id === id);
+
+                if (!modpack) {
+                    showNotification('Modpack not found: ' + id, 'error');
+                    return;
+                }
+
+                // Show instance name modal instead of prompt
+                showInstanceNameModal(modpack);
+            } catch (error) {
+                console.error('Failed to prepare modpack installation:', error);
+                showNotification('Failed to prepare modpack installation: ' + error, 'error');
+            }
+        }
+
+        async function installModpackWithName(modpack, instanceName) {
+            try {
+                // Validate inputs
+                if (!modpack || !modpack.displayName) {
+                    throw new Error('Invalid modpack data');
+                }
+                if (!instanceName || !instanceName.trim()) {
+                    throw new Error('Invalid instance name');
+                }
+
+                currentOperation = 'install';
+                currentInstanceName = instanceName;
+                showProgress(`Installing ${modpack.displayName}`);
+                await window.go.main.App.InstallModpack(modpack, instanceName);
+                currentOperation = null;
+                currentInstanceName = null;
+                await loadInstances();
+                showInstances();
+                hideProgress();
+                showNotification(`Successfully installed ${modpack.displayName}`, 'success');
+            } catch (error) {
+                hideProgress();
+                currentOperation = null;
+                currentInstanceName = null;
+                console.error('Failed to install modpack:', error);
+                showNotification('Failed to install modpack: ' + error, 'error');
+            }
+        }
+
+        // Create instance modal
+        function showCreateInstance() {
+            document.getElementById('createModal').style.display = 'flex';
+        }
+
+        function hideCreateInstance() {
+            document.getElementById('createModal').style.display = 'none';
+            // Clear form
+            document.getElementById('instanceName').value = '';
+            document.getElementById('minecraftVersion').value = '1.20.1';
+            document.getElementById('modLoader').value = 'vanilla';
+            document.getElementById('modLoaderVersionGroup').style.display = 'none';
+        }
+
+        async function createInstance() {
+            const name = document.getElementById('instanceName').value.trim();
+            const version = document.getElementById('minecraftVersion').value;
+            const loader = document.getElementById('modLoader').value;
+            const loaderVersion = document.getElementById('modLoaderVersion').value;
+
+            if (!name) {
+                showNotification('Please enter an instance name', 'error');
+                return;
+            }
+
+            if (loader !== 'vanilla' && !loaderVersion) {
+                showNotification('Please select a mod loader version', 'error');
+                return;
+            }
+
+            try {
+                hideCreateInstance();
+                currentOperation = 'create';
+                currentInstanceName = name;
+                showProgress("Creating Instance");
+                await window.go.main.App.CreateInstance(name, version, loader, loaderVersion);
+                currentOperation = null;
+                currentInstanceName = null;
+                await loadInstances();
+                showInstances();
+            } catch (error) {
+                hideProgress();
+                currentOperation = null;
+                currentInstanceName = null;
+                showNotification('Failed to create instance: ' + error, 'error');
+            }
+        }
+
+        // Account Manager Functions
+        let currentLoginData = null;
+
+        async function updateAccountDisplay() {
+            try {
+                const accounts = await window.go.main.App.GetAccounts();
+                const activeAccount = await window.go.main.App.GetActiveAccount().catch(() => null);
+
+                const usernameEl = document.getElementById('accountUsername');
+                const statusEl = document.getElementById('accountStatus');
+                const avatarEl = document.getElementById('accountAvatar');
+
+                if (activeAccount) {
+                    usernameEl.textContent = activeAccount.username;
+                    statusEl.textContent = activeAccount.needs_login ? 'Login required' : 'Online';
+                    avatarEl.textContent = '👤'; // Could use first letter of username
+                } else if (accounts && accounts.length > 0) {
+                    usernameEl.textContent = 'No active account';
+                    statusEl.textContent = 'Click to select account';
+                    avatarEl.textContent = '👤';
+                } else {
+                    usernameEl.textContent = 'Offline';
+                    statusEl.textContent = 'Click to login';
+                    avatarEl.textContent = '👤';
+                }
+            } catch (error) {
+                console.error('Failed to update account display:', error);
+                document.getElementById('accountUsername').textContent = 'Offline';
+                document.getElementById('accountStatus').textContent = 'Click to login';
+            }
+        }
+
+        async function openAccountManager() {
+            if (!window.go || !window.go.main || !window.go.main.App) {
+                showNotification('Wails runtime not available. Please refresh the page.', 'error');
+                return;
+            }
+
+            try {
+            const modal = document.getElementById('accountModal');
+
+            if (!modal) {
+                console.error('Account modal not found!');
+                return;
+            }
+
+            // Move modal to body to avoid nesting issues
+            document.body.appendChild(modal);
+
+            // Force visibility with important styles
+            modal.style.cssText = `
+                display: flex !important;
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 99999 !important;
+                background: rgba(0, 0, 0, 0.8) !important;
+                justify-content: center !important;
+                align-items: center !important;
+                visibility: visible !important;
+                opacity: 1 !important;
+            `;
+
+            await loadAccounts();
+            } catch (error) {
+                console.error('Error in openAccountManager:', error);
+                showNotification('Error opening account manager', 'error');
+            }
+        }
+
+        function closeAccountManager() {
+            document.getElementById('accountModal').style.display = 'none';
+        }
+
+        // Instance name modal functions
+        let pendingModpackInstall = null;
+
+        function showInstanceNameModal(modpack) {
+            pendingModpackInstall = modpack;
+
+            const modal = document.getElementById('instanceNameModal');
+            const input = document.getElementById('instanceNameInput');
+            const error = document.getElementById('instanceNameError');
+
+            if (!modal || !input || !error) {
+                console.error('Instance name modal elements not found!');
+                return;
+            }
+
+            // Set default instance name
+            const defaultName = modpack.instanceName || modpack.displayName.toLowerCase().replace(/\s+/g, '-');
+            input.value = defaultName;
+
+            // Clear any previous error
+            error.textContent = '';
+
+            // Move modal to body to avoid nesting issues (but don't clone)
+            if (modal.parentNode !== document.body) {
+                document.body.appendChild(modal);
+            }
+
+            // Show modal with force styling
+            modal.style.cssText = `
+                display: flex !important;
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 99999 !important;
+                background: rgba(0, 0, 0, 0.8) !important;
+                justify-content: center !important;
+                align-items: center !important;
+            `;
+
+            // Focus and select the input
+            setTimeout(() => {
+                input.focus();
+                input.select();
+            }, 100);
+        }
+
+        function closeInstanceNameModal() {
+            const modal = document.getElementById('instanceNameModal');
+            if (modal) {
+                modal.style.display = 'none';
+            }
+            pendingModpackInstall = null;
+        }
+
+        function confirmInstanceName() {
+            const modal = document.getElementById('instanceNameModal');
+            const input = document.getElementById('instanceNameInput');
+            const error = document.getElementById('instanceNameError');
+
+            if (!modal || !input || !error) return;
+
+            const instanceName = input.value.trim();
+
+            if (!instanceName) {
+                error.textContent = 'Instance name cannot be empty';
+                return;
+            }
+
+            if (!/^[a-zA-Z0-9_-]+$/.test(instanceName)) {
+                error.textContent = 'Instance name can only contain letters, numbers, hyphens, and underscores';
+                return;
+            }
+
+            // Preserve modpack data before clearing modal
+            const modpackToInstall = pendingModpackInstall;
+
+            // Close modal and proceed with installation
+            closeInstanceNameModal();
+
+            // Validate we have modpack data before proceeding
+            if (!modpackToInstall) {
+                showNotification('Error: No modpack data available', 'error');
+                return;
+            }
+
+            installModpackWithName(modpackToInstall, instanceName);
+        }
+
+        // Rename instance modal functions
+        let currentInstanceToRename = null;
+
+        function showRenameInstanceModal(instanceName) {
+            currentInstanceToRename = instanceName;
+            const modal = document.getElementById('renameInstanceModal');
+            const input = document.getElementById('newInstanceNameInput');
+            const currentNameDiv = document.getElementById('currentInstanceName');
+            const error = document.getElementById('renameInstanceError');
+
+            // Set current instance name display
+            currentNameDiv.textContent = instanceName;
+
+            // Set default new name
+            input.value = instanceName;
+
+            // Clear any previous error
+            error.textContent = '';
+
+            // Move modal to body to avoid nesting issues
+            if (modal.parentNode !== document.body) {
+                document.body.appendChild(modal);
+            }
+
+            // Show modal with force styling
+            modal.style.cssText = `
+                display: flex !important;
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 99999 !important;
+                background: rgba(0, 0, 0, 0.8) !important;
+                justify-content: center !important;
+                align-items: center !important;
+            `;
+
+            // Focus and select the input
+            setTimeout(() => {
+                input.focus();
+                input.select();
+            }, 100);
+        }
+
+        function closeRenameInstanceModal() {
+            const modal = document.getElementById('renameInstanceModal');
+            if (modal) {
+                modal.style.display = 'none';
+            }
+            currentInstanceToRename = null;
+        }
+
+        function confirmRenameInstance() {
+            const modal = document.getElementById('renameInstanceModal');
+            const input = document.getElementById('newInstanceNameInput');
+            const error = document.getElementById('renameInstanceError');
+
+            if (!modal || !input || !error) return;
+
+            const newName = input.value.trim();
+            const oldName = currentInstanceToRename;
+
+            if (!newName) {
+                error.textContent = 'Instance name cannot be empty';
+                return;
+            }
+
+            if (newName === oldName) {
+                error.textContent = 'New name must be different from current name';
+                return;
+            }
+
+            if (!/^[a-zA-Z0-9_-]+$/.test(newName)) {
+                error.textContent = 'Instance name can only contain letters, numbers, hyphens, and underscores';
+                return;
+            }
+
+            // Close modal and proceed with rename
+            closeRenameInstanceModal();
+            renameInstance(oldName, newName);
+        }
+
+        async function renameInstance(oldName, newName) {
+            try {
+                showProgress(`Renaming instance to "${newName}"...`);
+                await window.go.main.App.RenameInstance(oldName, newName);
+                await loadInstances(); // Reload instances
+                showInstances();
+                hideProgress();
+                showNotification(`Instance renamed successfully to "${newName}"`, 'success');
+            } catch (error) {
+                hideProgress();
+                console.error('Failed to rename instance:', error);
+                showNotification('Failed to rename instance: ' + error, 'error');
+            }
+        }
+
+        // Handle Enter key in the rename instance input
+        document.addEventListener('DOMContentLoaded', function() {
+            const renameInput = document.getElementById('newInstanceNameInput');
+            if (renameInput) {
+                renameInput.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        confirmRenameInstance();
+                    }
+                });
+            }
+        });
+
+        // Handle Enter key in the instance name input
+        document.addEventListener('DOMContentLoaded', function() {
+            const input = document.getElementById('instanceNameInput');
+            if (input) {
+                input.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        confirmInstanceName();
+                    }
+                });
+            }
+        });
+
+        // Generic confirmation modal functions
+        let confirmCallback = null;
+
+        // Track current operation for cleanup
+        let currentOperation = null;
+        let currentInstanceName = null;
+
+        function showConfirmModal(message, onConfirm, buttonText = 'Confirm', buttonClass = 'btn-danger') {
+            const modal = document.getElementById('confirmModal');
+            const messageDiv = document.getElementById('confirmMessage');
+            const confirmBtn = document.getElementById('confirmButton');
+
+            if (!modal || !messageDiv || !confirmBtn) {
+                console.error('Confirm modal elements not found!');
+                return;
+            }
+
+            // Set message
+            messageDiv.textContent = message;
+
+            // Set button text and class
+            confirmBtn.textContent = buttonText;
+            confirmBtn.className = 'btn ' + buttonClass;
+
+            // Store callback
+            confirmCallback = onConfirm;
+
+            // Move modal to body to avoid nesting issues (same approach as other working modals)
+            if (modal.parentNode !== document.body) {
+                document.body.appendChild(modal);
+            }
+
+            // Show modal with force styling
+            modal.style.cssText = `
+                display: flex !important;
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 99999 !important;
+                background: rgba(0, 0, 0, 0.8) !important;
+                justify-content: center !important;
+                align-items: center !important;
+            `;
+        }
+
+        function closeConfirmModal() {
+            document.getElementById('confirmModal').style.display = 'none';
+            confirmCallback = null;
+        }
+
+        function executeConfirmCallback() {
+            if (confirmCallback) {
+                confirmCallback();
+                closeConfirmModal();
+            }
+        }
+
+        // Generic confirm function to replace window.confirm
+        function customConfirm(message) {
+            return new Promise((resolve) => {
+                showConfirmModal(
+                    message,
+                    () => resolve(true),
+                    'Confirm',
+                    'btn-danger'
+                );
+            });
+        }
+
+        async function loadAccounts() {
+            try {
+                const accounts = await window.go.main.App.GetAccounts();
+                const accountsList = document.getElementById('accountsList');
+
+                if (!accounts || accounts.length === 0) {
+                    accountsList.innerHTML = `
+                        <div class="no-accounts">
+                            <p>No accounts yet. Click "Add Account" to get started!</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                accountsList.innerHTML = accounts.map(account => `
+                    <div class="account-item ${account.is_active ? 'active' : ''}">
+                        <div class="account-item-avatar">👤</div>
+                        <div class="account-item-info">
+                            <div class="account-item-username">${account.username}</div>
+                            <div class="account-item-details">
+                                <div class="account-item-status">
+                                    <div class="status-indicator ${account.needs_login ? 'warning' : ''}"></div>
+                                    ${account.needs_login ? 'Login required' : 'Ready to play'}
+                                </div>
+                                <div>Last used: ${new Date(account.last_used).toLocaleDateString()}</div>
+                            </div>
+                        </div>
+                        <div class="account-item-actions">
+                            ${!account.is_active ? `<button class="account-btn primary" onclick="selectAccount('${account.username}')">Select</button>` : ''}
+                            <button class="account-btn danger" onclick="removeAccount('${account.username}')">Remove</button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Failed to load accounts:', error);
+                document.getElementById('accountsList').innerHTML = `
+                    <div class="error">
+                        <p>Failed to load accounts: ${error.message}</p>
+                    </div>
+                `;
+            }
+        }
+
+        function showAccountTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.account-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            event.target.classList.add('active');
+
+            // Show/hide tab content
+            document.querySelectorAll('.account-tab-content').forEach(content => {
+                content.style.display = 'none';
+            });
+
+            if (tabName === 'accounts') {
+                document.getElementById('accountsTab').style.display = 'block';
+            } else if (tabName === 'add') {
+                document.getElementById('addTab').style.display = 'block';
+            }
+        }
+
+        async function selectAccount(username) {
+            try {
+                await window.go.main.App.SetActiveAccount(username);
+                await updateAccountDisplay();
+                await loadAccounts(); // Refresh the accounts list
+                showNotification(`Switched to account: ${username}`, 'success');
+            } catch (error) {
+                showNotification(`Failed to select account: ${error.message}`, 'error');
+            }
+        }
+
+        async function removeAccount(username) {
+            showConfirmModal(
+                `Are you sure you want to remove the account "${username}"? This cannot be undone.`,
+                async () => {
+                    try {
+                        await window.go.main.App.RemoveAccount(username);
+                        await updateAccountDisplay();
+                        await loadAccounts(); // Refresh the accounts list
+                        showNotification(`Account removed: ${username}`, 'success');
+                    } catch (error) {
+                        showNotification(`Failed to remove account: ${error.message}`, 'error');
+                    }
+                }
+            );
+        }
+
+        async function startMicrosoftLogin() {
+            try {
+                closeAccountManager();
+                const modal = document.getElementById('microsoftLoginModal');
+
+                // Move modal to body to avoid nesting issues
+                document.body.appendChild(modal);
+
+                // Force visibility with important styles
+                modal.style.cssText = `
+                    display: flex !important;
+                    position: fixed !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    width: 100% !important;
+                    height: 100% !important;
+                    z-index: 99999 !important;
+                    background: rgba(0, 0, 0, 0.8) !important;
+                    justify-content: center !important;
+                    align-items: center !important;
+                    visibility: visible !important;
+                    opacity: 1 !important;
+                `;
+
+                const loginData = await window.go.main.App.LoginToDeviceCode();
+                currentLoginData = loginData;
+
+                document.getElementById('deviceCode').textContent = loginData.user_code;
+                document.getElementById('verificationUrl').textContent = loginData.verification_uri;
+                document.getElementById('loginStatus').textContent = 'Waiting for you to sign in...';
+
+                // Start polling for login completion
+                pollForLoginCompletion(loginData.device_code);
+            } catch (error) {
+                console.error('Microsoft login error:', error);
+                const errorMessage = error.message || error.toString() || 'Unknown error occurred';
+                showNotification(`Failed to start Microsoft login: ${errorMessage}`, 'error');
+                closeMicrosoftLogin();
+            }
+        }
+
+        function closeMicrosoftLogin() {
+            document.getElementById('microsoftLoginModal').style.display = 'none';
+            currentLoginData = null;
+        }
+
+        function openMicrosoftLoginPage() {
+            if (currentLoginData && currentLoginData.verification_uri) {
+                // Open in the user's default browser using Wails runtime
+                if (window.go && window.go.main && window.go.main.App) {
+                    window.go.main.App.OpenBrowser(currentLoginData.verification_uri);
+                } else {
+                    // Fallback to window.open if Wails runtime is not available
+                    window.open(currentLoginData.verification_uri, '_blank');
+                }
+            }
+        }
+
+        function copyDeviceCode() {
+            if (currentLoginData && currentLoginData.user_code) {
+                navigator.clipboard.writeText(currentLoginData.user_code).then(() => {
+                    showNotification('Device code copied to clipboard!', 'success');
+                }).catch(() => {
+                    showNotification('Failed to copy device code', 'error');
+                });
+            }
+        }
+
+        function copyVerificationUrl() {
+            if (currentLoginData && currentLoginData.verification_uri) {
+                navigator.clipboard.writeText(currentLoginData.verification_uri).then(() => {
+                    showNotification('Login URL copied to clipboard!', 'success');
+                }).catch(() => {
+                    showNotification('Failed to copy login URL', 'error');
+                });
+            }
+        }
+
+        async function pollForLoginCompletion(deviceCode) {
+            const maxAttempts = 60; // 5 minutes with 5-second intervals
+            let attempts = 0;
+
+            const poll = async () => {
+                attempts++;
+
+                try {
+                    await window.go.main.App.CompleteDeviceCodeLogin(deviceCode);
+                    // Login successful!
+                    document.getElementById('loginStatus').textContent = 'Login successful! Setting up your account...';
+
+                    setTimeout(async () => {
+                        closeMicrosoftLogin();
+                        await updateAccountDisplay();
+                        showNotification('Microsoft account added successfully!', 'success');
+                    }, 1000);
+
+                } catch (error) {
+                    if (error.message.includes('authorization_pending')) {
+                        // Still waiting for user to sign in
+                        if (attempts < maxAttempts) {
+                            setTimeout(poll, 5000); // Poll every 5 seconds
+                        } else {
+                            document.getElementById('loginStatus').textContent = 'Login timed out. Please try again.';
+                        }
+                    } else {
+                        // Error occurred
+                        document.getElementById('loginStatus').textContent = `Login failed: ${error.message}`;
+                    }
+                }
+            };
+
+            poll(); // Start polling
+        }
+
+        function showOfflineLogin() {
+            closeAccountManager();
+            document.getElementById('offlineLoginModal').style.display = 'flex';
+            document.getElementById('offlineUsername').value = '';
+            document.getElementById('offlineUsername').focus();
+        }
+
+        function closeOfflineLogin() {
+            document.getElementById('offlineLoginModal').style.display = 'none';
+        }
+
+        async function confirmOfflineLogin() {
+            const username = document.getElementById('offlineUsername').value.trim();
+
+            if (!username) {
+                showNotification('Please enter a username', 'error');
+                return;
+            }
+
+            if (username.length < 3 || username.length > 16) {
+                showNotification('Username must be between 3 and 16 characters', 'error');
+                return;
+            }
+
+            try {
+                await window.go.main.App.LoginOffline(username);
+                closeOfflineLogin();
+                await updateAccountDisplay();
+                showNotification(`Offline account created: ${username}`, 'success');
+            } catch (error) {
+                showNotification(`Failed to create offline account: ${error.message}`, 'error');
+            }
+        }
+
+        // Settings Functions
+        let currentGlobalSettings = null;
+        let currentInstanceSettings = {};
+
+        // Show specific settings tab
+        function showSettingsTab(tab) {
+            // Update tab buttons
+            document.querySelectorAll('.settings-tab').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            event.target.classList.add('active');
+
+            // Show/hide tab content
+            document.getElementById('globalSettingsTab').style.display = tab === 'global' ? 'block' : 'none';
+            document.getElementById('instanceSettingsTab').style.display = tab === 'instances' ? 'block' : 'none';
+        }
+
+        // Load global settings
+        async function loadGlobalSettings() {
+            try {
+                const settings = await window.go.main.App.GetGlobalSettings();
+                currentGlobalSettings = settings;
+
+                // Populate form fields
+                document.getElementById('globalJavaPath').value = settings.javaPath || '';
+                document.getElementById('globalMinMemory').value = settings.defaultMinMemory || 1024;
+                document.getElementById('globalMaxMemory').value = settings.defaultMaxMemory || 4096;
+                document.getElementById('globalWindowWidth').value = settings.windowWidth || 854;
+                document.getElementById('globalWindowHeight').value = settings.windowHeight || 480;
+                document.getElementById('globalAutoUpdate').checked = settings.autoUpdate || true;
+                document.getElementById('globalCloseOnLaunch').checked = settings.closeOnLaunch || false;
+            } catch (error) {
+                showNotification('Failed to load global settings', 'error');
+                console.error('Failed to load global settings:', error);
+            }
+        }
+
+        // Save global settings
+        async function saveGlobalSettings() {
+            try {
+                const settings = {
+                    javaPath: document.getElementById('globalJavaPath').value,
+                    defaultMinMemory: parseInt(document.getElementById('globalMinMemory').value),
+                    defaultMaxMemory: parseInt(document.getElementById('globalMaxMemory').value),
+                    windowWidth: parseInt(document.getElementById('globalWindowWidth').value),
+                    windowHeight: parseInt(document.getElementById('globalWindowHeight').value),
+                    autoUpdate: document.getElementById('globalAutoUpdate').checked,
+                    closeOnLaunch: document.getElementById('globalCloseOnLaunch').checked,
+                };
+
+                await window.go.main.App.SaveGlobalSettings(settings);
+                currentGlobalSettings = settings;
+                showNotification('Global settings saved successfully!', 'success');
+            } catch (error) {
+                showNotification('Failed to save global settings: ' + error.message, 'error');
+                console.error('Failed to save global settings:', error);
+            }
+        }
+
+        // Reset global settings to defaults
+        async function resetGlobalSettings() {
+            showConfirmModal(
+                'Reset global settings to default values? This cannot be undone.',
+                async () => {
+                    try {
+                        const defaultSettings = {
+                            javaPath: '',
+                            defaultMinMemory: 1024,
+                            defaultMaxMemory: 4096,
+                            windowWidth: 854,
+                            windowHeight: 480,
+                            autoUpdate: true,
+                            closeOnLaunch: false,
+                        };
+
+                        await window.go.main.App.SaveGlobalSettings(defaultSettings);
+                        await loadGlobalSettings();
+                        showNotification('Global settings reset to defaults', 'success');
+                    } catch (error) {
+                        showNotification('Failed to reset global settings: ' + error.message, 'error');
+                        console.error('Failed to reset global settings:', error);
+                    }
+                }
+            );
+        }
+
+        // Load instances for settings
+        async function loadInstancesForSettings() {
+            try {
+                const instances = await window.go.main.App.GetInstances();
+                const selector = document.getElementById('instanceSelector');
+
+                selector.innerHTML = '<option value="">Select an instance...</option>';
+
+                instances.forEach(inst => {
+                    const option = document.createElement('option');
+                    option.value = inst.name;
+                    option.textContent = inst.name;
+                    selector.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Failed to load instances for settings:', error);
+            }
+        }
+
+        // Load instance settings
+        async function loadInstanceSettings() {
+            const instanceName = document.getElementById('instanceSelector').value;
+
+            if (!instanceName) {
+                document.getElementById('instanceSettingsContent').style.display = 'none';
+                return;
+            }
+
+            try {
+                const settings = await window.go.main.App.GetInstanceSettings(instanceName);
+                currentInstanceSettings[instanceName] = settings;
+
+                console.log('Loaded instance settings for', instanceName, ':', settings);
+                console.log('Memory settings - Min:', settings.min_memory, 'Max:', settings.max_memory);
+                console.log('Resolution settings:', settings.resolution);
+                console.log('Packwiz info:', settings.packwiz);
+
+                document.getElementById('instanceSettingsContent').style.display = 'block';
+
+                // Check if this is a modpack instance with recommended settings
+                const isModpackInstance = settings.packwiz && settings.packwiz.name;
+
+                // Populate form fields with actual current values
+                document.getElementById('instanceJavaPath').value = settings.java || '';
+                document.getElementById('instanceJavaArgs').value = settings.javaArgs || '';
+                document.getElementById('instanceMinMemory').value = settings.min_memory || 1024;
+                document.getElementById('instanceMaxMemory').value = settings.max_memory || 4096;
+                document.getElementById('instanceWindowWidth').value = settings.resolution.width || 854;
+                document.getElementById('instanceWindowHeight').value = settings.resolution.height || 480;
+
+                console.log('UI values after population - Max Memory:', document.getElementById('instanceMaxMemory').value);
+
+                // Clean up any existing modpack info
+                const existingModpackInfo = document.getElementById('modpackInfo');
+                if (existingModpackInfo) {
+                    existingModpackInfo.remove();
+                }
+
+                // Show modpack info if applicable
+                if (isModpackInstance) {
+                    const settingsContent = document.getElementById('instanceSettingsContent');
+                    const infoSection = document.createElement('div');
+                    infoSection.id = 'modpackInfo';
+                    infoSection.className = 'settings-section';
+                    infoSection.style.background = 'rgba(62, 180, 137, 0.1)';
+                    infoSection.style.border = '1px solid rgba(62, 180, 137, 0.3)';
+                    settingsContent.insertBefore(infoSection, settingsContent.firstChild);
+
+                    infoSection.innerHTML = `
+                        <h3>📦 Modpack Information</h3>
+                        <p><strong>${settings.packwiz.name}</strong> by ${settings.packwiz.author || 'Unknown'}</p>
+                        <p><em>This instance was created from a modpack with recommended memory settings.</em></p>
+                        <p><strong>Version:</strong> ${settings.packwiz.version || 'Unknown'}</p>
+                    `;
+                }
+            } catch (error) {
+                showNotification('Failed to load instance settings', 'error');
+                console.error('Failed to load instance settings:', error);
+            }
+        }
+
+        // Save instance settings
+        async function saveInstanceSettings() {
+            const instanceName = document.getElementById('instanceSelector').value;
+
+            if (!instanceName) {
+                showNotification('Please select an instance first', 'error');
+                return;
+            }
+
+            try {
+                const settings = {
+                    java: document.getElementById('instanceJavaPath').value,
+                    javaArgs: document.getElementById('instanceJavaArgs').value,
+                    min_memory: parseInt(document.getElementById('instanceMinMemory').value),
+                    max_memory: parseInt(document.getElementById('instanceMaxMemory').value),
+                    resolution: {
+                        width: parseInt(document.getElementById('instanceWindowWidth').value),
+                        height: parseInt(document.getElementById('instanceWindowHeight').value),
+                    },
+                    customJar: '',
+                    packwiz: currentInstanceSettings[instanceName]?.packwiz || {},
+                };
+
+                await window.go.main.App.SaveInstanceSettings(instanceName, settings);
+                currentInstanceSettings[instanceName] = settings;
+                showNotification(`Settings saved for instance: ${instanceName}`, 'success');
+            } catch (error) {
+                showNotification('Failed to save instance settings: ' + error.message, 'error');
+                console.error('Failed to save instance settings:', error);
+            }
+        }
+
+        // Reset instance settings to global defaults
+        async function resetInstanceSettings() {
+            const instanceName = document.getElementById('instanceSelector').value;
+
+            if (!instanceName) {
+                showNotification('Please select an instance first', 'error');
+                return;
+            }
+
+            showConfirmModal(
+                `Reset settings for "${instanceName}" to global defaults? This cannot be undone.`,
+                async () => {
+                    try {
+                        // Use current global settings as defaults
+                        const defaultSettings = {
+                            java: currentGlobalSettings?.javaPath || '',
+                            javaArgs: '',
+                            min_memory: currentGlobalSettings?.defaultMinMemory || 1024,
+                            max_memory: currentGlobalSettings?.defaultMaxMemory || 4096,
+                            resolution: {
+                                width: currentGlobalSettings?.windowWidth || 854,
+                                height: currentGlobalSettings?.windowHeight || 480,
+                            },
+                            customJar: '',
+                            packwiz: currentInstanceSettings[instanceName]?.packwiz || {},
+                        };
+
+                        await window.go.main.App.SaveInstanceSettings(instanceName, defaultSettings);
+                        await loadInstanceSettings();
+                        showNotification(`Settings reset for instance: ${instanceName}`, 'success');
+                    } catch (error) {
+                        showNotification('Failed to reset instance settings: ' + error.message, 'error');
+                        console.error('Failed to reset instance settings:', error);
+                    }
+                }
+            );
+        }
+
+        function showNotification(message, type = 'info') {
+            // Create a simple notification system (could be enhanced later)
+            const notification = document.createElement('div');
+            notification.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                padding: 15px 20px;
+                border-radius: 8px;
+                color: white;
+                font-weight: 500;
+                z-index: 10000;
+                max-width: 300px;
+                word-wrap: break-word;
+                ${type === 'success' ? 'background: #10B981;' : ''}
+                ${type === 'error' ? 'background: #EF4444;' : ''}
+                ${type === 'info' ? 'background: #3B82F6;' : ''}
+            `;
+            notification.textContent = message;
+
+            document.body.appendChild(notification);
+
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 3000);
+        }
+
+        // Initialize when DOM is ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+    </script>
+
+<!-- Instance Name Prompt Modal -->
+<div class="modal" id="instanceNameModal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            Enter Instance Name
+            <button class="close-btn" onclick="closeInstanceNameModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p>Enter a custom name for this instance:</p>
+            <input type="text" id="instanceNameInput" class="form-input" placeholder="Instance name" style="width: 100%; margin-bottom: 10px;">
+            <div id="instanceNameError" style="color: #E74C3C; font-size: 12px; min-height: 16px;"></div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="closeInstanceNameModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="confirmInstanceName()">Install</button>
+        </div>
+    </div>
+</div>
+
+<!-- Rename Instance Modal -->
+<div class="modal" id="renameInstanceModal" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            Rename Instance
+            <button class="close-btn" onclick="closeRenameInstanceModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p>Enter a new name for this instance:</p>
+            <div style="margin-bottom: 15px;">
+                <div style="font-size: 12px; color: #888; margin-bottom: 5px;">Current name</div>
+                <div id="currentInstanceName" style="font-size: 14px; color: white;"></div>
+            </div>
+            <input type="text" id="newInstanceNameInput" class="form-input" placeholder="New instance name" style="width: 100%; margin-bottom: 10px;">
+            <div id="renameInstanceError" style="color: #E74C3C; font-size: 12px; min-height: 16px;"></div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="closeRenameInstanceModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="confirmRenameInstance()">Rename</button>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>

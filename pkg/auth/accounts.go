@@ -32,6 +32,11 @@ func (a *Account) isValid() bool {
 	return a.AccessToken != "" && a.Expires.After(time.Now())
 }
 
+// IsValid checks if the account's access token is still valid (public method)
+func (a *Account) IsValid() bool {
+	return a.isValid()
+}
+
 // refresh refreshes the account's authentication tokens
 func (a *Account) refresh() error {
 	if !a.MSA.isValid() {
@@ -221,7 +226,7 @@ func (am *AccountsManager) AuthenticateAs(username string) (Session, error) {
 	}
 
 	// Check if token is valid, refresh if needed
-	if !account.isValid() {
+	if !account.IsValid() {
 		if err := account.refresh(); err != nil {
 			return Session{}, fmt.Errorf("refresh account '%s': %w", username, err)
 		}

@@ -23,6 +23,10 @@ EN | [DE](README_de.md)
 
 ## Installation
 
+### Binaries
+You can download prebuilt binaries from the Releases tab here on GitHub.
+Builds of the latest commit are available at [nightly.link](https://nightly.link/dilllxd/theboyslauncher/workflows/build/main).
+
 ### Via go install
 Make sure you have [Go](https://go.dev) installed.
 

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -13,12 +14,31 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/iancoleman/orderedmap"
 	"github.com/dilllxd/theboyslauncher/internal/network"
 	env "github.com/dilllxd/theboyslauncher/pkg"
 )
+
+// MavenMetadata represents Maven metadata XML structure
+type MavenMetadata struct {
+	XMLName  xml.Name `xml:"metadata"`
+	GroupID  string   `xml:"groupId"`
+	ArtifactID string `xml:"artifactId"`
+	Version string   `xml:"version"`
+	Versions struct {
+		XMLName  xml.Name `xml:"versions"`
+		Version []string `xml:"version"`
+	} `xml:"versioning>versions"`
+}
+
+// ForgeVersion represents a Forge version with stability info
+type ForgeVersion struct {
+	Version string
+	Stable  bool
+}
 
 // A ForgeInstallProfile contains install libraries and processors used to initialize Forge.
 type ForgeInstallProfile struct {
@@ -135,7 +155,126 @@ func FetchForgeVersion(gameVersion string) (string, error) {
 		return "", fmt.Errorf("no version found for specified game version")
 	}
 	return gameVersion + "-" + version, nil
+}
 
+// FetchForgeVersions retrieves all available Forge versions for a specific Minecraft version
+func FetchForgeVersions(minecraftVersion string) ([]ForgeVersion, error) {
+	resp, err := http.Get("https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := network.CheckResponse(resp); err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var metadata MavenMetadata
+	if err := xml.Unmarshal(body, &metadata); err != nil {
+		return nil, fmt.Errorf("parse Maven metadata: %w", err)
+	}
+
+	var versions []ForgeVersion
+	for _, version := range metadata.Versions.Version {
+		// Filter out versions that don't look like valid Forge versions
+		// Forge versions are typically in format like "1.20.1-47.2.0"
+		if strings.Contains(version, "-") && len(strings.Split(version, "-")) >= 2 {
+			parts := strings.Split(version, "-")
+			if len(parts) >= 2 && parts[0] == minecraftVersion {
+				// This version matches our Minecraft version
+				// Consider versions without "beta" or "alpha" as stable
+				stable := !strings.Contains(strings.ToLower(version), "beta") &&
+						 !strings.Contains(strings.ToLower(version), "alpha") &&
+						 !strings.Contains(strings.ToLower(version), "rc")
+				versions = append(versions, ForgeVersion{
+					Version: version,
+					Stable:  stable,
+				})
+			}
+		}
+	}
+
+	// Sort versions in descending order (newest first)
+	slices.SortFunc(versions, func(a, b ForgeVersion) int {
+		return strings.Compare(b.Version, a.Version)
+	})
+
+	return versions, nil
+}
+
+// FetchNeoforgeVersions retrieves all available NeoForge versions for a specific Minecraft version
+func FetchNeoforgeVersions(minecraftVersion string) ([]ForgeVersion, error) {
+	resp, err := http.Get("https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := network.CheckResponse(resp); err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var metadata MavenMetadata
+	if err := xml.Unmarshal(body, &metadata); err != nil {
+		return nil, fmt.Errorf("parse Maven metadata: %w", err)
+	}
+
+	// Parse Minecraft version (e.g., "1.21.8" -> major=21, minor=8)
+	mcParts := strings.Split(minecraftVersion, ".")
+	if len(mcParts) < 3 {
+		return nil, fmt.Errorf("invalid Minecraft version format: %s", minecraftVersion)
+	}
+
+	mcMajor, err := strconv.Atoi(mcParts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid Minecraft major version: %s", mcParts[1])
+	}
+
+	mcMinor, err := strconv.Atoi(mcParts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid Minecraft minor version: %s", mcParts[2])
+	}
+
+	var versions []ForgeVersion
+	for _, version := range metadata.Versions.Version {
+		// Filter NeoForge versions (they follow semantic versioning)
+		parts := strings.Split(version, ".")
+		if len(parts) >= 3 {
+			// NeoForge versioning: A.B.C maps to Minecraft 1.A.B
+			// For example, NeoForge 21.8.49 maps to Minecraft 1.21.8
+			nfMajor, err1 := strconv.Atoi(parts[0])
+			nfMinor, err2 := strconv.Atoi(parts[1])
+
+			if err1 == nil && err2 == nil {
+				// Check if this NeoForge version is compatible with the selected Minecraft version
+				if nfMajor == mcMajor && nfMinor == mcMinor {
+					// Consider versions without "beta" or "alpha" as stable
+					stable := !strings.Contains(strings.ToLower(version), "beta") &&
+							 !strings.Contains(strings.ToLower(version), "alpha") &&
+							 !strings.Contains(strings.ToLower(version), "rc")
+					versions = append(versions, ForgeVersion{
+						Version: version,
+						Stable:  stable,
+					})
+				}
+			}
+		}
+	}
+
+	// Sort versions in descending order (newest first)
+	slices.SortFunc(versions, func(a, b ForgeVersion) int {
+		return strings.Compare(b.Version, a.Version)
+	})
+
+	return versions, nil
 }
 
 type forge struct {
