@@ -205,7 +205,8 @@ func (a *App) CreateInstance(name, version, loader, loaderVersion string) error 
 	// Mark as completed
 	a.updateProgress("Completed", fmt.Sprintf("Instance '%s' created and prepared successfully!", name), 100)
 
-	// Reset progress after a delay
+	// Reset progress after a delay (UI state reset)
+	// Note: This sleep is intentional for UI feedback, not a timeout
 	go func() {
 		time.Sleep(3 * time.Second)
 		a.updateProgress("Idle", "Ready to launch", 0)
@@ -727,7 +728,8 @@ func (a *App) InstallModpack(modpack Modpack, customInstanceName string) error {
 	// Mark as completed
 	a.updateProgress("Completed", fmt.Sprintf("Modpack '%s' installed successfully!", instanceName), 100)
 
-	// Reset progress after a delay
+	// Reset progress after a delay (UI state reset)
+	// Note: This sleep is intentional for UI feedback, not a timeout
 	go func() {
 		time.Sleep(3 * time.Second)
 		a.updateProgress("Idle", "Ready to launch", 0)
