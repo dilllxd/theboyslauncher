@@ -1,4 +1,6 @@
 // Package env provides directories used by the launcher for various data.
+// Note: We use TheBoysLauncher as the default directory to avoid conflicts
+// with the official Minecraft launcher which uses .minecraft
 package env
 
 import (
@@ -7,7 +9,7 @@ import (
 	"path/filepath"
 )
 
-var RootDir string // Base launcher directory. Defaults to "$HOME/.minecraft"
+var RootDir string // Base launcher directory. Defaults to "$HOME/TheBoysLauncher"
 
 var LibrariesDir string // Java libraries directory
 
@@ -35,7 +37,7 @@ func SetDirs(rootDir string) error {
 	AssetsDir = filepath.Join(RootDir, "assets")
 	TmpDir = filepath.Join(RootDir, "tmp")
 	JavaDir = filepath.Join(RootDir, "java")
-	AuthStorePath = filepath.Join(RootDir, "account.json")
+	AuthStorePath = filepath.Join(RootDir, "accounts.json") // Use unified accounts.json
 	AccountsPath = filepath.Join(RootDir, "accounts.json")
 
 	if err := os.MkdirAll(rootDir, 0755); err != nil {
@@ -46,5 +48,5 @@ func SetDirs(rootDir string) error {
 
 func init() {
 	home, _ := os.UserHomeDir()
-	SetDirs(filepath.Join(home, ".minecraft"))
+	SetDirs(filepath.Join(home, "TheBoysLauncher"))
 }

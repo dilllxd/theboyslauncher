@@ -32,6 +32,35 @@ func (a *Account) isValid() bool {
 	return a.AccessToken != "" && a.Expires.After(time.Now())
 }
 
+// ShouldRefresh checks if the account's token should be refreshed proactively
+// Returns true if the token expires within the next 12 hours (similar to Prism Launcher)
+func (a *Account) ShouldRefresh() bool {
+	if a.Expires.IsZero() {
+		return true // No expiration info, should refresh
+	}
+	// Refresh if expires within 12 hours
+	twelveHoursFromNow := time.Now().Add(12 * time.Hour)
+	return a.Expires.Before(twelveHoursFromNow)
+}
+
+// isExpired checks if the account's access token is expired
+func (a *Account) isExpired() bool {
+	return a.AccessToken == "" || a.Expires.Before(time.Now().Add(-5*time.Minute))
+}
+
+// GetTimeUntilExpiry returns the duration until the token expires
+func (a *Account) GetTimeUntilExpiry() time.Duration {
+	if a.Expires.IsZero() {
+		return 0
+	}
+	return time.Until(a.Expires)
+}
+
+// Refresh manually refreshes the account's authentication tokens
+func (a *Account) Refresh() error {
+	return a.refresh()
+}
+
 // IsValid checks if the account's access token is still valid (public method)
 func (a *Account) IsValid() bool {
 	return a.isValid()
@@ -63,7 +92,7 @@ func (a *Account) refresh() error {
 	// Update account info
 	a.AccessToken = a.Minecraft.AccessToken
 	a.UUID = a.Minecraft.UUID
-	a.Expires = time.Now().Add(time.Second * time.Duration(3600)) // Default 1 hour
+	a.Expires = a.Minecraft.Expires // Use actual Minecraft token expiration
 
 	return nil
 }
@@ -141,7 +170,7 @@ func (am *AccountsManager) AddAccount(session Session, authStore AuthStore) erro
 		Username:    session.Username,
 		UUID:        session.UUID,
 		AccessToken: session.AccessToken,
-		Expires:     time.Now().Add(time.Hour), // Default 1 hour
+		Expires:     authStore.Minecraft.Expires, // Use actual Minecraft token expiration
 		LastUsed:    time.Now(),
 		MSA:         authStore.MSA,
 		XBL:         authStore.XBL,
@@ -225,8 +254,8 @@ func (am *AccountsManager) AuthenticateAs(username string) (Session, error) {
 		return Session{}, err
 	}
 
-	// Check if token is valid, refresh if needed
-	if !account.IsValid() {
+	// Check if token needs refresh (either expired or should be refreshed proactively)
+	if !account.IsValid() || account.ShouldRefresh() {
 		if err := account.refresh(); err != nil {
 			return Session{}, fmt.Errorf("refresh account '%s': %w", username, err)
 		}
@@ -245,6 +274,62 @@ func (am *AccountsManager) AuthenticateAs(username string) (Session, error) {
 		UUID:        account.UUID,
 		AccessToken: account.AccessToken,
 	}, nil
+}
+
+// ProactivelyRefreshAccounts checks all accounts and refreshes those that need it
+// This should be called periodically (e.g., on application startup)
+func (am *AccountsManager) ProactivelyRefreshAccounts() error {
+	refreshed := false
+	for username, account := range am.Accounts {
+		if account.ShouldRefresh() {
+			output.Info(fmt.Sprintf("Proactively refreshing tokens for account '%s'", username))
+			if err := account.refresh(); err != nil {
+				output.Warning(fmt.Sprintf("Failed to refresh account '%s': %v", username, err))
+				continue
+			}
+			refreshed = true
+			output.Info(fmt.Sprintf("Successfully refreshed tokens for account '%s'", username))
+		}
+	}
+
+	if refreshed {
+		if err := am.SaveAccounts(); err != nil {
+			return fmt.Errorf("save proactively refreshed accounts: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetAccountStatus returns status information about an account
+func (am *AccountsManager) GetAccountStatus(username string) (map[string]interface{}, error) {
+	account, err := am.GetAccount(username)
+	if err != nil {
+		return nil, err
+	}
+
+	status := map[string]interface{}{
+		"username": account.Username,
+		"uuid": account.UUID,
+		"is_valid": account.IsValid(),
+		"should_refresh": account.ShouldRefresh(),
+		"is_expired": account.isExpired(),
+		"expires": account.Expires,
+		"time_until_expiry": account.GetTimeUntilExpiry().String(),
+		"last_used": account.LastUsed,
+	}
+
+	return status, nil
+}
+
+// GetAllAccountsStatus returns status information for all accounts
+func (am *AccountsManager) GetAllAccountsStatus() map[string]map[string]interface{} {
+	statuses := make(map[string]map[string]interface{})
+	for username := range am.Accounts {
+		if status, err := am.GetAccountStatus(username); err == nil {
+			statuses[username] = status
+		}
+	}
+	return statuses
 }
 
 // migrateFromOldAuth migrates data from the old single-account auth store
@@ -287,5 +372,16 @@ var GlobalAccountsManager *AccountsManager
 // InitAccountsManager initializes the global accounts manager
 func InitAccountsManager() error {
 	GlobalAccountsManager = NewAccountsManager()
-	return GlobalAccountsManager.LoadAccounts()
+	if err := GlobalAccountsManager.LoadAccounts(); err != nil {
+		return err
+	}
+
+	// Proactively refresh tokens that need it on startup
+	go func() {
+		if err := GlobalAccountsManager.ProactivelyRefreshAccounts(); err != nil {
+			output.Warning(fmt.Sprintf("Failed to proactively refresh accounts: %v", err))
+		}
+	}()
+
+	return nil
 }

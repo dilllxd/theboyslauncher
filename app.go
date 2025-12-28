@@ -6,40 +6,46 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	goRuntime "runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/dilllxd/theboyslauncher/internal/meta"
+	env "github.com/dilllxd/theboyslauncher/pkg"
 	"github.com/dilllxd/theboyslauncher/pkg/auth"
 	"github.com/dilllxd/theboyslauncher/pkg/launcher"
+	"github.com/dilllxd/theboyslauncher/pkg/migration"
 	"github.com/dilllxd/theboyslauncher/pkg/packwiz"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App struct
 type App struct {
-	ctx            context.Context
+	ctx              context.Context
 	runningInstances map[string]*launcher.GuiRunner
-	instanceMutex   sync.RWMutex
-	launchProgress  LaunchProgress
-	progressMutex   sync.RWMutex
+	instanceMutex    sync.RWMutex
+	launchProgress   LaunchProgress
+	progressMutex    sync.RWMutex
 }
 
 // LaunchProgress tracks detailed launch progress
 type LaunchProgress struct {
-	Stage        string `json:"stage"`        // Current stage (e.g., "Downloading", "Preparing", "Launching")
-	Progress     int    `json:"progress"`     // Percentage (0-100)
-	Message      string `json:"message"`      // Detailed message
-	TotalSteps   int    `json:"totalSteps"`   // Total steps in current stage
-	CurrentStep  int    `json:"currentStep"`  // Current step in stage
-	FileName     string `json:"fileName"`     // Current file being processed (if applicable)
+	Stage       string `json:"stage"`       // Current stage (e.g., "Downloading", "Preparing", "Launching")
+	Progress    int    `json:"progress"`    // Percentage (0-100)
+	Message     string `json:"message"`     // Detailed message
+	TotalSteps  int    `json:"totalSteps"`  // Total steps in current stage
+	CurrentStep int    `json:"currentStep"` // Current step in stage
+	FileName    string `json:"fileName"`    // Current file being processed (if applicable)
 }
 
 // NewApp creates a new App application struct
 func NewApp() *App {
 	// Initialize auth client configuration
-	auth.ClientID = "6a533aa3-afbf-45a4-91bc-8c35a37e35c7"
+	auth.ClientID = "d10dfc60-1a42-44a8-b3af-edf4f5ee2c1f"
 	auth.RedirectURI, _ = url.Parse("http://localhost:8000/signin")
 
 	return &App{
@@ -191,7 +197,7 @@ func (a *App) CreateInstance(name, version, loader, loaderVersion string) error 
 	_, err = launcher.Prepare(
 		inst,
 		launcher.LaunchOptions{
-			Session: auth.Session{Username: "Player"}, // Offline session for preparation
+			Session:        auth.Session{Username: "Player"}, // Offline session for preparation
 			InstanceConfig: inst.Config,
 		},
 		watcher,
@@ -313,7 +319,7 @@ func (a *App) LaunchInstance(name, username string) error {
 			}
 		case launcher.FileDownloadEvent:
 			if totalDownloads > 0 {
-				_ = int((float64(e.Progress)/float64(e.Total))*100) // Calculate for potential future use
+				_ = int((float64(e.Progress) / float64(e.Total)) * 100) // Calculate for potential future use
 				a.updateDetailedProgress("Downloading",
 					fmt.Sprintf("Downloading %s...", e.Filename),
 					20+int((float64(completedDownloads)/float64(totalDownloads))*60),
@@ -491,10 +497,10 @@ func (a *App) GetLaunchProgress() LaunchProgress {
 
 // LoaderVersion represents a mod loader version
 type LoaderVersion struct {
-	ID        string `json:"id"`
-	Stable    bool   `json:"stable"`
-	Version   string `json:"version"`
-	Name      string `json:"name"`
+	ID      string `json:"id"`
+	Stable  bool   `json:"stable"`
+	Version string `json:"version"`
+	Name    string `json:"name"`
 }
 
 // GetLoaderVersions returns available versions for a specific mod loader
@@ -563,10 +569,10 @@ type VersionFilters struct {
 
 // MinecraftVersion represents a Minecraft version
 type MinecraftVersion struct {
-	ID           string `json:"id"`
-	Type         string `json:"type"`
-	DisplayName  string `json:"displayName"`
-	ReleaseTime  string `json:"releaseTime"`
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	DisplayName string `json:"displayName"`
+	ReleaseTime string `json:"releaseTime"`
 }
 
 // GetMinecraftVersions fetches available Minecraft versions from Mojang's API
@@ -707,7 +713,7 @@ func (a *App) InstallModpack(modpack Modpack, customInstanceName string) error {
 	_, err = launcher.Prepare(
 		*instance,
 		launcher.LaunchOptions{
-			Session: auth.Session{Username: "Player"}, // Offline session for preparation
+			Session:        auth.Session{Username: "Player"}, // Offline session for preparation
 			InstanceConfig: instance.Config,
 		},
 		watcher,
@@ -817,12 +823,12 @@ func (a *App) getNeoforgeVersions(minecraftVersion string) ([]LoaderVersion, err
 
 // AccountInfo represents account information for the frontend
 type AccountInfo struct {
-	ID          string `json:"id"`          // UUID
-	Username    string `json:"username"`    // Minecraft username
-	UUID        string `json:"uuid"`        // Minecraft UUID
-	LastUsed    string `json:"last_used"`   // Last used timestamp
-	IsActive    bool   `json:"is_active"`   // Whether this is the active account
-	NeedsLogin  bool   `json:"needs_login"` // Whether token needs refresh
+	ID         string `json:"id"`          // UUID
+	Username   string `json:"username"`    // Minecraft username
+	UUID       string `json:"uuid"`        // Minecraft UUID
+	LastUsed   string `json:"last_used"`   // Last used timestamp
+	IsActive   bool   `json:"is_active"`   // Whether this is the active account
+	NeedsLogin bool   `json:"needs_login"` // Whether token needs refresh
 }
 
 // GetAccounts returns all accounts for the account manager
@@ -913,6 +919,78 @@ type GlobalSettings struct {
 // OpenBrowser opens a URL in the user's default browser
 func (a *App) OpenBrowser(url string) {
 	runtime.BrowserOpenURL(a.ctx, url)
+}
+
+// OpenDirectory opens a directory in the native file explorer
+func (a *App) OpenDirectory(path string) error {
+	if path == "" {
+		return fmt.Errorf("empty path provided")
+	}
+
+	// Check if directory exists, if not, try to create it
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			return fmt.Errorf("create directory: %w", err)
+		}
+	}
+
+	// Open directory using OS-specific methods
+	switch goRuntime.GOOS {
+	case "windows":
+		// On Windows, use "explorer" command
+		// Note: explorer often returns exit status 1 even when successful
+		cmd := exec.Command("explorer", path)
+		err := cmd.Run()
+		// Ignore exit status 1 on Windows as explorer often returns this even when successful
+		if err != nil && err.Error() != "exit status 1" {
+			return err
+		}
+		return nil
+	case "darwin":
+		// On macOS, use "open" command
+		cmd := exec.Command("open", path)
+		return cmd.Run()
+	case "linux":
+		// On Linux, try xdg-open first (standard desktop environments)
+		if _, err := exec.LookPath("xdg-open"); err == nil {
+			cmd := exec.Command("xdg-open", path)
+			if err := cmd.Run(); err == nil {
+				return nil
+			}
+		}
+		// Fallback for Linux: try common file managers
+		fileManagers := []string{"nautilus", "dolphin", "thunar", "pcmanfm", "caja"}
+		for _, fm := range fileManagers {
+			if _, err := exec.LookPath(fm); err == nil {
+				cmd := exec.Command(fm, path)
+				if err := cmd.Run(); err == nil {
+					return nil
+				}
+			}
+		}
+		// Last resort: try xdg-open even if we couldn't find it in PATH
+		cmd := exec.Command("xdg-open", path)
+		return cmd.Run()
+	default:
+		// For other OS, try xdg-open as a last resort
+		cmd := exec.Command("xdg-open", path)
+		return cmd.Run()
+	}
+}
+
+// OpenLauncherDirectory opens the main launcher directory
+func (a *App) OpenLauncherDirectory() error {
+	return a.OpenDirectory(env.RootDir)
+}
+
+// OpenInstanceDirectory opens a specific instance directory
+func (a *App) OpenInstanceDirectory(instanceName string) error {
+	if instanceName == "" {
+		return fmt.Errorf("empty instance name provided")
+	}
+
+	instancePath := filepath.Join(env.InstancesDir, instanceName)
+	return a.OpenDirectory(instancePath)
 }
 
 // GetGlobalSettings returns the global launcher settings
@@ -1022,10 +1100,10 @@ func (a *App) LoginOffline(username string) error {
 
 	// Create a simple offline account entry
 	offlineAccount := &auth.Account{
-		ID:        "offline-" + strings.ToLower(username),
-		Username:  username,
-		UUID:      "", // Will be generated by Minecraft launcher
-		LastUsed:  time.Now(),
+		ID:       "offline-" + strings.ToLower(username),
+		Username: username,
+		UUID:     "", // Will be generated by Minecraft launcher
+		LastUsed: time.Now(),
 	}
 
 	if auth.GlobalAccountsManager == nil {
@@ -1039,4 +1117,163 @@ func (a *App) LoginOffline(username string) error {
 	auth.GlobalAccountsManager.ActiveAccount = username + " (Offline)"
 
 	return auth.GlobalAccountsManager.SaveAccounts()
+}
+
+// MigrationInfo contains information about available Prism installations
+type MigrationInfo struct {
+	CanMigrate    bool     `json:"can_migrate"`
+	Installations []string `json:"installations"`
+	EstimatedSize int64    `json:"estimated_size"`
+	InstanceCount int      `json:"instance_count"`
+}
+
+// DetectMigration checks if Prism installations are available for migration
+func (a *App) DetectMigration() (MigrationInfo, error) {
+	installations, err := migration.DetectPrismInstallations()
+	if err != nil {
+		return MigrationInfo{}, fmt.Errorf("detect Prism installations: %w", err)
+	}
+
+	info := MigrationInfo{
+		CanMigrate:    len(installations) > 0,
+		Installations: installations,
+	}
+
+	if len(installations) > 0 {
+		// Use the first installation to estimate size and count instances
+		migrator, err := migration.NewMigrator(installations[0])
+		if err == nil {
+			if size, err := migrator.GetMigrationSize(); err == nil {
+				info.EstimatedSize = size
+			}
+
+			// Count instances
+			if instances, err := os.ReadDir(filepath.Join(installations[0], "instances")); err == nil {
+				count := 0
+				for _, inst := range instances {
+					if inst.IsDir() {
+						count++
+					}
+				}
+				info.InstanceCount = count
+			}
+		}
+	}
+
+	return info, nil
+}
+
+// StartMigration begins the migration process from the specified Prism path
+func (a *App) StartMigration(prismPath string) (*migration.MigrationResult, error) {
+	migrator, err := migration.NewMigrator(prismPath)
+	if err != nil {
+		return nil, fmt.Errorf("create migrator: %w", err)
+	}
+
+	return migrator.StartMigration()
+}
+
+// InstanceUpdateInfo contains update information for an instance
+type InstanceUpdateInfo struct {
+	Name           string `json:"name"`
+	HasUpdate      bool   `json:"has_update"`
+	NewVersion     string `json:"new_version,omitempty"`
+	CurrentVersion string `json:"current_version,omitempty"`
+}
+
+// CheckInstanceUpdates checks all instances for packwiz updates
+func (a *App) CheckInstanceUpdates() ([]InstanceUpdateInfo, error) {
+	instances, err := launcher.FetchAllInstances()
+	if err != nil {
+		return nil, fmt.Errorf("list instances: %w", err)
+	}
+
+	var updateInfos []InstanceUpdateInfo
+
+	for _, instance := range instances {
+
+		// Only check packwiz instances
+		if instance.Config.Packwiz.URL == "" {
+			continue
+		}
+
+		hasUpdate, packFile, err := packwiz.CheckForUpdates(instance)
+		if err != nil {
+			// Log error but continue checking other instances
+			fmt.Printf("Failed to check updates for %s: %v\n", instance.Name, err)
+			continue
+		}
+
+		updateInfo := InstanceUpdateInfo{
+			Name:           instance.Name,
+			HasUpdate:      hasUpdate,
+			CurrentVersion: instance.Config.Packwiz.Version,
+		}
+
+		if hasUpdate && packFile != nil {
+			updateInfo.NewVersion = packFile.Version
+		}
+
+		updateInfos = append(updateInfos, updateInfo)
+	}
+
+	return updateInfos, nil
+}
+
+// CheckInstanceUpdate checks a specific instance for updates
+func (a *App) CheckInstanceUpdate(instanceName string) (InstanceUpdateInfo, error) {
+	instance, err := launcher.FetchInstance(instanceName)
+	if err != nil {
+		return InstanceUpdateInfo{}, fmt.Errorf("fetch instance: %w", err)
+	}
+
+	// Only packwiz instances can have updates
+	if instance.Config.Packwiz.URL == "" {
+		return InstanceUpdateInfo{
+			Name:      instanceName,
+			HasUpdate: false,
+		}, nil
+	}
+
+	hasUpdate, packFile, err := packwiz.CheckForUpdates(instance)
+	if err != nil {
+		return InstanceUpdateInfo{}, fmt.Errorf("check updates: %w", err)
+	}
+
+	updateInfo := InstanceUpdateInfo{
+		Name:           instanceName,
+		HasUpdate:      hasUpdate,
+		CurrentVersion: instance.Config.Packwiz.Version,
+	}
+
+	if hasUpdate && packFile != nil {
+		updateInfo.NewVersion = packFile.Version
+	}
+
+	return updateInfo, nil
+}
+
+// UpdateInstance updates a packwiz instance to the latest version
+func (a *App) UpdateInstance(instanceName string) error {
+	instance, err := launcher.FetchInstance(instanceName)
+	if err != nil {
+		return fmt.Errorf("fetch instance: %w", err)
+	}
+
+	// Check for updates first
+	hasUpdate, packFile, err := packwiz.CheckForUpdates(instance)
+	if err != nil {
+		return fmt.Errorf("check for updates: %w", err)
+	}
+
+	if !hasUpdate {
+		return fmt.Errorf("no updates available")
+	}
+
+	// Apply the update (this includes saving the configuration)
+	if err := packwiz.UpdateInstance(&instance, packFile); err != nil {
+		return fmt.Errorf("update instance: %w", err)
+	}
+
+	return nil
 }

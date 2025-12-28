@@ -155,6 +155,7 @@ func FetchInstance(name string) (Instance, error) {
 	unmarshaler := toml.Unmarshal
 	var data []byte
 	var err error
+	isJSON := false
 
 	data, err = os.ReadFile(filepath.Join(dir, "instance.toml"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -165,6 +166,7 @@ func FetchInstance(name string) (Instance, error) {
 			return Instance{}, fmt.Errorf("read instance configuration (JSON): %w", err)
 		}
 		unmarshaler = json.Unmarshal
+		isJSON = true
 	} else if err != nil {
 		return Instance{}, fmt.Errorf("read instance configuration: %w", err)
 	}
@@ -176,8 +178,13 @@ func FetchInstance(name string) (Instance, error) {
 
 	inst.Name = name
 
-	// If instance is using JSON config, migrate it to TOML. Also resets formatting of configuration if changed.
-	inst.WriteConfig()
+	// If instance is using JSON config, migrate it to TOML
+	if isJSON {
+		if err := inst.WriteConfig(); err != nil {
+			return Instance{}, fmt.Errorf("migrate instance to TOML: %w", err)
+		}
+	}
+
 	return inst, nil
 }
 

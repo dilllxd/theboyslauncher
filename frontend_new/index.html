@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://modpacks.dylan.lol">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://modpacks.dylan.lol https://api.mineatar.io">
     <title>TheBoysLauncher</title>
     <style>
         * {
@@ -134,9 +134,9 @@
         }
 
         .account-avatar {
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
+            width: 44px;
+            height: 44px;
+            border-radius: 8px;
             background: #3EB489;
             display: flex;
             align-items: center;
@@ -144,6 +144,10 @@
             font-size: 18px;
             color: white;
             flex-shrink: 0;
+        }
+
+        .account-avatar img {
+            background: transparent;
         }
 
         .account-info {
@@ -304,6 +308,22 @@
 
         .btn-danger:hover {
             background: rgba(239, 68, 68, 0.1);
+        }
+
+        .btn-warning {
+            background: #F59E0B;
+            border-color: #F59E0B;
+            color: white;
+        }
+
+        .btn-warning:hover {
+            background: #D97706;
+        }
+
+        .update-available {
+            color: #F59E0B;
+            font-weight: 600;
+            font-size: 13px;
         }
 
         .empty-state {
@@ -475,6 +495,158 @@
             word-break: break-all;
         }
 
+        /* Migration Modal Styles */
+        .migration-info {
+            text-align: center;
+        }
+
+        .migration-details {
+            margin: 20px 0;
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            flex-wrap: wrap;
+        }
+
+        .migration-stat {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .stat-icon {
+            font-size: 20px;
+        }
+
+        .stat-text {
+            font-size: 14px;
+            color: #E4E4E7;
+        }
+
+        .migration-warning {
+            background: rgba(255, 193, 7, 0.1);
+            border: 1px solid rgba(255, 193, 7, 0.3);
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: left;
+        }
+
+        .migration-warning h5 {
+            color: #FFC107;
+            margin-bottom: 12px;
+            font-size: 14px;
+        }
+
+        .migration-warning ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+
+        .migration-warning li {
+            margin-bottom: 8px;
+            font-size: 13px;
+            color: #E4E4E7;
+        }
+
+        .migration-question {
+            font-size: 16px;
+            font-weight: 600;
+            color: #E4E4E7;
+            margin: 20px 0 0 0;
+        }
+
+        .migration-progress {
+            text-align: center;
+        }
+
+        .migration-success {
+            text-align: center;
+        }
+
+        .migration-results {
+            margin: 20px 0;
+            text-align: left;
+        }
+
+        .migration-results h5 {
+            margin-bottom: 12px;
+            color: #4CAF50;
+        }
+
+        .migration-results ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+
+        .migration-results li {
+            margin-bottom: 8px;
+            color: #E4E4E7;
+        }
+
+        .migration-next-steps {
+            margin-top: 20px;
+            padding: 16px;
+            background: rgba(76, 175, 80, 0.1);
+            border-radius: 8px;
+            border: 1px solid rgba(76, 175, 80, 0.3);
+            font-size: 14px;
+        }
+
+        .migration-error {
+            text-align: center;
+        }
+
+        .error-details {
+            background: rgba(244, 67, 54, 0.1);
+            border: 1px solid rgba(244, 67, 54, 0.3);
+            border-radius: 8px;
+            padding: 16px;
+            margin: 16px 0;
+        }
+
+        .error-details code {
+            color: #FF6B6B;
+            font-family: monospace;
+            font-size: 13px;
+            word-break: break-all;
+        }
+
+        /* Account Choice Modal Styles */
+        .account-choice-modal h4 {
+            margin-bottom: 16px;
+            color: #E4E4E7;
+        }
+
+        .account-options {
+            margin: 20px 0;
+        }
+
+        .account-option {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .account-option strong {
+            display: block;
+            margin-bottom: 8px;
+            color: #3EB489;
+            font-size: 16px;
+        }
+
+        .account-option p {
+            margin: 0;
+            color: #B0B0B3;
+            line-height: 1.4;
+        }
+
         /* Account Manager Styles */
         .account-modal-content {
             max-width: 600px;
@@ -545,9 +717,9 @@
         }
 
         .account-item-avatar {
-            width: 50px;
-            height: 50px;
-            border-radius: 50%;
+            width: 54px;
+            height: 54px;
+            border-radius: 8px;
             background: linear-gradient(135deg, #3EB489 0%, #22C55E 100%);
             display: flex;
             align-items: center;
@@ -1058,7 +1230,7 @@
                     </div>
                     <p>3. Sign in to your Microsoft account</p>
 
-                    <button onclick="openMicrosoftLoginPage()" class="btn btn-primary">🌐 Open Login Page</button>
+                    <button onclick="openMicrosoftLoginPage()" class="btn btn-primary">🌐 Open Page & Copy Code</button>
 
                     <div class="login-progress">
                         <p id="loginStatus">Waiting for you to sign in...</p>
@@ -1090,6 +1262,25 @@
         </div>
     </div>
 
+    <!-- Prism Migration Modal -->
+    <div class="modal" id="prismMigrationModal" style="display: none;">
+        <div class="modal-content" style="max-width: 600px;">
+            <div class="modal-header">
+                <h3>📦 Migrate from Prism Launcher</h3>
+                <button class="close-btn" onclick="closePrismMigration()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="migrationContent">
+                    <p>Detecting Prism installation...</p>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closePrismMigration()" id="migrationCancelBtn">Cancel</button>
+                <button class="btn btn-primary" onclick="startMigration()" id="migrationStartBtn" style="display: none;">Start Migration</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Confirmation Modal -->
     <div class="modal" id="confirmModal" style="display: none;">
         <div class="modal-content">
@@ -1107,17 +1298,46 @@
         </div>
     </div>
 
+    <!-- Update Instance Modal -->
+    <div class="modal" id="updateModal" style="display: none;">
+        <div class="modal-content" style="max-width: 500px;">
+            <div class="modal-header">
+                <h3>🔄 Update Instance</h3>
+                <button class="close-btn" onclick="closeUpdateModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="updateContent">
+                    <p>Checking for updates...</p>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeUpdateModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="launchInstanceWithUpdateCheck()" id="launchAnywayBtn" style="display: none;">Launch Anyway</button>
+                <button class="btn btn-warning" onclick="updateInstance()" id="updateBtn" style="display: none;">Update Now</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Global state
         let currentView = 'instances';
         let instances = [];
         let statusRefreshInterval = null;
 
+        // Settings state tracking
+        let currentInstanceSettings = {};
+        let originalInstanceSettings = {};
+        let hasUnsavedChanges = false;
+
         // Initialize the app
         async function init() {
             await loadInstances();
             await loadMinecraftVersions();
             await updateAccountDisplay(); // Initialize account display
+
+            // Check for Prism migration on startup
+            await checkPrismMigration();
+
             showView('instances');
             setupEventListeners();
         }
@@ -1139,6 +1359,18 @@
 
         // View management
         function showView(view) {
+            // Check for unsaved changes when leaving settings
+            if (currentView === 'settings' && view !== 'settings' && hasUnsavedChanges) {
+                showUnsavedChangesModal(() => {
+                    navigateToView(view);
+                });
+                return;
+            }
+
+            navigateToView(view);
+        }
+
+        function navigateToView(view) {
             currentView = view;
             const main = document.getElementById('main');
 
@@ -1170,15 +1402,39 @@
                 const instanceData = await window.go.main.App.GetInstances();
                 const runningInstances = await window.go.main.App.GetRunningInstances() || [];
 
-                instances = instanceData.map(inst => ({
-                    name: inst.name,
-                    gameVersion: inst.game_version,
-                    modLoader: inst.mod_loader ? inst.mod_loader : 'Vanilla',
-                    running: Array.isArray(runningInstances) && runningInstances.includes(inst.name)
-                }));
-                            } catch (error) {
+                // Check for updates
+                const updates = await window.go.main.App.CheckInstanceUpdates().catch(err => {
+                    console.error('Failed to check for updates:', err);
+                    return [];
+                });
+
+                instances = instanceData.map(inst => {
+                    const updateInfo = updates && updates.find ? updates.find(update => update.name === inst.name) : null;
+                    const isPackwiz = inst.config && inst.config.packwiz && inst.config.packwiz.url;
+                    const hasUpdate = updateInfo ? updateInfo.has_update : false;
+
+                    console.log(`Instance ${inst.name}:`, {
+                        hasUpdate,
+                        isPackwiz,
+                        updateInfo
+                    });
+
+                    return {
+                        name: inst.name,
+                        gameVersion: inst.game_version || 'Unknown',
+                        modLoader: inst.mod_loader ? (inst.mod_loader.charAt(0).toUpperCase() + inst.mod_loader.slice(1)) : 'Vanilla',
+                        running: Array.isArray(runningInstances) && runningInstances.includes(inst.name),
+                        hasUpdate: hasUpdate,
+                        currentVersion: updateInfo ? updateInfo.current_version : null,
+                        newVersion: updateInfo ? updateInfo.new_version : null,
+                        isPackwiz: isPackwiz
+                    };
+                });
+                showInstances();
+            } catch (error) {
                 console.error('Failed to load instances:', error);
                 instances = [];
+                showInstances();
             }
         }
 
@@ -1304,22 +1560,26 @@
                     </div>
                     <div class="instance-info">
                         Version: ${instance.gameVersion}<br>
-                        Mod Loader: ${instance.modLoader || 'Vanilla'}
+                        Mod Loader: ${instance.modLoader || 'Vanilla'}${instance.hasUpdate ? '<br><span class="update-available">🔄 Update Available</span>' : ''}
                     </div>
                     <div class="instance-actions">
                         ${instance.running ?
                             `<button class="btn btn-danger" onclick="killInstance('${instance.name}')">
                                 ⛔ Kill
                             </button>` :
+                            // Combined logic for both packwiz and regular instances
+                            // Show update button only when there are updates available
+                            (instance.hasUpdate ?
+                                `<button class="btn btn-warning" onclick="showUpdateDialog('${instance.name}')" title="Update available from ${instance.currentVersion || 'current'} to ${instance.newVersion || 'latest'}${instance.isPackwiz ? ' (required before launch)' : ''}">
+                                    🔄 Update ${instance.isPackwiz ? 'Required' : 'Available'}
+                                </button>` :
+                            // For regular instances without updates, just show Launch button
                             `<button class="btn btn-primary" onclick="launchInstance('${instance.name}')">
                                 Launch
-                            </button>`
+                            </button>`)
                         }
                         <button class="btn" onclick="configureInstance('${instance.name}')" title="Configure instance settings">
                             ⚙️ Settings
-                        </button>
-                        <button class="btn" onclick="showRenameInstanceModal('${instance.name}')" title="Rename instance">
-                            ✏️ Rename
                         </button>
                         <button class="btn btn-danger" onclick="deleteInstance('${instance.name}')" title="Delete instance" ${instance.running ? 'disabled' : ''}>
                             🗑️ Delete
@@ -1430,6 +1690,7 @@
                         <div class="settings-actions">
                             <button class="btn btn-primary" onclick="saveGlobalSettings()">💾 Save Global Settings</button>
                             <button class="btn btn-secondary" onclick="resetGlobalSettings()">🔄 Reset to Defaults</button>
+                            <button class="btn btn-info" onclick="openLauncherFolder()">📁 Open Launcher Folder</button>
                         </div>
                     </div>
 
@@ -1446,6 +1707,15 @@
                         </div>
 
                         <div id="instanceSettingsContent" style="display: none;">
+                            <div class="settings-section">
+                                <h3>Instance Name</h3>
+                                <div class="form-group">
+                                    <label class="form-label">Instance Name</label>
+                                    <input type="text" id="instanceName" class="form-input" placeholder="Enter instance name..." maxlength="50">
+                                    <p class="help-text">Changing the instance name will rename the instance folder</p>
+                                </div>
+                            </div>
+
                             <div class="settings-section">
                                 <h3>Java Settings</h3>
                                 <div class="form-group">
@@ -1486,6 +1756,7 @@
                             <div class="settings-actions">
                                 <button class="btn btn-primary" onclick="saveInstanceSettings()">💾 Save Instance Settings</button>
                                 <button class="btn btn-secondary" onclick="resetInstanceSettings()">🔄 Reset to Global Defaults</button>
+                                <button class="btn btn-info" onclick="openInstanceFolder()" id="openInstanceFolderBtn" style="display: none;">📁 Open Instance Folder</button>
                             </div>
                         </div>
                     </div>
@@ -1718,13 +1989,18 @@
         }
 
         function updateProgress(progress) {
-            console.log('Updating progress with data:', progress);
-
             // Try to update the overlay first
             const stageEl = document.getElementById('progressStage');
             const messageEl = document.getElementById('progressMessage');
             const percentageEl = document.getElementById('progressPercentage');
             const barEl = document.getElementById('progressBar');
+
+            // If progress elements don't exist, the overlay was hidden, so exit early
+            if (!stageEl && !messageEl && !percentageEl && !barEl) {
+                return;
+            }
+
+            console.log('Updating progress with data:', progress);
 
             if (stageEl) stageEl.textContent = progress.stage || 'Unknown';
             if (messageEl) messageEl.textContent = progress.message || 'Processing...';
@@ -1835,16 +2111,35 @@
                     return;
                 }
 
+                // Auto-check for updates before launching
+                try {
+                    const updateInfo = await window.go.main.App.CheckInstanceUpdate(name);
+                    if (updateInfo.has_update) {
+                        showUpdateDialog(name);
+                        return;
+                    }
+                } catch (error) {
+                    console.log('Update check failed, launching anyway:', error);
+                }
+
                 // Check for active account first
                 let username = null;
+                let hasAccount = false;
                 try {
                     const activeAccount = await window.go.main.App.GetActiveAccount();
                     if (activeAccount) {
                         username = activeAccount.username;
+                        hasAccount = true;
                         console.log('Using active account:', username);
                     }
                 } catch (error) {
-                    console.log('No active account found, will launch offline');
+                    console.log('No active account found, will prompt user');
+                }
+
+                // If no account found, show choice modal
+                if (!hasAccount) {
+                    await showAccountChoiceModal(name);
+                    return;
                 }
 
                 console.log('Launching instance:', name, 'with account:', username || 'offline');
@@ -1864,6 +2159,206 @@
                 console.error('Launch error:', error);
                 hideProgress();
                 showNotification('Failed to launch instance: ' + error, 'error');
+            }
+        }
+
+        // Update-related functions
+        let currentUpdateInstance = null;
+
+        // Start packwiz update with progress display
+        async function startPackwizUpdate(instanceName) {
+            showProgress(`Updating ${instanceName}...`, 0, 100);
+
+            try {
+                console.log('Starting packwiz update for:', instanceName);
+                await window.go.main.App.UpdateInstance(instanceName);
+                showNotification(`Successfully updated ${instanceName}!`, 'success');
+
+                // Refresh instances after update
+                await loadInstances();
+
+                // Auto-launch after successful update
+                setTimeout(() => {
+                    launchInstance(instanceName);
+                }, 1000);
+
+            } catch (error) {
+                console.error('Update failed for', instanceName, ':', error);
+                showNotification(`Failed to update ${instanceName}: ${error.message || error}`, 'error');
+            } finally {
+                hideProgress();
+            }
+        }
+
+        // Show update dialog for an instance
+        async function showUpdateDialog(instanceName) {
+            currentUpdateInstance = instanceName;
+
+            // Check if this is a packwiz instance
+            const instances = await window.go.main.App.GetInstances();
+            const instance = instances.find(inst => inst.name === instanceName);
+            const isPackwiz = instance && instance.config && instance.config.packwiz && instance.config.packwiz.url;
+
+            // For packwiz instances, start update immediately with progress modal
+            if (isPackwiz) {
+                await startPackwizUpdate(instanceName);
+                return;
+            }
+
+            // For non-packwiz instances, show confirmation modal
+            const modal = document.getElementById('updateModal');
+            const content = document.getElementById('updateContent');
+            const updateBtn = document.getElementById('updateBtn');
+            const launchAnywayBtn = document.getElementById('launchAnywayBtn');
+
+            // Show loading state
+            content.innerHTML = '<p>Checking for updates...</p>';
+            updateBtn.style.display = 'none';
+            launchAnywayBtn.style.display = 'none';
+
+            // Move modal to body and show with force styling
+            if (modal.parentNode !== document.body) {
+                document.body.appendChild(modal);
+            }
+            modal.style.cssText = `
+                display: flex !important;
+                position: fixed !important;
+                top: 0 !important;
+                left: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                z-index: 99999 !important;
+                background: rgba(0, 0, 0, 0.8) !important;
+                justify-content: center !important;
+                align-items: center !important;
+            `;
+
+            try {
+                const updateInfo = await window.go.main.App.CheckInstanceUpdate(instanceName);
+
+                if (updateInfo.has_update) {
+                    content.innerHTML = `
+                        <div class="update-info">
+                            <h4>🔄 Update Available!</h4>
+                            <div class="update-details">
+                                <p><strong>Instance:</strong> ${instanceName}</p>
+                                <p><strong>Current Version:</strong> ${updateInfo.current_version || 'Unknown'}</p>
+                                <p><strong>New Version:</strong> ${updateInfo.new_version || 'Latest'}</p>
+                            </div>
+                            <div class="update-message">
+                                <p>${isPackwiz ?
+                                    '⚠️ <strong>Update required before launch.</strong> This Packwiz instance must be updated to the latest version before you can launch it.' :
+                                    'Would you like to update to the latest version before launching?'}</p>
+                            </div>
+                        </div>
+                    `;
+                    updateBtn.style.display = 'inline-block';
+                    // For packwiz instances, don't show launch anyway button - update is required
+                    if (isPackwiz) {
+                        launchAnywayBtn.style.display = 'none';
+                        updateBtn.textContent = 'Update Required';
+                    } else {
+                        launchAnywayBtn.style.display = 'inline-block';
+                        updateBtn.textContent = 'Update Now';
+                    }
+                } else {
+                    // For packwiz instances with no updates, just launch directly
+                    if (isPackwiz) {
+                        closeUpdateModal();
+                        launchInstance(instanceName);
+                        return;
+                    }
+
+                    content.innerHTML = `
+                        <div class="update-info">
+                            <h4>✅ No Updates Available</h4>
+                            <p>Your instance is already up to date.</p>
+                        </div>
+                    `;
+
+                    // Auto close after 2 seconds for regular instances
+                    setTimeout(() => {
+                        closeUpdateModal();
+                    }, 2000);
+                }
+            } catch (error) {
+                content.innerHTML = `
+                    <div class="update-error">
+                        <h4>❌ Update Check Failed</h4>
+                        <p>Failed to check for updates:</p>
+                        <p><code>${error.message || error}</code></p>
+                    </div>
+                `;
+                launchAnywayBtn.style.display = 'inline-block';
+                launchAnywayBtn.textContent = 'Launch Anyway';
+            }
+        }
+
+        // Close update modal
+        function closeUpdateModal() {
+            document.getElementById('updateModal').style.display = 'none';
+            currentUpdateInstance = null;
+        }
+
+        // Launch instance with update check (for auto-check on launch)
+        async function launchInstanceWithUpdateCheck(name) {
+            closeUpdateModal();
+
+            // Quick check for updates before launching
+            try {
+                const updateInfo = await window.go.main.App.CheckInstanceUpdate(name);
+
+                if (updateInfo.has_update) {
+                    // Show update dialog
+                    showUpdateDialog(name);
+                    return;
+                }
+            } catch (error) {
+                console.log('Quick update check failed, launching anyway:', error);
+            }
+
+            // No updates or check failed, launch normally
+            launchInstance(name);
+        }
+
+        // Update instance
+        async function updateInstance() {
+            console.log('updateInstance called, currentUpdateInstance:', currentUpdateInstance);
+            if (!currentUpdateInstance) {
+                showNotification('No instance selected for update', 'error');
+                return;
+            }
+
+            const updateBtn = document.getElementById('updateBtn');
+            const originalText = updateBtn.textContent;
+            updateBtn.disabled = true;
+            updateBtn.textContent = 'Updating...';
+
+            try {
+                await window.go.main.App.UpdateInstance(currentUpdateInstance);
+                showNotification(`Successfully updated ${currentUpdateInstance}!`, 'success');
+
+                // Check if this is a packwiz instance to determine auto-launch behavior
+                const instances = await window.go.main.App.GetInstances();
+                const instance = instances.find(inst => inst.name === currentUpdateInstance);
+                const isPackwiz = instance && instance.config && instance.config.packwiz && instance.config.packwiz.url;
+
+                // Refresh instances after update
+                await loadInstances();
+                closeUpdateModal();
+
+                // Auto-launch after successful update for packwiz instances (required behavior)
+                if (isPackwiz) {
+                    setTimeout(() => {
+                        launchInstance(currentUpdateInstance);
+                    }, 1000);
+                }
+
+            } catch (error) {
+                console.error('Update failed for', currentUpdateInstance, ':', error);
+                showNotification(`Failed to update ${currentUpdateInstance}: ${error.message || error}`, 'error');
+                updateBtn.disabled = false;
+                updateBtn.textContent = originalText;
             }
         }
 
@@ -2033,14 +2528,24 @@
                 if (activeAccount) {
                     usernameEl.textContent = activeAccount.username;
                     statusEl.textContent = activeAccount.needs_login ? 'Login required' : 'Online';
-                    avatarEl.textContent = '👤'; // Could use first letter of username
+
+                    // Show Minecraft skin avatar if UUID is available
+                    if (activeAccount.uuid) {
+                        avatarEl.style.background = 'transparent';
+                        avatarEl.innerHTML = `<img src="https://api.mineatar.io/face/${activeAccount.uuid}?scale=44" alt="${activeAccount.username}" onerror="this.parentElement.style.background='#3EB489'; this.parentElement.textContent='👤'" style="width: 44px; height: 44px; border-radius: 8px; object-fit: cover;">`;
+                    } else {
+                        avatarEl.style.background = '#3EB489';
+                        avatarEl.textContent = '👤';
+                    }
                 } else if (accounts && accounts.length > 0) {
                     usernameEl.textContent = 'No active account';
                     statusEl.textContent = 'Click to select account';
+                    avatarEl.style.background = '#3EB489';
                     avatarEl.textContent = '👤';
                 } else {
                     usernameEl.textContent = 'Offline';
                     statusEl.textContent = 'Click to login';
+                    avatarEl.style.background = '#3EB489';
                     avatarEl.textContent = '👤';
                 }
             } catch (error) {
@@ -2393,7 +2898,7 @@
 
                 accountsList.innerHTML = accounts.map(account => `
                     <div class="account-item ${account.is_active ? 'active' : ''}">
-                        <div class="account-item-avatar">👤</div>
+                        <div class="account-item-avatar"${account.uuid ? ` style="background: transparent;"` : ''}>${account.uuid ? `<img src="https://api.mineatar.io/face/${account.uuid}?scale=54" alt="${account.username}" onerror="this.parentElement.style.background='linear-gradient(135deg, #3EB489 0%, #22C55E 100%)'; this.parentElement.textContent='👤'" style="width: 54px; height: 54px; border-radius: 8px; object-fit: cover;">` : '👤'}</div>
                         <div class="account-item-info">
                             <div class="account-item-username">${account.username}</div>
                             <div class="account-item-details">
@@ -2514,6 +3019,15 @@
 
         function openMicrosoftLoginPage() {
             if (currentLoginData && currentLoginData.verification_uri) {
+                // Copy the device code first
+                if (currentLoginData.user_code) {
+                    navigator.clipboard.writeText(currentLoginData.user_code).then(() => {
+                        showNotification('Device code copied to clipboard!', 'success');
+                    }).catch(() => {
+                        showNotification('Failed to copy device code', 'error');
+                    });
+                }
+
                 // Open in the user's default browser using Wails runtime
                 if (window.go && window.go.main && window.go.main.App) {
                     window.go.main.App.OpenBrowser(currentLoginData.verification_uri);
@@ -2614,9 +3128,323 @@
             }
         }
 
+        // Prism Migration Functions
+        let migrationInfo = null;
+        let selectedPrismPath = null;
+
+        // Check for Prism migration on startup
+        async function checkPrismMigration() {
+            try {
+                const result = await window.go.main.App.DetectMigration();
+                migrationInfo = result;
+
+                if (result.can_migrate) {
+                    showMigrationPrompt(result);
+                }
+            } catch (error) {
+                console.error('Failed to check for Prism migration:', error);
+            }
+        }
+
+        // Show migration prompt
+        function showMigrationPrompt(info) {
+            console.log('Migration prompt called with:', info);
+            const content = document.getElementById('migrationContent');
+            const modal = document.getElementById('prismMigrationModal');
+
+            if (info.installations && info.installations.length > 0) {
+                selectedPrismPath = info.installations[0]; // Select first found installation
+
+                const sizeText = formatFileSize(info.estimated_size);
+                const instanceText = info.instance_count === 1 ? '1 instance' : `${info.instance_count} instances`;
+
+                content.innerHTML = `
+                    <div class="migration-info">
+                        <h4>🎮 Prism Launcher Detected!</h4>
+                        <p>We found a Prism Launcher installation with your Minecraft data.</p>
+                        <div class="migration-details">
+                            <div class="migration-stat">
+                                <span class="stat-icon">📁</span>
+                                <span class="stat-text">${instanceText} found</span>
+                            </div>
+                            <div class="migration-stat">
+                                <span class="stat-icon">💾</span>
+                                <span class="stat-text">${sizeText} of game data</span>
+                            </div>
+                        </div>
+                        <div class="migration-warning">
+                            <h5>⚠️ Important Notes:</h5>
+                            <ul>
+                                <li>We'll migrate your game data (worlds, mods, resource packs, configs)</li>
+                                <li>You'll need to log in again with your Microsoft account</li>
+                                <li>A backup will be created automatically</li>
+                                <li>Old Prism files can be cleaned up afterward</li>
+                            </ul>
+                        </div>
+                        <p class="migration-question">Would you like to migrate your data?</p>
+                    </div>
+                `;
+
+                document.getElementById('migrationStartBtn').style.display = 'inline-block';
+                document.getElementById('migrationCancelBtn').textContent = 'Skip';
+            } else {
+                content.innerHTML = `
+                    <p>No Prism Launcher installation found.</p>
+                    <p>You can continue using the launcher normally.</p>
+                `;
+                document.getElementById('migrationStartBtn').style.display = 'none';
+                document.getElementById('migrationCancelBtn').textContent = 'Close';
+            }
+
+            // Ensure modal is properly placed in the DOM
+            if (modal.parentNode !== document.body) {
+                document.body.appendChild(modal);
+            }
+
+            // Show the modal using flex for centering
+            modal.style.display = 'flex';
+
+            // Ensure it's visible with timeout
+            setTimeout(() => {
+                modal.style.display = 'flex';
+            }, 100);
+        }
+
+        // Format file size for display
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        // Start migration process
+        async function startMigration() {
+            if (!selectedPrismPath) {
+                showNotification('No Prism installation selected', 'error');
+                return;
+            }
+
+            // Close the migration modal and show consistent progress
+            closePrismMigration();
+
+            // Show progress using the same system as launching/updating
+            showProgress("Migrating from Prism Launcher...", 0, 100);
+            updateProgress({
+                progress: 0,
+                stage: "Starting migration...",
+                message: "Preparing to migrate your Prism data..."
+            });
+
+            try {
+                // Update progress during migration
+                updateProgress({
+                    progress: 25,
+                    stage: "Detecting Prism instances...",
+                    message: "Scanning for existing instances"
+                });
+                await new Promise(resolve => setTimeout(resolve, 500)); // Brief pause for UX
+
+                updateProgress({
+                    progress: 50,
+                    stage: "Migrating instances...",
+                    message: "Copying instance data and configurations"
+                });
+                const result = await window.go.main.App.StartMigration(selectedPrismPath);
+
+                if (result.success) {
+                    updateProgress({
+                        progress: 90,
+                        stage: "Finalizing migration...",
+                        message: "Completing migration process"
+                    });
+                    await new Promise(resolve => setTimeout(resolve, 500));
+
+                    updateProgress({
+                        progress: 100,
+                        stage: "Migration Complete!",
+                        message: "Successfully migrated all Prism data"
+                    });
+
+                    // Show success message briefly before closing
+                    setTimeout(() => {
+                        hideProgress();
+                        showNotification('Migration completed successfully!', 'success');
+                        // Refresh instances to show migrated data
+                        loadInstances();
+                    }, 2000);
+
+                } else {
+                    throw new Error(result.errors ? result.errors.join(', ') : 'Unknown migration error');
+                }
+
+            } catch (error) {
+                hideProgress();
+                showNotification('Migration failed: ' + error.message, 'error');
+
+                // Re-show the migration modal with error
+                const modal = document.getElementById('migrationModal');
+                const content = document.getElementById('migrationContent');
+                const startBtn = document.getElementById('migrationStartBtn');
+                const cancelBtn = document.getElementById('migrationCancelBtn');
+
+                // Re-enable buttons
+                startBtn.disabled = false;
+                cancelBtn.disabled = false;
+                startBtn.textContent = 'Start Migration';
+
+                content.innerHTML = `
+                    <div class="migration-error">
+                        <h4>❌ Migration Failed</h4>
+                        <p>Sorry, the migration encountered an error:</p>
+                        <div class="error-details">
+                            <code>${error.message}</code>
+                        </div>
+                        <p>Please try again or contact support for assistance.</p>
+                    </div>
+                `;
+
+                // Show modal again
+                modal.style.cssText = `
+                    display: flex !important;
+                    position: fixed !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    width: 100% !important;
+                    height: 100% !important;
+                    z-index: 99999 !important;
+                    background: rgba(0, 0, 0, 0.8) !important;
+                    justify-content: center !important;
+                    align-items: center !important;
+                `;
+            }
+        }
+
+        // Close migration modal
+        function closePrismMigration() {
+            document.getElementById('prismMigrationModal').style.display = 'none';
+        }
+
+        // Show account choice modal when no account is found
+        async function showAccountChoiceModal(instanceName) {
+            const modal = document.getElementById('confirmModal');
+            const message = document.getElementById('confirmMessage');
+            const confirmBtn = document.getElementById('confirmButton');
+
+            message.innerHTML = `
+                <div class="account-choice-modal">
+                    <h4>🎮 No Account Found</h4>
+                    <p>You don't have a Microsoft account added to play online.</p>
+                    <div class="account-options">
+                        <div class="account-option">
+                            <strong>🌐 Add Microsoft Account</strong>
+                            <p>Sign in with your Microsoft account to play online with friends and access official servers.</p>
+                        </div>
+                        <div class="account-option">
+                            <strong>👤 Play Offline</strong>
+                            <p>Play offline with a custom username. You won't be able to join online servers.</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            confirmBtn.textContent = 'Add Microsoft Account';
+            confirmBtn.className = 'btn btn-primary';
+
+            modal.style.display = 'block';
+
+            // Store original handlers
+            const originalClick = confirmBtn.onclick;
+            const originalClose = window.closeConfirmModal;
+
+            // Set up custom handlers
+            confirmBtn.onclick = () => {
+                closeConfirmModal();
+                showAccountManager(); // Open account manager
+            };
+
+            // Add "Play Offline" button
+            const actionsContainer = confirmBtn.parentElement;
+            const offlineBtn = document.createElement('button');
+            offlineBtn.className = 'btn btn-secondary';
+            offlineBtn.textContent = 'Play Offline';
+            offlineBtn.style.marginLeft = '10px';
+            offlineBtn.onclick = () => {
+                closeConfirmModal();
+                showOfflineLoginModal(instanceName);
+            };
+            actionsContainer.appendChild(offlineBtn);
+
+            // Override close modal to cleanup
+            window.closeConfirmModal = () => {
+                // Restore original handlers
+                confirmBtn.onclick = originalClick;
+                if (offlineBtn.parentNode) {
+                    offlineBtn.parentNode.removeChild(offlineBtn);
+                }
+                document.getElementById('confirmModal').style.display = 'none';
+                window.closeConfirmModal = originalClose;
+            };
+        }
+
+        // Show offline login modal with pre-filled instance name
+        function showOfflineLoginModal(instanceName) {
+            document.getElementById('offlineUsername').value = '';
+            document.getElementById('offlineLoginModal').style.display = 'block';
+
+            // Override the confirm function to use the instance name
+            const originalConfirmOffline = window.confirmOfflineLogin;
+            window.confirmOfflineLogin = () => {
+                const username = document.getElementById('offlineUsername').value.trim();
+                if (!username) {
+                    showNotification('Please enter a username', 'error');
+                    return;
+                }
+                if (username.length < 3 || username.length > 16) {
+                    showNotification('Username must be between 3 and 16 characters', 'error');
+                    return;
+                }
+
+                closeOfflineLogin();
+                launchInstanceOffline(instanceName, username);
+                window.confirmOfflineLogin = originalConfirmOffline;
+            };
+
+            // Restore original close function
+            const originalCloseOffline = window.closeOfflineLogin;
+            window.closeOfflineLogin = () => {
+                window.confirmOfflineLogin = originalConfirmOffline;
+                window.closeOfflineLogin = originalCloseOffline;
+                document.getElementById('offlineLoginModal').style.display = 'none';
+            };
+        }
+
+        // Launch instance in offline mode
+        async function launchInstanceOffline(instanceName, username) {
+            try {
+                console.log('Launching instance in offline mode:', instanceName, 'with username:', username);
+                showProgress();
+                await window.go.main.App.LaunchInstance(instanceName, username);
+                console.log('Offline launch completed');
+
+                // Wait a moment then refresh to check running status
+                setTimeout(async () => {
+                    console.log('Checking running status after offline launch...');
+                    await loadInstances();
+                    showInstances();
+                }, 2000);
+
+                showInstances();
+            } catch (error) {
+                console.error('Offline launch error:', error);
+                hideProgress();
+                showNotification('Failed to launch instance: ' + error, 'error');
+            }
+        }
+
         // Settings Functions
         let currentGlobalSettings = null;
-        let currentInstanceSettings = {};
 
         // Show specific settings tab
         function showSettingsTab(tab) {
@@ -2725,6 +3553,13 @@
 
             if (!instanceName) {
                 document.getElementById('instanceSettingsContent').style.display = 'none';
+
+                // Hide the "Open Instance Folder" button when no instance is selected
+                const openInstanceFolderBtn = document.getElementById('openInstanceFolderBtn');
+                if (openInstanceFolderBtn) {
+                    openInstanceFolderBtn.style.display = 'none';
+                }
+
                 return;
             }
 
@@ -2739,16 +3574,30 @@
 
                 document.getElementById('instanceSettingsContent').style.display = 'block';
 
+                // Show the "Open Instance Folder" button when an instance is loaded
+                const openInstanceFolderBtn = document.getElementById('openInstanceFolderBtn');
+                if (openInstanceFolderBtn) {
+                    openInstanceFolderBtn.style.display = 'inline-block';
+                }
+
                 // Check if this is a modpack instance with recommended settings
                 const isModpackInstance = settings.packwiz && settings.packwiz.name;
 
                 // Populate form fields with actual current values
+                document.getElementById('instanceName').value = instanceName;
                 document.getElementById('instanceJavaPath').value = settings.java || '';
                 document.getElementById('instanceJavaArgs').value = settings.javaArgs || '';
                 document.getElementById('instanceMinMemory').value = settings.min_memory || 1024;
                 document.getElementById('instanceMaxMemory').value = settings.max_memory || 4096;
                 document.getElementById('instanceWindowWidth').value = settings.resolution.width || 854;
                 document.getElementById('instanceWindowHeight').value = settings.resolution.height || 480;
+
+                // Store original settings for change detection
+                originalInstanceSettings[instanceName] = getCurrentInstanceSettings();
+                hasUnsavedChanges = false;
+
+                // Add change detection listeners
+                addInstanceSettingsChangeListeners();
 
                 console.log('UI values after population - Max Memory:', document.getElementById('instanceMaxMemory').value);
 
@@ -2784,13 +3633,34 @@
         // Save instance settings
         async function saveInstanceSettings() {
             const instanceName = document.getElementById('instanceSelector').value;
+            const newInstanceName = document.getElementById('instanceName').value.trim();
 
             if (!instanceName) {
                 showNotification('Please select an instance first', 'error');
                 return;
             }
 
+            if (!newInstanceName) {
+                showNotification('Instance name cannot be empty', 'error');
+                return;
+            }
+
+            if (newInstanceName.length < 3) {
+                showNotification('Instance name must be at least 3 characters', 'error');
+                return;
+            }
+
             try {
+                // Handle name change if different
+                let finalInstanceName = instanceName;
+                if (newInstanceName !== instanceName) {
+                    await window.go.main.App.RenameInstance(instanceName, newInstanceName);
+                    finalInstanceName = newInstanceName;
+
+                    // Update the selector with the new name
+                    document.getElementById('instanceSelector').value = finalInstanceName;
+                }
+
                 const settings = {
                     java: document.getElementById('instanceJavaPath').value,
                     javaArgs: document.getElementById('instanceJavaArgs').value,
@@ -2804,13 +3674,149 @@
                     packwiz: currentInstanceSettings[instanceName]?.packwiz || {},
                 };
 
-                await window.go.main.App.SaveInstanceSettings(instanceName, settings);
-                currentInstanceSettings[instanceName] = settings;
-                showNotification(`Settings saved for instance: ${instanceName}`, 'success');
+                await window.go.main.App.SaveInstanceSettings(finalInstanceName, settings);
+                currentInstanceSettings[finalInstanceName] = settings;
+
+                // Refresh instances list to reflect the name change
+                await loadInstances();
+
+                showNotification(`Settings saved for instance: ${finalInstanceName}`, 'success');
+                markSettingsAsUnchanged();
             } catch (error) {
                 showNotification('Failed to save instance settings: ' + error.message, 'error');
                 console.error('Failed to save instance settings:', error);
             }
+        }
+
+        // Unsaved changes detection functions
+        function getCurrentInstanceSettings() {
+            const instanceName = document.getElementById('instanceSelector').value;
+            if (!instanceName) return null;
+
+            return {
+                name: document.getElementById('instanceName').value,
+                java: document.getElementById('instanceJavaPath').value,
+                javaArgs: document.getElementById('instanceJavaArgs').value,
+                min_memory: parseInt(document.getElementById('instanceMinMemory').value),
+                max_memory: parseInt(document.getElementById('instanceMaxMemory').value),
+                resolution: {
+                    width: parseInt(document.getElementById('instanceWindowWidth').value),
+                    height: parseInt(document.getElementById('instanceWindowHeight').value),
+                },
+                customJar: '',
+                packwiz: currentInstanceSettings[instanceName]?.packwiz || {},
+            };
+        }
+
+        function compareSettings(settings1, settings2) {
+            if (!settings1 || !settings2) return false;
+
+            // Compare individual fields for better reliability
+            return (
+                settings1.name === settings2.name &&
+                settings1.java === settings2.java &&
+                settings1.javaArgs === settings2.javaArgs &&
+                settings1.min_memory === settings2.min_memory &&
+                settings1.max_memory === settings2.max_memory &&
+                settings1.resolution.width === settings2.resolution.width &&
+                settings1.resolution.height === settings2.resolution.height &&
+                settings1.customJar === settings2.customJar
+                // Note: We skip packwiz comparison since it's complex
+            );
+        }
+
+        function checkForUnsavedChanges() {
+            const current = getCurrentInstanceSettings();
+            const instanceName = document.getElementById('instanceSelector').value;
+            if (!instanceName || !current) return false;
+
+            const original = originalInstanceSettings[instanceName];
+            const isChanged = !compareSettings(current, original);
+            hasUnsavedChanges = isChanged;
+
+            return isChanged;
+        }
+
+        function markSettingsAsUnchanged() {
+            const instanceName = document.getElementById('instanceSelector').value;
+            if (!instanceName) return;
+
+            originalInstanceSettings[instanceName] = getCurrentInstanceSettings();
+            hasUnsavedChanges = false;
+        }
+
+        function showUnsavedChangesModal(callback) {
+            const modal = document.getElementById('confirmModal');
+            const message = document.getElementById('confirmMessage');
+            const confirmBtn = document.getElementById('confirmButton');
+
+            message.innerHTML = `
+                <h4>⚠️ Unsaved Changes</h4>
+                <p>You have unsaved changes to your instance settings.</p>
+                <p>Would you like to save your changes before leaving?</p>
+            `;
+
+            confirmBtn.textContent = 'Save & Exit';
+            confirmBtn.className = 'btn btn-primary';
+
+            modal.style.display = 'block';
+
+            // Set up temporary click handlers
+            const originalClick = confirmBtn.onclick;
+
+            confirmBtn.onclick = async () => {
+                await saveInstanceSettings();
+                closeConfirmModal();
+                if (callback) callback();
+            };
+
+            // Add "Discard Changes" button
+            const actionsContainer = confirmBtn.parentElement;
+            const discardBtn = document.createElement('button');
+            discardBtn.className = 'btn btn-secondary';
+            discardBtn.textContent = 'Discard Changes';
+            discardBtn.style.marginLeft = '10px';
+            discardBtn.onclick = () => {
+                closeConfirmModal();
+                if (callback) callback();
+            };
+            actionsContainer.appendChild(discardBtn);
+
+            // Cleanup on close
+            const closeModalOriginal = window.closeConfirmModal;
+            window.closeConfirmModal = () => {
+                // Restore original handlers
+                confirmBtn.onclick = originalClick;
+                if (discardBtn.parentNode) {
+                    discardBtn.parentNode.removeChild(discardBtn);
+                }
+                document.getElementById('confirmModal').style.display = 'none';
+                window.closeConfirmModal = closeModalOriginal;
+            };
+        }
+
+        function addInstanceSettingsChangeListeners() {
+            const inputFields = [
+                'instanceName',
+                'instanceJavaPath',
+                'instanceJavaArgs',
+                'instanceMinMemory',
+                'instanceMaxMemory',
+                'instanceWindowWidth',
+                'instanceWindowHeight'
+            ];
+
+            inputFields.forEach(fieldId => {
+                const element = document.getElementById(fieldId);
+                if (element) {
+                    element.addEventListener('input', () => {
+                        checkForUnsavedChanges();
+                    });
+                    element.addEventListener('change', () => {
+                        checkForUnsavedChanges();
+                    });
+                }
+            });
         }
 
         // Reset instance settings to global defaults
@@ -2849,6 +3855,34 @@
                     }
                 }
             );
+        }
+
+        // Open launcher directory in file explorer
+        async function openLauncherFolder() {
+            try {
+                await window.go.main.App.OpenLauncherDirectory();
+            } catch (error) {
+                showNotification('Failed to open launcher folder: ' + error.message, 'error');
+                console.error('Failed to open launcher folder:', error);
+            }
+        }
+
+        // Open instance directory in file explorer
+        async function openInstanceFolder() {
+            const instanceSelector = document.getElementById('instanceSelector');
+            const selectedInstance = instanceSelector.value;
+
+            if (!selectedInstance) {
+                showNotification('Please select an instance first', 'warning');
+                return;
+            }
+
+            try {
+                await window.go.main.App.OpenInstanceDirectory(selectedInstance);
+            } catch (error) {
+                showNotification('Failed to open instance folder: ' + error.message, 'error');
+                console.error('Failed to open instance folder:', error);
+            }
         }
 
         function showNotification(message, type = 'info') {

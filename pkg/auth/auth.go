@@ -265,6 +265,8 @@ var ErrNoAccount = errors.New("no account found")
 // authenticateFromStore authenticates using the current Store and returns a Session.
 // This is an internal helper function for temporary authentication flows.
 func authenticateFromStore() (Session, error) {
+	refreshed := false
+
 	if Store.MSA.RefreshToken == "" {
 		return Session{}, ErrNoAccount
 	}
@@ -272,22 +274,34 @@ func authenticateFromStore() (Session, error) {
 		if err := Store.MSA.refresh(); err != nil {
 			return Session{}, fmt.Errorf("authenticate with MSA: %w", err)
 		}
+		refreshed = true
 	}
 	if !Store.XBL.isValid() {
 		if err := Store.XBL.refresh(); err != nil {
 			return Session{}, fmt.Errorf("authenticate with Xbox Live: %w", err)
 		}
+		refreshed = true
 	}
 	if !Store.XSTS.isValid() {
 		if err := Store.XSTS.refresh(); err != nil {
 			return Session{}, fmt.Errorf("authenticate with XSTS: %w", err)
 		}
+		refreshed = true
 	}
 	if !Store.Minecraft.isValid() {
 		if err := Store.Minecraft.refresh(); err != nil {
 			return Session{}, fmt.Errorf("authenticate with Minecraft: %w", err)
 		}
+		refreshed = true
 	}
+
+	// Save refreshed tokens to cache if any were refreshed
+	if refreshed {
+		if err := Store.WriteToCache(); err != nil {
+			return Session{}, fmt.Errorf("save refreshed tokens: %w", err)
+		}
+	}
+
 	return Session{
 		Username:    Store.Minecraft.Username,
 		UUID:        Store.Minecraft.UUID,

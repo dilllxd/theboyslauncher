@@ -3,12 +3,19 @@
 import {main} from '../models';
 import {launcher} from '../models';
 import {context} from '../models';
+import {migration} from '../models';
+
+export function CheckInstanceUpdate(arg1:string):Promise<main.InstanceUpdateInfo>;
+
+export function CheckInstanceUpdates():Promise<Array<main.InstanceUpdateInfo>>;
 
 export function CompleteDeviceCodeLogin(arg1:string):Promise<void>;
 
 export function CreateInstance(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
 export function DeleteInstance(arg1:string):Promise<void>;
+
+export function DetectMigration():Promise<main.MigrationInfo>;
 
 export function GetAccounts():Promise<Array<main.AccountInfo>>;
 
@@ -48,6 +55,12 @@ export function OnStartup(arg1:context.Context):Promise<void>;
 
 export function OpenBrowser(arg1:string):Promise<void>;
 
+export function OpenDirectory(arg1:string):Promise<void>;
+
+export function OpenInstanceDirectory(arg1:string):Promise<void>;
+
+export function OpenLauncherDirectory():Promise<void>;
+
 export function RemoveAccount(arg1:string):Promise<void>;
 
 export function RenameInstance(arg1:string,arg2:string):Promise<void>;
@@ -63,3 +76,7 @@ export function ShowConfirmDialog(arg1:string,arg2:string):Promise<boolean>;
 export function ShowDialog(arg1:string,arg2:string):Promise<void>;
 
 export function ShowOfflineLoginDialog():Promise<Record<string, any>>;
+
+export function StartMigration(arg1:string):Promise<migration.MigrationResult>;
+
+export function UpdateInstance(arg1:string):Promise<void>;

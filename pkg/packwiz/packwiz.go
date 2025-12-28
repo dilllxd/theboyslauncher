@@ -258,6 +258,24 @@ func UpdateInstance(instance *launcher.Instance, packFile *PackFile) error {
 		return fmt.Errorf("failed to save updated instance configuration: %w", err)
 	}
 
+	// Create installer to download updated mods
+	installer := NewInstaller(instance.Dir(), false)
+
+	// Ensure packwiz installer is downloaded
+	if err := installer.downloadPackwizInstaller(instance.Dir()); err != nil {
+		return fmt.Errorf("failed to download packwiz installer: %w", err)
+	}
+
+	// Store the pack URL for the installer
+	if err := installer.StorePackURL(instance.Dir(), instance.Config.Packwiz.URL); err != nil {
+		return fmt.Errorf("failed to store pack URL: %w", err)
+	}
+
+	// Run packwiz installer to download and install updated mods
+	if err := installer.RunPackwizInstallerWithURL(instance.Dir(), instance.Config.Packwiz.URL, true); err != nil {
+		return fmt.Errorf("failed to install updated mods: %w", err)
+	}
+
 	return nil
 }
 

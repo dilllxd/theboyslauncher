@@ -165,6 +165,24 @@ export namespace main {
 	        this.closeOnLaunch = source["closeOnLaunch"];
 	    }
 	}
+	export class InstanceUpdateInfo {
+	    name: string;
+	    has_update: boolean;
+	    new_version?: string;
+	    current_version?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new InstanceUpdateInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.has_update = source["has_update"];
+	        this.new_version = source["new_version"];
+	        this.current_version = source["current_version"];
+	    }
+	}
 	export class LaunchProgress {
 	    stage: string;
 	    progress: number;
@@ -203,6 +221,24 @@ export namespace main {
 	        this.stable = source["stable"];
 	        this.version = source["version"];
 	        this.name = source["name"];
+	    }
+	}
+	export class MigrationInfo {
+	    can_migrate: boolean;
+	    installations: string[];
+	    estimated_size: number;
+	    instance_count: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new MigrationInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.can_migrate = source["can_migrate"];
+	        this.installations = source["installations"];
+	        this.estimated_size = source["estimated_size"];
+	        this.instance_count = source["instance_count"];
 	    }
 	}
 	export class MinecraftVersion {
@@ -275,6 +311,35 @@ export namespace main {
 	        this.snapshot = source["snapshot"];
 	        this.beta = source["beta"];
 	        this.alpha = source["alpha"];
+	    }
+	}
+
+}
+
+export namespace migration {
+	
+	export class MigrationResult {
+	    success: boolean;
+	    migrated_items: Record<string, string>;
+	    skipped_items: string[];
+	    errors: string[];
+	    backup_path: string;
+	    total_size: number;
+	    duration: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new MigrationResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.success = source["success"];
+	        this.migrated_items = source["migrated_items"];
+	        this.skipped_items = source["skipped_items"];
+	        this.errors = source["errors"];
+	        this.backup_path = source["backup_path"];
+	        this.total_size = source["total_size"];
+	        this.duration = source["duration"];
 	    }
 	}
 
