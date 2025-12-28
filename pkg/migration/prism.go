@@ -61,12 +61,12 @@ type MigrationResult struct {
 
 // Migrator handles the migration from Prism to TheBoysLauncher
 type Migrator struct {
-	PrismPath      string
-	LauncherPath   string
-	BackupPath     string
-	Progress       *MigrationProgress
-	ProgressChan   chan *MigrationProgress
-	TerminateChan  chan bool
+	PrismPath     string
+	LauncherPath  string
+	BackupPath    string
+	Progress      *MigrationProgress
+	ProgressChan  chan *MigrationProgress
+	TerminateChan chan bool
 }
 
 // NewMigrator creates a new migrator instance
@@ -92,20 +92,19 @@ func NewMigrator(prismPath string) (*Migrator, error) {
 func DetectPrismInstallations() ([]string, error) {
 	var installations []string
 
-	// For testing: Look for Prism in the specific demo directory
-	rootPath := "C:\\Users\\Dylan\\Desktop\\Prism Demo"
-
-	// Check if root directory exists
-	if _, err := os.Stat(rootPath); os.IsNotExist(err) {
+	// For testing: Allow override via TEST_PRISM_PATH env var
+	if testPath := os.Getenv("THEBOYSLAUNCHER_TEST_PRISM_PATH"); testPath != "" {
+		if _, err := os.Stat(testPath); err == nil {
+			installations = append(installations, testPath)
+		}
 		return installations, nil
 	}
 
-	// Look for prism subdirectory in the root
-	prismPath := filepath.Join(rootPath, "prism")
-
-	if isPrismInstallation(prismPath) {
-		installations = append(installations, prismPath)
-	}
+	// TODO: Implement standard Prism installation detection for production
+	// This would check standard directories like:
+	// - Windows: %APPDATA%/Prism Launcher
+	// - macOS: ~/Library/Application Support/Prism Launcher
+	// - Linux: ~/.prism
 
 	return installations, nil
 }
@@ -744,13 +743,13 @@ func (m *Migrator) setupWinterPackPackwiz(instancePath string, inst *launcher.In
 	}
 
 	var modpacks []struct {
-		ID             string `json:"id"`
-		DisplayName    string `json:"displayName"`
-		PackURL        string `json:"packUrl"`
-		InstanceName   string `json:"instanceName"`
-		Description    string `json:"description"`
-		Author         string `json:"author"`
-		Version        string `json:"version"`
+		ID           string `json:"id"`
+		DisplayName  string `json:"displayName"`
+		PackURL      string `json:"packUrl"`
+		InstanceName string `json:"instanceName"`
+		Description  string `json:"description"`
+		Author       string `json:"author"`
+		Version      string `json:"version"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&modpacks); err != nil {
@@ -759,13 +758,13 @@ func (m *Migrator) setupWinterPackPackwiz(instancePath string, inst *launcher.In
 
 	// Find WinterPack in the modpacks
 	var winterPack *struct {
-		ID             string `json:"id"`
-		DisplayName    string `json:"displayName"`
-		PackURL        string `json:"packUrl"`
-		InstanceName   string `json:"instanceName"`
-		Description    string `json:"description"`
-		Author         string `json:"author"`
-		Version        string `json:"version"`
+		ID           string `json:"id"`
+		DisplayName  string `json:"displayName"`
+		PackURL      string `json:"packUrl"`
+		InstanceName string `json:"instanceName"`
+		Description  string `json:"description"`
+		Author       string `json:"author"`
+		Version      string `json:"version"`
 	}
 
 	for _, modpack := range modpacks {
