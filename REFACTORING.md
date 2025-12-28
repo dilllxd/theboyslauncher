@@ -160,27 +160,19 @@ These are intentional UX patterns, not bugs. Converting to timeout contexts woul
 ## Phase 4: Testing & Validation 🧪
 *Est. Time: 4-5 hours | Risk: Medium | Impact: High*
 
-### P4.1: Add Tests for Authentication (0% → 70% coverage)
-**Status**: ⬜ NOT STARTED
+### P4.1: Add Tests for Authentication (0% → 70% coverage) ⏸ PAUSED
+**Status**: ⏸ PAUSED - Had module/import issues
 **Priority**: 🟠 HIGH
 **File**: `pkg/auth/auth.go`, `pkg/auth/accounts.go`
-**Estimated**: 1 hour
-
-**Tests Needed**:
-- [ ] TestFetchDeviceCode() - device code retrieval
-- [ ] TestAuthenticateMSA() - MSA authentication
-- [ ] TestAuthenticateXBL() - XBox Live authentication
-- [ ] TestTokenRefresh() - token expiration and refresh logic
-- [ ] TestAccountPersistence() - loading/saving accounts
-- [ ] TestAccountValidation() - `isValid()`, `ShouldRefresh()`, `isExpired()`
 
 **Tasks**:
-- [ ] Create `pkg/auth/auth_test.go`
-- [ ] Mock HTTP responses for testing
+- [x] Created `pkg/auth/auth_test.go` with test framework
 - [ ] Test success paths: valid OAuth flow, token storage
 - [ ] Test failure paths: invalid credentials, network errors
 - [ ] Test edge cases: expired tokens, malformed responses
 - [ ] Run `go test -cover ./pkg/auth` to verify >70% coverage
+
+**Notes**: Encountered issues with global variable state (ClientID, RedirectURI) causing test isolation problems. Need better dependency injection pattern. Skipping for now.
 
 ### P4.2: Add Tests for Migration (0% → 60% coverage)
 **Status**: ⬜ NOT STARTED
