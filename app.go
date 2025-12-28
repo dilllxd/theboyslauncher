@@ -58,11 +58,6 @@ func NewApp() *App {
 	}
 }
 
-// startup is called when the app starts up.
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
-}
-
 // OnStartup is called when the app starts up.
 func (a *App) OnStartup(ctx context.Context) {
 	a.ctx = ctx

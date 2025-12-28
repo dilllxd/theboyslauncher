@@ -1,4 +1,4 @@
-//go:build gui
+//go:build desktop
 
 package main
 
@@ -26,7 +26,7 @@ func main() {
 			Assets: assets,
 		},
 		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
-		OnStartup:        app.startup,
+		OnStartup:        app.OnStartup,
 		OnDomReady:       app.OnDomReady,
 		OnBeforeClose:    app.OnBeforeClose,
 		OnShutdown:       app.OnShutdown,
