@@ -109,3 +109,11 @@ fyne.bin
 # PowerShell scripts that might contain sensitive data
 *-cert.pfx
 sign-*.ps1
+
+# v4 Tauri/React/Rust rewrite artifacts
+node_modules/
+target/
+src-tauri/target/
+frontend/dist/
+frontend/node_modules/
+data/
