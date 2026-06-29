@@ -1599,6 +1599,7 @@ function App() {
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [showAccountsModal, setShowAccountsModal] = useState(false);
   const [repairInProgressProfileId, setRepairInProgressProfileId] = useState<string | null>(null);
+  const [setupInProgressProfileId, setSetupInProgressProfileId] = useState<string | null>(null);
   const [installInProgressPackId, setInstallInProgressPackId] = useState<string | null>(null);
   const [deleteInProgressProfileId, setDeleteInProgressProfileId] = useState<string | null>(null);
   const [lifecycleActionInProgressKey, setLifecycleActionInProgressKey] = useState<string | null>(null);
@@ -1666,6 +1667,13 @@ function App() {
       if (lifecycleActionInProgressRef.current === `repair:${event.subjectId}`) {
         lifecycleActionInProgressRef.current = null;
         setLifecycleActionInProgressKey(null);
+      }
+      if (event.message === "Profile setup completed.") {
+        setSetupInProgressProfileId((current) => (current === event.subjectId ? null : current));
+        if (lifecycleActionInProgressRef.current === `setup:${event.subjectId}`) {
+          lifecycleActionInProgressRef.current = null;
+          setLifecycleActionInProgressKey(null);
+        }
       }
       void loadBootstrapSnapshot().catch(() => undefined);
     } else if (event.operation === "delete_profile") {
@@ -1793,6 +1801,7 @@ function App() {
   const primaryPackHasActiveProcess = Boolean(primaryPack && activeProcessProfileIds.has(primaryPack.id));
   const lifecycleActionInProgress = Boolean(
     installInProgressPackId ||
+      setupInProgressProfileId ||
       repairInProgressProfileId ||
       deleteInProgressProfileId ||
       lifecycleActionInProgressKey ||
@@ -1802,6 +1811,8 @@ function App() {
   );
   const lifecycleActionLabel = installInProgressPackId
     ? "Installing..."
+    : setupInProgressProfileId
+      ? "Setting up..."
     : repairInProgressProfileId
       ? "Checking files..."
       : deleteInProgressProfileId
@@ -1829,6 +1840,7 @@ function App() {
     Boolean(
       profileId &&
         (installInProgressPackId === profileId ||
+          setupInProgressProfileId === profileId ||
           repairInProgressProfileId === profileId ||
           deleteInProgressProfileId === profileId ||
           launchInProgressProfileIds.has(profileId) ||
@@ -1837,6 +1849,7 @@ function App() {
   const profileLifecycleLabel = (profileId?: string | null) => {
     if (!profileId) return lifecycleActionLabel;
     if (installInProgressPackId === profileId) return "Installing...";
+    if (setupInProgressProfileId === profileId) return "Setting up...";
     if (repairInProgressProfileId === profileId) return "Checking files...";
     if (deleteInProgressProfileId === profileId) return "Deleting...";
     if (profileId && launchInProgressProfileIds.has(profileId)) return "Launching...";
@@ -3582,9 +3595,9 @@ function App() {
       setProfileCreatorOpen(false);
       setActivity(`${profile.name} created. Setting up files...`);
       if (isNative) {
-        setRepairInProgressProfileId(profile.id);
-        setLifecycleActionInProgressKey(`repair:${profile.id}`);
-        lifecycleActionInProgressRef.current = `repair:${profile.id}`;
+        setSetupInProgressProfileId(profile.id);
+        setLifecycleActionInProgressKey(`setup:${profile.id}`);
+        lifecycleActionInProgressRef.current = `setup:${profile.id}`;
         try {
           await invoke<ActionReceipt>("prepare_profile", { profileId: profile.id });
           await loadBootstrapSnapshot();
@@ -3594,8 +3607,8 @@ function App() {
           await loadLauncherEvents(true).catch(() => undefined);
           setActivity(nativeFailureActivity(setupError, `${profile.name} created; setup will retry on Play`));
         } finally {
-          setRepairInProgressProfileId((current) => (current === profile.id ? null : current));
-          if (lifecycleActionInProgressRef.current === `repair:${profile.id}`) {
+          setSetupInProgressProfileId((current) => (current === profile.id ? null : current));
+          if (lifecycleActionInProgressRef.current === `setup:${profile.id}`) {
             lifecycleActionInProgressRef.current = null;
             setLifecycleActionInProgressKey(null);
           }
