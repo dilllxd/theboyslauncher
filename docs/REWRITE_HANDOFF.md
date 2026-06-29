@@ -1245,6 +1245,8 @@ Latest Discover Modrinth slice: the Discover tab now has a real Modrinth browse 
 
 Latest fast Modrinth Discover smoke: added `npm run smoke:live:modrinth:discover`, a quick live metadata smoke that searches Modrinth for public modpacks, selects Fabulously Optimized when present, resolves the project version list to an HTTPS `.mrpack` archive, and validates archive filename/size without downloading the pack. This gives the new Discover browse/install handoff a low-cost live check distinct from the heavier full `.mrpack` install smoke. Verified with `node --check scripts/run-live-winterpack-smoke.mjs`, `npm run smoke:live:modrinth:discover`, `cargo test -p launcher-core modrinth_ -- --test-threads=1`, `cargo fmt --all --check`, and `npm run build`.
 
+Latest packaged executable refresh after Discover work: reran release-side verification after the Modrinth Discover/search additions. `npm run verify:tauri-security`, `npm run verify:package-resources`, `npm run verify:tauri-bundles`, `npm run build`, and `$env:CARGO_TARGET_DIR='target/codex-goal-check'; cargo check --workspace` all passed. Rebuilt the local release executable with `npx tauri build --no-bundle`; the current `target/release/theboyslauncher.exe` is `21,535,232` bytes and was modified `2026-06-29T18:39:48-04:00`. No `theboyslauncher`, `social-backend`, `java`, or `javaw` processes were left running afterward.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
