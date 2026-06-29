@@ -1584,12 +1584,12 @@ test("successful pack update clears stale launch repair recovery", async ({ page
   await profile.getByRole("button", { name: "Launch details" }).click();
 
   await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
-  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Try again" })).toBeVisible();
+  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toBeVisible();
 
   await profile.getByLabel("WinterPack launch actions").getByRole("button", { name: "Update" }).click();
 
   await expect(page.getByLabel("Launcher status message")).toContainText("Pack updated successfully.");
-  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Try again" })).toHaveCount(0);
+  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toHaveCount(0);
   const invoked = await page.evaluate(
     () => (window as typeof window & { __updateClearsRecoveryInvokes: string[] }).__updateClearsRecoveryInvokes,
   );
@@ -5251,7 +5251,7 @@ test("library launch command action shows native command preview", async ({ page
   expect(invoked).not.toContain("build_launch_command");
 });
 
-test("launch command preflight failure offers file-check recovery", async ({ page }) => {
+test("launch command preflight failure offers setup recovery", async ({ page }) => {
   await page.addInitScript(() => {
     const invoked: string[] = [];
     Object.defineProperty(window, "__commandRepairRecoveryInvokes", {
@@ -5359,8 +5359,8 @@ test("launch command preflight failure offers file-check recovery", async ({ pag
   await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
   await expect(page.getByLabel("Launch details preview")).toHaveCount(0);
   const recoveryActions = page.getByLabel("Launcher recovery actions");
-  await expect(recoveryActions.getByRole("button", { name: "Try again" })).toBeVisible();
-  await recoveryActions.getByRole("button", { name: "Try again" }).click();
+  await expect(recoveryActions.getByRole("button", { name: "Set up again" })).toBeVisible();
+  await recoveryActions.getByRole("button", { name: "Set up again" }).click();
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
@@ -5462,14 +5462,14 @@ test("successful launch command preview clears stale repair recovery", async ({ 
   await profile.getByRole("button", { name: "Launch details" }).click();
 
   await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
-  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Try again" })).toBeVisible();
+  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toBeVisible();
 
   await profile.getByRole("button", { name: "Launch details" }).click();
 
   const preview = page.getByLabel("Launch details preview", { exact: true });
   await expect(preview).toContainText("WinterPack");
   await expect(preview).toContainText("javaw.exe");
-  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Try again" })).toHaveCount(0);
+  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toHaveCount(0);
 });
 
 test("launch command Java preflight failure offers Java recovery", async ({ page }) => {
@@ -7663,14 +7663,14 @@ test("library delete action clears stale launch recovery for removed profile", a
   const profile = page.locator(".profile-row").filter({ hasText: "Latest Release" });
   await profile.getByRole("button", { name: "Launch details" }).click();
   await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
-  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Try again" })).toBeVisible();
+  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toBeVisible();
 
   await openProfileCustomize(profile);
   await profile.getByRole("button", { name: "Delete" }).click();
   await profile.getByRole("button", { name: "Confirm delete" }).click();
 
   await expect(page.locator(".event-row").filter({ hasText: "shared Minecraft downloads were kept" })).toBeVisible();
-  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Try again" })).toHaveCount(0);
+  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toHaveCount(0);
   await page.getByRole("button", { name: "Library" }).click();
   await expect(profile).toHaveCount(0);
   const invoked = await page.evaluate(

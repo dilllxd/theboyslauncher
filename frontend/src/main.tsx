@@ -3898,6 +3898,17 @@ function App() {
       setActivityMode("events");
       setActivity("Setting up profile files");
       const receipt = await invoke<ActionReceipt>("repair_profile", { profileId });
+      const receiptEvent: LauncherEvent = {
+        id: `${plan.operationId}-receipt-completed`,
+        operationId: plan.operationId,
+        operation: "repair_profile",
+        subjectId: profileId,
+        kind: "completed",
+        message: receipt.message,
+        progressPercent: 100,
+        occurredAtUnixSeconds: Math.floor(Date.now() / 1000),
+      };
+      setLauncherEvents((current) => mergeLauncherEvents(current, [receiptEvent]));
       await loadBootstrapSnapshot();
       await loadLauncherEvents();
       setActiveView("activity");
@@ -4458,7 +4469,7 @@ function App() {
                           ? "Try join again"
                           : launchRecoveryAction === "repair_and_launch"
                           ? "Try play again"
-                          : "Try again"}
+                          : "Set up again"}
                   </button>
                 )}
                 {launchJavaRecoveryNeeded && (
