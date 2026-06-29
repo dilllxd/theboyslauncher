@@ -456,7 +456,7 @@ type LauncherOperationSummary = {
 type ArtifactOperationSummary = {
   currentArtifact?: string;
   pending: number;
-  started: number;
+  downloading: number;
   finished: number;
   failed: number;
 };
@@ -1403,19 +1403,28 @@ function summarizeArtifactOperation(events: LauncherEvent[]): ArtifactOperationS
   if (artifactEvents.length === 0) return undefined;
 
   const pending = artifactEvents.filter((entry) => fileEventMessageKind(entry.event.message) === "pending");
-  const starts = artifactEvents.filter((entry) => fileEventMessageKind(entry.event.message) === "started");
+  const downloading = artifactEvents.filter((entry) => fileEventMessageKind(entry.event.message) === "started");
   const finished = artifactEvents.filter(
     (entry) => fileEventMessageKind(entry.event.message) === "finished",
   );
   const failed = artifactEvents.filter((entry) => fileEventMessageKind(entry.event.message) === "failed");
+  const latestByArtifact = new Map<string, (typeof artifactEvents)[number]>();
+  for (const entry of artifactEvents) {
+    latestByArtifact.set(entry.artifact, entry);
+  }
   const current =
-    [...artifactEvents].reverse().find((entry) => fileEventMessageKind(entry.event.message) === "started") ??
-    artifactEvents[artifactEvents.length - 1];
+    [...artifactEvents]
+      .reverse()
+      .find((entry) => {
+        if (latestByArtifact.get(entry.artifact) !== entry) return false;
+        const kind = fileEventMessageKind(entry.event.message);
+        return kind === "started" || kind === "pending";
+      }) ?? artifactEvents[artifactEvents.length - 1];
 
   return {
     currentArtifact: current.artifact,
     pending: pending.length,
-    started: starts.length,
+    downloading: downloading.length,
     finished: finished.length,
     failed: failed.length,
   };
@@ -5706,7 +5715,7 @@ function App() {
                       Current: <strong>{latestArtifactSummary.currentArtifact}</strong>
                     </span>
                     <span>{latestArtifactSummary.pending} pending</span>
-                    <span>{latestArtifactSummary.started} started</span>
+                    <span>{latestArtifactSummary.downloading} downloading</span>
                     <span>{latestArtifactSummary.finished} finished</span>
                     <span>{latestArtifactSummary.failed} failed</span>
                   </div>

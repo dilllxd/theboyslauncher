@@ -1223,6 +1223,8 @@ Latest setup wording source cleanup: native lifecycle-gate descriptions and the 
 
 Latest packaged-app verification refresh: current release-mode `target/release/theboyslauncher.exe` was rebuilt with `npx tauri build --no-bundle` after the Modrinth archive and setup-wording changes. Release/security/package checks still pass with `npm run verify:tauri-security`, `npm run verify:package-resources`, and `npm run verify:tauri-bundles`. A fresh packaged smoke launched the rebuilt exe against isolated `target/packaged-goal-smoke-current-clean` with hosted backend URL override, opened a `TheBoysLauncher` window, created `data/`, `config/`, `cache/`, `logs/`, `config/profiles.json`, and `config/settings.json`, then closed cleanly with no remaining `theboyslauncher` process.
 
+Latest Activity file-progress polish: the Activity overview file summary now chooses the current file from the latest per-file state, so a file that has already emitted a later finished/already-present event is not kept as `Current`. The summary wording now says `downloading` instead of `started`, and the preview regression expects the pending mod to become current after the previous client download finished. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity screen loads event log fallback"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

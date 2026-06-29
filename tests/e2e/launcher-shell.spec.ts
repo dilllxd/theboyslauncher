@@ -8829,9 +8829,9 @@ test("activity screen loads event log fallback", async ({ page }) => {
   await expect(page.getByLabel("Latest operation breakdown")).toContainText("0 completed");
   await expect(page.getByLabel("Latest operation breakdown")).toContainText("5 active");
   await expect(page.getByLabel("Latest operation breakdown")).toContainText("1 pending");
-  await expect(page.getByLabel("Latest file progress")).toContainText("Current: forge-bootstrap");
+  await expect(page.getByLabel("Latest file progress")).toContainText("Current: cabin-mod");
   await expect(page.getByLabel("Latest file progress")).toContainText("1 pending");
-  await expect(page.getByLabel("Latest file progress")).toContainText("2 started");
+  await expect(page.getByLabel("Latest file progress")).toContainText("2 downloading");
   await expect(page.getByLabel("Latest file progress")).toContainText("2 finished");
   await expect(page.getByLabel("Latest file progress")).toContainText("0 failed");
   const activeDownloadStep = page.locator(".operation-step").filter({ hasText: "Downloading file: forge-bootstrap" });
