@@ -32,6 +32,10 @@ npm run social:logs
 npm run social:down
 ```
 
+The GitHub Container Registry image workflow lives at `.github/workflows/social-backend-image.yml`.
+GitHub only exposes newly added workflows after they exist on the default branch, so this workflow
+becomes manually dispatchable after the v4 branch replaces `main` or after a release tag includes it.
+
 ## Release Build
 
 Normal PR and branch pushes run verification only. Windows packaging runs only for `v*` tags or manual dispatch with `package_windows=true` or `publish_release=true`.
