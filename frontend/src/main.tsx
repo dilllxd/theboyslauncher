@@ -6888,32 +6888,6 @@ function ProfileEditor({
               </select>
               {versionUnavailableMessage && <span className="field-hint">{versionUnavailableMessage}</span>}
             </label>
-            <label>
-              <span>Loader</span>
-              <select
-                aria-label={`${profile.name} loader`}
-                value={loader}
-                onChange={(event) => setLoader(event.target.value as ProfileSummary["loader"])}
-              >
-                {profileLoaders.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Memory</span>
-              <input
-                aria-label={`${profile.name} memory`}
-                min={512}
-                max={32768}
-                step={512}
-                type="number"
-                value={memoryMb}
-                onChange={(event) => setMemoryMb(Number(event.target.value))}
-              />
-            </label>
             <div className="profile-advanced-toggle">
               <button
                 className="secondary-button compact subtle-button"
@@ -6926,6 +6900,32 @@ function ProfileEditor({
             </div>
             {showAdvancedProfileSettings && (
               <div className="profile-advanced-fields" aria-label={`${profile.name} advanced profile settings`}>
+                <label>
+                  <span>Loader</span>
+                  <select
+                    aria-label={`${profile.name} loader`}
+                    value={loader}
+                    onChange={(event) => setLoader(event.target.value as ProfileSummary["loader"])}
+                  >
+                    {profileLoaders.map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Memory</span>
+                  <input
+                    aria-label={`${profile.name} memory`}
+                    min={512}
+                    max={32768}
+                    step={512}
+                    type="number"
+                    value={memoryMb}
+                    onChange={(event) => setMemoryMb(Number(event.target.value))}
+                  />
+                </label>
                 <label>
                   <span>Window width</span>
                   <input

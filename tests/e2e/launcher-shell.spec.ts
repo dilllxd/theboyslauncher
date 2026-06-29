@@ -7235,10 +7235,12 @@ test("library profile editor saves preview changes", async ({ page }) => {
   await expect(profile.getByLabel("WinterPack game version")).toBeDisabled();
   await profile.getByLabel("WinterPack version type").selectOption("release");
   await profile.getByLabel("WinterPack game version").selectOption("1.21.4");
-  await profile.getByLabel("WinterPack loader").selectOption("quilt");
-  await profile.getByLabel("WinterPack memory").fill("8192");
+  await expect(profile.getByLabel("WinterPack loader")).toHaveCount(0);
+  await expect(profile.getByLabel("WinterPack memory")).toHaveCount(0);
   await profile.getByRole("button", { name: "Advanced" }).click();
   await expect(profile.getByLabel("WinterPack advanced profile settings")).toBeVisible();
+  await profile.getByLabel("WinterPack loader").selectOption("quilt");
+  await profile.getByLabel("WinterPack memory").fill("8192");
   await profile.getByLabel("WinterPack window width").fill("1600");
   await profile.getByLabel("WinterPack window height").fill("900");
   await profile.getByLabel("WinterPack default server name").fill("The New Cabin");

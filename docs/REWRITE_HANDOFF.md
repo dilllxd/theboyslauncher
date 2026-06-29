@@ -1197,6 +1197,8 @@ Latest packaged process-status polish: native managed-process updates now use co
 
 Latest Activity noise polish: the Events tab now keeps high-signal lifecycle failures/completions visible while hiding per-file download chatter behind a collapsed `View file details` section. This keeps large vanilla/modpack installs from filling the Activity screen with hundreds of asset-object rows, while preserving exact file-level debugging details when opened. Sidebar live file progress is unchanged and still shows the current active file. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity screen loads event log fallback"`, `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "live file download events surface|pending native install .*sidebar|pending native install plan surfaces"`, and `npm run build`.
 
+Latest profile customization cleanup: Library profile customization now mirrors the beginner-friendly New profile flow. The default customize surface keeps only Name, Version type, and Version visible; loader, memory, window size, server, JVM args, and per-profile Java override all live under the collapsed Advanced section. This keeps Java/loader/memory controls out of normal screens while preserving full power-user edits. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "library profile editor saves preview changes|library profile editor can choose snapshot versions from the manifest|library new profile action"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
