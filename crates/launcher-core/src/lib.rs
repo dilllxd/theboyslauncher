@@ -2550,10 +2550,7 @@ fn build_launch_plan_for_profile_with_version_details(
         Some(details) => minecraft_launch_arguments_from_details(details, &mut launch_context)?,
         None => fallback_minecraft_launch_arguments(&mut launch_context)?,
     };
-    let uses_version_arguments = version_details
-        .and_then(|details| details.arguments.as_ref())
-        .is_some();
-    if !uses_version_arguments {
+    if version_details.is_none() {
         if let Some(resolution) = profile.resolution.as_ref() {
             arguments.extend([
                 "--width".to_owned(),
@@ -14848,6 +14845,64 @@ hash = "987654321"
             .arguments
             .iter()
             .any(|argument| argument == "-Djava.library.path=C:/cache/natives/1.7.10"));
+    }
+
+    #[test]
+    fn legacy_minecraft_arguments_do_not_get_modern_resolution_flags() {
+        let _java = JavaRuntimeDiscoveryGuard::java_8();
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "legacy-snapshot".to_owned(),
+            name: "Legacy Snapshot".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "13w23a".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 2048,
+            jvm_args: Vec::new(),
+            resolution: Some(ProfileResolution {
+                width: 1280,
+                height: 720,
+            }),
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let mut details = minecraft_details_fixture();
+        details.id = "13w23a".to_owned();
+        details.arguments = None;
+        details.minecraft_arguments = Some(
+            "--username ${auth_player_name} --session ${auth_session} --version ${version_name} --gameDir ${game_directory} --assetsDir ${game_assets}".to_owned(),
+        );
+        details.asset_index.id = "legacy".to_owned();
+
+        let plan = build_launch_plan_for_profile_with_version_details(
+            &profile,
+            &settings,
+            &directories,
+            None,
+            None,
+            Some(&details),
+        )
+        .expect("legacy snapshot launch plan should build");
+
+        assert!(!plan.arguments.contains(&"--width".to_owned()));
+        assert!(!plan.arguments.contains(&"--height".to_owned()));
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--assetsDir").as_deref(),
+            Some("C:/cache/assets/virtual/legacy")
+        );
     }
 
     #[test]
