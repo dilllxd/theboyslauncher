@@ -16,6 +16,7 @@
     "verify:package-resources": "node scripts/verify-package-resources.mjs",
     "verify:tauri-security": "node scripts/verify-tauri-security-config.mjs",
     "verify:tauri-bundles": "node scripts/verify-tauri-bundles.mjs",
+    "preflight:v4-release": "node scripts/preflight-v4-release.mjs",
     "generate:updater-manifest": "node scripts/generate-tauri-updater-manifest.mjs",
     "postgres:up": "node scripts/manage-social-postgres.mjs up",
     "postgres:down": "node scripts/manage-social-postgres.mjs down",

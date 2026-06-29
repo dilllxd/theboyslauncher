@@ -63,6 +63,7 @@ Current v4 release-readiness evidence from `codex/fresh-foundation-rewrite`:
 After reviewing and committing the v4 rewrite branch, replace `main` only with explicit approval:
 
 ```powershell
+npm run preflight:v4-release -- v4.0.0
 git push origin codex/fresh-foundation-rewrite:main --force-with-lease
 git tag v4.0.0
 git push origin v4.0.0
