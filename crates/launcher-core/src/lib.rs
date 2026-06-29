@@ -11451,6 +11451,8 @@ mod tests {
     impl LiveSmokeRoot {
         fn new() -> Self {
             let requested_root = env::var_os("THEBOYS_LAUNCHER_LIVE_TEST_ROOT").map(PathBuf::from);
+            let requested_cache =
+                env::var_os("THEBOYS_LAUNCHER_LIVE_TEST_CACHE").map(PathBuf::from);
             let env = LauncherDirEnvGuard::isolated();
             let (root, temp) = if let Some(root) = requested_root {
                 fs::create_dir_all(&root).expect("live smoke root should create");
@@ -11460,6 +11462,10 @@ mod tests {
                 (temp.path().to_path_buf(), Some(temp))
             };
             env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", &root);
+            if let Some(cache) = requested_cache {
+                fs::create_dir_all(&cache).expect("live smoke cache should create");
+                env::set_var("THEBOYS_LAUNCHER_CACHE_DIR", cache);
+            }
             Self {
                 _env: env,
                 _temp: temp,

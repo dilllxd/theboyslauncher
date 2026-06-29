@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 const manifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const testName = "live_vanilla_compat_version_launch_process_survives_startup_and_can_stop";
 const defaultRoot = resolve("target", "live-smoke", "vanilla-compat");
+const defaultSharedCacheRoot = resolve("target", "live-smoke", "vanilla-compat-shared-cache");
 
 function usage() {
   console.log(`Usage:
@@ -24,6 +25,8 @@ Options:
   --offset <n>    With --all, skip the first n selected versions for resumable chunks.
   --limit <n>     With --all, test at most n selected versions for resumable chunks.
   --keep          Keep each per-version launcher root after the run.
+  --jobs <n>      Run up to n isolated version smokes at once. Defaults to 1.
+  --shared-cache  Reuse one shared launcher cache across versions. Serial only for now.
   --dry-run       Print selected versions without downloading or launching Minecraft.
 `);
 }
@@ -41,10 +44,12 @@ function parseArgs(argv) {
     authSessionFile: null,
     dryRun: false,
     keep: false,
+    jobs: 1,
     matrix: false,
     limit: null,
     offset: 0,
     sample: false,
+    sharedCache: false,
     types: [],
     versions: [],
   };
@@ -61,6 +66,10 @@ function parseArgs(argv) {
       options.dryRun = true;
     } else if (arg === "--keep") {
       options.keep = true;
+    } else if (arg === "--jobs") {
+      index += 1;
+      options.jobs = parseNonNegativeInteger(argv[index], "--jobs");
+      if (options.jobs < 1) throw new Error("--jobs must be at least 1");
     } else if (arg === "--matrix") {
       options.matrix = true;
     } else if (arg === "--limit") {
@@ -71,6 +80,8 @@ function parseArgs(argv) {
       options.offset = parseNonNegativeInteger(argv[index], "--offset");
     } else if (arg === "--sample") {
       options.sample = true;
+    } else if (arg === "--shared-cache") {
+      options.sharedCache = true;
     } else if (arg === "--type") {
       index += 1;
       const type = argv[index];
@@ -106,6 +117,9 @@ function parseArgs(argv) {
   if (options.authSessionFile && !existsSync(options.authSessionFile)) {
     throw new Error(`--auth-session-file does not exist: ${options.authSessionFile}`);
   }
+  if (options.sharedCache && options.jobs > 1) {
+    throw new Error("--shared-cache is serial-only for now; use --jobs 1 or omit --shared-cache");
+  }
 
   return options;
 }
@@ -120,6 +134,13 @@ function assertRootIsSafe(rootPath) {
   const resolvedRoot = resolve(rootPath);
   if (resolvedRoot !== defaultRoot && !resolvedRoot.startsWith(`${defaultRoot}\\`) && !resolvedRoot.startsWith(`${defaultRoot}/`)) {
     throw new Error(`Refusing to clean outside ${defaultRoot}: ${resolvedRoot}`);
+  }
+}
+
+function assertSharedCacheRootIsSafe(rootPath) {
+  const resolvedRoot = resolve(rootPath);
+  if (resolvedRoot !== defaultSharedCacheRoot) {
+    throw new Error(`Refusing to use unexpected shared cache root: ${resolvedRoot}`);
   }
 }
 
@@ -188,8 +209,13 @@ function selectMatrixVersions(manifest) {
 function runVersion(version, options) {
   const versionRoot = resolve(defaultRoot, safePathSegment(version));
   const lockPath = `${versionRoot}.lock`;
+  const sharedCacheRoot = options.sharedCache ? defaultSharedCacheRoot : null;
 
   mkdirSync(defaultRoot, { recursive: true });
+  if (sharedCacheRoot) {
+    assertSharedCacheRootIsSafe(sharedCacheRoot);
+    mkdirSync(sharedCacheRoot, { recursive: true });
+  }
   try {
     mkdirSync(lockPath, { recursive: false });
     writeFileSync(
@@ -225,6 +251,9 @@ function runVersion(version, options) {
 
   console.log(`\n== Vanilla compatibility: ${version} ==`);
   console.log(`THEBOYS_LAUNCHER_LIVE_TEST_ROOT=${versionRoot}`);
+  if (sharedCacheRoot) {
+    console.log(`THEBOYS_LAUNCHER_LIVE_TEST_CACHE=${sharedCacheRoot}`);
+  }
   console.log(`cargo ${args.join(" ")}`);
 
   return new Promise((resolveRun) => {
@@ -232,6 +261,7 @@ function runVersion(version, options) {
       env: {
         ...process.env,
         THEBOYS_LAUNCHER_LIVE_TEST_ROOT: versionRoot,
+        ...(sharedCacheRoot ? { THEBOYS_LAUNCHER_LIVE_TEST_CACHE: sharedCacheRoot } : {}),
         THEBOYS_VANILLA_COMPAT_AUTH: options.authSessionFile ? "stored" : "offline",
         THEBOYS_VANILLA_COMPAT_VERSION: version,
       },
@@ -251,6 +281,30 @@ function runVersion(version, options) {
       });
     });
   });
+}
+
+async function runVersions(versions, options) {
+  if (options.jobs === 1) {
+    const results = [];
+    for (const version of versions) {
+      results.push(await runVersion(version, options));
+    }
+    return results;
+  }
+
+  const results = new Array(versions.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(options.jobs, versions.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < versions.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await runVersion(versions[currentIndex], options);
+      }
+    }),
+  );
+  return results;
 }
 
 const options = parseArgs(process.argv.slice(2));
@@ -273,15 +327,15 @@ if (versions.length === 0) {
 }
 
 console.log(`Selected ${versions.length} Minecraft version(s): ${versions.join(", ")}`);
+if (!options.dryRun) {
+  console.log(`Runner settings: jobs=${options.jobs}, sharedCache=${options.sharedCache ? defaultSharedCacheRoot : "disabled"}`);
+}
 
 if (options.dryRun) {
   process.exit(0);
 }
 
-const results = [];
-for (const version of versions) {
-  results.push(await runVersion(version, options));
-}
+const results = await runVersions(versions, options);
 
 const failed = results.filter((result) => result.code !== 0);
 console.log("\nVanilla compatibility results:");
