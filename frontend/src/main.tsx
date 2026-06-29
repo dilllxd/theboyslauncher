@@ -1352,6 +1352,12 @@ function fileEventMessageKind(message: string) {
   return undefined;
 }
 
+function isVerboseDownloadFileEvent(event: LauncherEvent) {
+  if (event.operation !== "download_artifacts") return false;
+  const kind = fileEventMessageKind(event.message);
+  return kind === "pending" || kind === "started" || kind === "finished";
+}
+
 function userFacingLauncherEventMessage(message: string) {
   return message
     .replace(
@@ -1665,8 +1671,13 @@ function App() {
     () => summarizeArtifactOperation(latestOperationEvents),
     [latestOperationEvents],
   );
-  const visibleActivityEvents = useMemo(
-    () => (activityMode === "overview" ? launcherEvents.slice(-5) : launcherEvents),
+  const visibleActivityEvents = useMemo(() => {
+    if (activityMode === "overview") return launcherEvents.slice(-5);
+    if (activityMode === "events") return launcherEvents.filter((event) => !isVerboseDownloadFileEvent(event));
+    return launcherEvents;
+  }, [activityMode, launcherEvents]);
+  const verboseDownloadFileEvents = useMemo(
+    () => (activityMode === "events" ? launcherEvents.filter(isVerboseDownloadFileEvent) : []),
     [activityMode, launcherEvents],
   );
   const activeProcessProfileIds = useMemo(
@@ -5686,7 +5697,7 @@ function App() {
                 </details>
               </div>
             )}
-            {activityMode !== "processes" && visibleActivityEvents.length > 0 ? (
+            {activityMode !== "processes" && visibleActivityEvents.length > 0 && (
               <div className="event-list" aria-label={activityMode === "overview" ? "Recent launcher events" : "Launcher events"}>
                 {visibleActivityEvents.map((event) => {
                   const playableProfile = lifecycleEventLaunchTarget(event);
@@ -5844,7 +5855,33 @@ function App() {
                   );
                 })}
               </div>
-            ) : activityMode !== "processes" ? (
+            )}
+            {activityMode === "events" && verboseDownloadFileEvents.length > 0 && (
+              <details className="technical-details operation-step-details" aria-label="File download details">
+                <summary>
+                  View file details ({verboseDownloadFileEvents.length}{" "}
+                  {verboseDownloadFileEvents.length === 1 ? "file event" : "file events"})
+                </summary>
+                <div className="operation-steps">
+                  {verboseDownloadFileEvents.map((event, index) => (
+                    <div className="operation-step event-row" key={event.id}>
+                      <span className="step-index">{index + 1}</span>
+                      <div>
+                        <strong>{userFacingLauncherEventMessage(event.message)}</strong>
+                        <span>
+                          {event.kind}
+                          {typeof event.progressPercent === "number" ? ` - ${event.progressPercent}%` : ""} -{" "}
+                          {operationContextLabel(event.operation, event.subjectId, event.message)} - {formatUnixDate(event.occurredAtUnixSeconds)}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+            {activityMode !== "processes" &&
+            visibleActivityEvents.length === 0 &&
+            !(activityMode === "events" && verboseDownloadFileEvents.length > 0) ? (
               <div className="social-empty compact-empty">
                 <Activity size={42} />
                 <h3>No launcher events yet</h3>

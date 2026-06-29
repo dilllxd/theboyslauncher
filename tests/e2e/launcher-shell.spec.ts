@@ -8801,6 +8801,10 @@ test("activity screen loads event log fallback", async ({ page }) => {
   await expect(page.locator(".event-row").filter({ hasText: "Event log is mocked in web preview" })).toContainText(
     "Set up files - winterpack",
   );
+  const fileDetails = page.getByLabel("File download details");
+  await expect(fileDetails).toContainText("View file details (5 file events)");
+  await expect(page.locator(".event-row").filter({ hasText: "Downloaded file: client-1.20.1" })).not.toBeVisible();
+  await fileDetails.getByText("View file details (5 file events)").click();
   await expect(page.locator(".event-row").filter({ hasText: "Downloaded file: client-1.20.1" })).toContainText(
     "Download files - winterpack",
   );
