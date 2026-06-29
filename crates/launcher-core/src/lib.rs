@@ -13507,6 +13507,40 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits live Modrinth search and project-version APIs without downloading the archive"]
+    async fn live_modrinth_discover_search_resolves_installable_archive() {
+        let results = search_modrinth_modpacks("fabulously optimized", 6)
+            .await
+            .expect("live Modrinth modpack search should respond");
+        assert!(
+            !results.is_empty(),
+            "live Modrinth search should return modpack results"
+        );
+        let selected = results
+            .iter()
+            .find(|result| result.slug == "fabulously-optimized")
+            .unwrap_or(&results[0]);
+        assert!(!selected.project_id.trim().is_empty());
+        assert!(!selected.title.trim().is_empty());
+        assert!(
+            selected.loaders.iter().any(|loader| loader == "fabric")
+                || !selected.game_versions.is_empty(),
+            "search result should include useful loader/version metadata"
+        );
+
+        let archive = resolve_modrinth_modpack_archive(&selected.project_id)
+            .await
+            .expect("live Modrinth project should resolve an installable archive");
+        assert_eq!(archive.project_id, selected.project_id);
+        assert!(archive.file_name.ends_with(".mrpack"));
+        assert!(archive.url.starts_with("https://"));
+        assert!(
+            archive.size.unwrap_or_default() > 0,
+            "archive should report a positive file size"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "downloads a live public Modrinth .mrpack, Fabric loader, pack files, and vanilla artifacts before launch preflight"]
     async fn live_public_modrinth_mrpack_install_artifacts_pass_launch_preflight() {
         let _smoke_root = LiveSmokeRoot::new();
