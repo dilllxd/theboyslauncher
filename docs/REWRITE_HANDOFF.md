@@ -1151,6 +1151,10 @@ Latest sidebar progress hardening: the bottom-left launcher status now clears ol
 
 Latest launch-concurrency polish: Activity completion rows now use per-profile lifecycle checks for their `Play` action instead of the global install/setup lock, so a user can launch a ready profile while an unrelated pack install is still running. Pack cards already used per-profile lifecycle checks for Play; this closes the remaining Activity surface. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity play stays available"` and `npm run build`.
 
+Latest packaged-state verification: existing local Windows bundles remain present under `target/release/bundle` (`msi/TheBoysLauncher_4.0.0_x64_en-US.msi`, `nsis/TheBoysLauncher_4.0.0_x64-setup.exe`, signatures, and `latest.json`), and `npm run verify:tauri-bundles` verified the two release bundles plus updater manifest for `4.0.0`. `npm run verify:tauri-security` passed. `npm run verify:package-resources` initially caught a local staged sidecar mismatch, then `npm run stage:social-backend && npm run verify:package-resources` restaged and verified both `src-tauri/resources/social-backend.exe` and `src-tauri/resources/social-backend` against the current release binary hash `7f5b8b257cc00ad39b582b4b896683f00cc2693fa846614ec83ff291af44cb90`; this did not leave tracked worktree changes.
+
+Latest sidebar active-operation polish: when there is no live file-download event yet, the bottom-left launcher status now shows the latest active non-download launcher operation with its progress bar, so a pending install/setup plan no longer looks idle before individual files start streaming. `download_artifacts` stays routed through the stale-aware download selector so completed installs still clear old processor/file messages. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "pending native install .*sidebar|pending native install plan surfaces|live file download events surface"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

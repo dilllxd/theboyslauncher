@@ -1430,6 +1430,7 @@ function latestActiveDownloadEvent(events: LauncherEvent[]) {
 function sidebarStatusTitle(isNative: boolean, event?: LauncherEvent) {
   if (!isNative) return "Web preview";
   if (event?.operation === "download_artifacts") return "Downloading files";
+  if (event?.operation) return operationLabelForMessage(event.operation, event.message);
   return "Desktop connected";
 }
 
@@ -1958,7 +1959,16 @@ function App() {
     : "Choose";
   const latestLauncherEvent = launcherOperationSummaries[0]?.latestEvent;
   const sidebarDownloadEvent = latestActiveDownloadEvent(launcherEvents);
-  const sidebarProgressEvent = sidebarDownloadEvent;
+  const sidebarActiveOperationEvent = launcherOperationSummaries.find(
+    (operation) =>
+      typeof operation.progressPercent === "number" &&
+      operation.progressPercent >= 0 &&
+      operation.progressPercent < 100 &&
+      operation.latestEvent.operation !== "download_artifacts" &&
+      operation.latestEvent.kind !== "completed" &&
+      operation.latestEvent.kind !== "failed",
+  )?.latestEvent;
+  const sidebarProgressEvent = sidebarDownloadEvent ?? sidebarActiveOperationEvent;
   const sidebarProgressPercent = sidebarProgressEvent?.progressPercent;
   const sidebarProgressVisible =
     typeof sidebarProgressPercent === "number" && sidebarProgressPercent >= 0 && sidebarProgressPercent < 100;

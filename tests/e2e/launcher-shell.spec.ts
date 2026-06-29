@@ -2264,6 +2264,91 @@ test("pending native install polls launcher events into the sidebar without refr
   expect(invoked.filter((cmd) => cmd === "list_launcher_events").length).toBeGreaterThanOrEqual(2);
 });
 
+test("pending native install plan surfaces operation progress before file events", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string) => {
+          if (cmd === "bootstrap_snapshot") {
+            return {
+              settings: {
+                maxMemoryMb: 6144,
+                minMemoryMb: 2048,
+                offlineUsername: "Player",
+                telemetryEnabled: false,
+              },
+              directories: {
+                dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+                configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+                cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+                logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+              },
+              friends: [],
+              packs: [
+                {
+                  id: "winterpack",
+                  name: "WinterPack",
+                  tagline: "Cozy survival with friends.",
+                  version: "2.3.7",
+                  status: "not_installed",
+                  accent: "#67e8b9",
+                  installedPlayers: 0,
+                  defaultServer: "The Cabin",
+                },
+              ],
+              profiles: [],
+              imports: [],
+            };
+          }
+          if (cmd === "plan_install_pack") {
+            return {
+              operationId: "install-plan",
+              operation: "install_pack",
+              subjectId: "winterpack",
+              events: [
+                { kind: "queued", message: "Install queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Install plan is ready to execute.", progressPercent: 100 },
+              ],
+            };
+          }
+          if (cmd === "install_pack") return new Promise(() => undefined);
+          if (cmd === "list_launcher_events" || cmd === "list_managed_processes") return [];
+          if (cmd === "load_minecraft_session") return null;
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+  await page.getByLabel("Primary pack actions").getByRole("button", { name: "Install" }).click();
+
+  await expect(page.getByLabel("Launcher status", { exact: true })).toContainText("Install pack");
+  await expect(page.getByLabel("Launcher status message")).toContainText("Installing pack is running");
+  await expect(page.getByLabel("Launcher status progress")).toBeVisible();
+  await expect(page.getByLabel("Launcher status progress")).toHaveAttribute("aria-valuenow", "95");
+});
+
 test("pack update action is disabled while native install is pending", async ({ page }) => {
   await page.addInitScript(() => {
     let updated = false;
