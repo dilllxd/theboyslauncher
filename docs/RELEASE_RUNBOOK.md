@@ -45,6 +45,12 @@ git push origin 022b8e3c81c0132140cff279387e10110b03d893:refs/heads/backup/main-
 
 The backup branch already exists as of this handoff.
 
+Current v4 release-readiness evidence from `codex/fresh-foundation-rewrite`:
+
+- Push verification run `28343669378` succeeded for commit `9cff831ea6ed57886ca5736f73622e1b5bbf2bdb`.
+- Manual package validation run `28343968252` succeeded with `package_windows=true`, `publish_release=false`, and `release_tag=v4.0.0`.
+- The package run uploaded artifact `TheBoysLauncher-windows-9cff831ea6ed57886ca5736f73622e1b5bbf2bdb` containing the MSI, NSIS setup exe, both `.sig` files, and `latest.json`.
+
 After reviewing and committing the v4 rewrite branch, replace `main` only with explicit approval:
 
 ```powershell
