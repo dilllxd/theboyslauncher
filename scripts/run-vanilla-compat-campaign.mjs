@@ -27,6 +27,7 @@ Options:
   --keep          Keep each per-version launcher root after the run.
   --jobs <n>      Run up to n isolated version smokes at once. Defaults to 1.
   --shared-cache  Reuse one shared launcher cache across versions. Serial only for now.
+  --quiet         Capture cargo output and print only concise progress plus failure tails.
   --dry-run       Print selected versions without downloading or launching Minecraft.
 `);
 }
@@ -48,6 +49,7 @@ function parseArgs(argv) {
     matrix: false,
     limit: null,
     offset: 0,
+    quiet: false,
     sample: false,
     sharedCache: false,
     types: [],
@@ -78,6 +80,8 @@ function parseArgs(argv) {
     } else if (arg === "--offset") {
       index += 1;
       options.offset = parseNonNegativeInteger(argv[index], "--offset");
+    } else if (arg === "--quiet") {
+      options.quiet = true;
     } else if (arg === "--sample") {
       options.sample = true;
     } else if (arg === "--shared-cache") {
@@ -122,6 +126,29 @@ function parseArgs(argv) {
   }
 
   return options;
+}
+
+function createTailBuffer(maxLines = 220) {
+  const lines = [];
+  let carry = "";
+
+  return {
+    append(chunk) {
+      carry += chunk.toString();
+      const parts = carry.split(/\r?\n/);
+      carry = parts.pop() ?? "";
+      for (const line of parts) {
+        lines.push(line);
+        if (lines.length > maxLines) {
+          lines.shift();
+        }
+      }
+    },
+    text() {
+      const output = carry ? [...lines, carry] : lines;
+      return output.join("\n");
+    },
+  };
 }
 
 function safePathSegment(input) {
@@ -257,6 +284,7 @@ function runVersion(version, options) {
   console.log(`cargo ${args.join(" ")}`);
 
   return new Promise((resolveRun) => {
+    const outputTail = options.quiet ? createTailBuffer() : null;
     const child = spawn("cargo", args, {
       env: {
         ...process.env,
@@ -265,9 +293,14 @@ function runVersion(version, options) {
         THEBOYS_VANILLA_COMPAT_AUTH: options.authSessionFile ? "stored" : "offline",
         THEBOYS_VANILLA_COMPAT_VERSION: version,
       },
-      stdio: "inherit",
+      stdio: options.quiet ? ["ignore", "pipe", "pipe"] : "inherit",
       windowsHide: true,
     });
+
+    if (outputTail) {
+      child.stdout?.on("data", (chunk) => outputTail.append(chunk));
+      child.stderr?.on("data", (chunk) => outputTail.append(chunk));
+    }
 
     child.on("exit", (code, signal) => {
       rmSync(lockPath, { recursive: true, force: true });
@@ -278,6 +311,7 @@ function runVersion(version, options) {
         version,
         code: signal ? 1 : code ?? 1,
         signal,
+        outputTail: outputTail?.text() ?? "",
       });
     });
   });
@@ -328,7 +362,9 @@ if (versions.length === 0) {
 
 console.log(`Selected ${versions.length} Minecraft version(s): ${versions.join(", ")}`);
 if (!options.dryRun) {
-  console.log(`Runner settings: jobs=${options.jobs}, sharedCache=${options.sharedCache ? defaultSharedCacheRoot : "disabled"}`);
+  console.log(
+    `Runner settings: jobs=${options.jobs}, sharedCache=${options.sharedCache ? defaultSharedCacheRoot : "disabled"}, quiet=${options.quiet}`,
+  );
 }
 
 if (options.dryRun) {
@@ -341,6 +377,13 @@ const failed = results.filter((result) => result.code !== 0);
 console.log("\nVanilla compatibility results:");
 for (const result of results) {
   console.log(`- ${result.version}: ${result.code === 0 ? "passed" : `failed (${result.signal ?? result.code})`}`);
+}
+
+for (const result of failed) {
+  if (result.outputTail) {
+    console.log(`\n--- ${result.version} failure output tail ---`);
+    console.log(result.outputTail);
+  }
 }
 
 if (failed.length > 0) {
