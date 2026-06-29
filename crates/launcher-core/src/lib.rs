@@ -1245,7 +1245,7 @@ pub fn repair_profile(profile_id: &str) -> Result<ActionReceipt> {
     Ok(receipt(
         LauncherAction::RepairProfile,
         Some(profile_id.to_owned()),
-        "Profile repair planned and queued.",
+        "Profile setup planned and queued.",
     ))
 }
 
@@ -12670,7 +12670,8 @@ mod tests {
 
         assert!(launch_profile("").is_err());
         assert!(install_pack("winterpack").is_ok());
-        assert!(repair_profile("winterpack").is_ok());
+        let setup_receipt = repair_profile("winterpack").expect("profile setup should queue");
+        assert_eq!(setup_receipt.message, "Profile setup planned and queued.");
     }
 
     #[test]

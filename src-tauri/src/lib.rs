@@ -2564,7 +2564,8 @@ async fn repair_profile(
     event_log: State<'_, LauncherEventLog>,
     lifecycle_gate: State<'_, LifecycleOperationGate>,
 ) -> Result<ActionReceipt, String> {
-    let _lifecycle_guard = lifecycle_gate.acquire(format!("repairing profile '{profile_id}'"))?;
+    let _lifecycle_guard =
+        lifecycle_gate.acquire(format!("setting up profile files for '{profile_id}'"))?;
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Err(profile_repair_active_process_error(&profile_id, &process));
     }
@@ -3224,7 +3225,7 @@ mod tests {
             .acquire("installing pack 'winterpack'")
             .expect("first lifecycle operation should acquire gate");
 
-        let error = match gate.acquire("repairing profile 'winterpack'") {
+        let error = match gate.acquire("setting up profile files for 'winterpack'") {
             Ok(_) => panic!("second lifecycle operation should be rejected"),
             Err(error) => error,
         };
@@ -3247,12 +3248,12 @@ mod tests {
         }
 
         let _next_guard = gate
-            .acquire("repairing profile 'winterpack'")
+            .acquire("setting up profile files for 'winterpack'")
             .expect("dropped lifecycle guard should release gate");
 
         assert_eq!(
             gate.active_description().unwrap().as_deref(),
-            Some("repairing profile 'winterpack'")
+            Some("setting up profile files for 'winterpack'")
         );
     }
 
