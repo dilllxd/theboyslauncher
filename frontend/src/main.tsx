@@ -1942,6 +1942,9 @@ function App() {
   const sidebarDownloadEvent = latestActiveDownloadEvent(launcherEvents);
   const sidebarProgressEvent = sidebarDownloadEvent;
   const sidebarProgressPercent = sidebarProgressEvent?.progressPercent;
+  const sidebarProgressVisible =
+    typeof sidebarProgressPercent === "number" && sidebarProgressPercent >= 0 && sidebarProgressPercent < 100;
+  const sidebarProgressWidth = sidebarProgressVisible ? Math.max(6, sidebarProgressPercent) : 0;
   const latestOperationQuickLabel = lifecycleActionInProgress
     ? lifecycleActionLabel
     : latestLauncherEvent
@@ -4381,9 +4384,16 @@ function App() {
           <div className="status-copy">
             <strong>{sidebarStatusTitle(isNative, sidebarProgressEvent)}</strong>
             <span aria-label="Launcher status message">{sidebarStatusMessage(sidebarProgressEvent, activity)}</span>
-            {typeof sidebarProgressPercent === "number" && sidebarProgressPercent > 0 && sidebarProgressPercent < 100 && (
-              <div className="connection-progress" aria-label="Launcher status progress">
-                <span style={{ width: `${sidebarProgressPercent}%` }} />
+            {sidebarProgressVisible && (
+              <div
+                className={sidebarProgressPercent === 0 ? "connection-progress starting" : "connection-progress"}
+                aria-label="Launcher status progress"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={sidebarProgressPercent}
+              >
+                <span style={{ width: `${sidebarProgressWidth}%` }} />
               </div>
             )}
             {(launchRecoveryProfileId ||

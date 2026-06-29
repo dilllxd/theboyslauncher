@@ -1675,6 +1675,31 @@ test("live file download events surface in the sidebar status card", async ({ pa
       },
       configurable: true,
     });
+    Object.defineProperty(window, "__emitDownloadQueuedEvent", {
+      value: () => {
+        const event = {
+          event: "launcher-event",
+          payload: {
+            id: "download-queued",
+            operationId: "download-plan",
+            operation: "download_artifacts",
+            subjectId: "winterpack-modloader-artifacts",
+            kind: "queued",
+            message: "File pending: forge-bootstrap (library, 2.4 MB)",
+            progressPercent: 0,
+            occurredAtUnixSeconds: 1_710_000_000,
+          },
+        };
+        callbacks.forEach((callback) => {
+          try {
+            callback(event);
+          } catch {
+            // Other Tauri listeners may receive a different payload shape in this test.
+          }
+        });
+      },
+      configurable: true,
+    });
     Object.defineProperty(window, "__emitDownloadCompletedEvent", {
       value: () => {
         const event = {
@@ -1819,6 +1844,15 @@ test("live file download events surface in the sidebar status card", async ({ pa
     )
     .toBeGreaterThan(0);
   await page.evaluate(() =>
+    (window as typeof window & { __emitDownloadQueuedEvent: () => void }).__emitDownloadQueuedEvent(),
+  );
+
+  await expect(page.getByLabel("Launcher status", { exact: true })).toContainText("Downloading files");
+  await expect(page.getByLabel("Launcher status message")).toContainText("winterpack - File pending: forge-bootstrap");
+  await expect(page.getByLabel("Launcher status progress")).toBeVisible();
+  await expect(page.getByLabel("Launcher status progress")).toHaveAttribute("aria-valuenow", "0");
+
+  await page.evaluate(() =>
     (window as typeof window & { __emitDownloadEvent: () => void }).__emitDownloadEvent(),
   );
 
@@ -1827,6 +1861,7 @@ test("live file download events surface in the sidebar status card", async ({ pa
     "winterpack - Downloading file: forge-bootstrap",
   );
   await expect(page.getByLabel("Launcher status progress")).toBeVisible();
+  await expect(page.getByLabel("Launcher status progress")).toHaveAttribute("aria-valuenow", "42");
 
   await page.evaluate(() =>
     (window as typeof window & { __emitDownloadCompletedEvent: () => void }).__emitDownloadCompletedEvent(),
