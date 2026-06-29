@@ -1239,6 +1239,8 @@ Latest Activity file-progress summary polish: Activity Overview's compact `Lates
 
 Latest native event-push status polish: native `launcher-event` pushes now route their fallback bottom-left activity text through the same user-facing formatter used by the sidebar instead of writing raw event messages directly. This keeps pushed setup/download/process events consistent with the newer friendly status wording while Activity details still retain exact event rows. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "live file download events surface|terminal repair event clears stuck native repair busy state|stopping a native process keeps playing presence"` and `npm run build`.
 
+Latest packaged executable verification refresh: rechecked the frontend for normal user-facing `Repair` / `Check files` wording; remaining repair/check hits are internal command names, state keys, legacy sanitizers, tests, or friendly setup labels. Current release/security/package verification passes with `npm run verify:tauri-security`, `npm run verify:tauri-bundles`, `npm run build`, `npm run verify:package-resources`, and `$env:CARGO_TARGET_DIR='target/codex-goal-check'; cargo check --workspace`. Rebuilt the local release executable with `npx tauri build --no-bundle`, producing `target/release/theboyslauncher.exe` (`21,356,032` bytes, modified `2026-06-29T18:22:08-04:00`) with the current friendly status/download UI, and confirmed no `theboyslauncher`, `social-backend`, `java`, or `javaw` processes were left running afterward.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
