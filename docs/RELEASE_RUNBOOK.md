@@ -91,8 +91,9 @@ Final v4.0.0 release evidence from 2026-06-29:
 - `https://github.com/dilllxd/theboyslauncher/releases/latest/download/latest.json` returns updater metadata for version `4.0.0`.
 - The setup exe URL in `latest.json` returns HTTP 200.
 - The GHCR backend image was pulled and started through `npm run social:up`; `http://127.0.0.1:4074/health` returned `{"ok":true,"service":"social-backend"}`.
+- Local Windows Caddy was configured to reverse-proxy `launcher.dylan.lol` to `127.0.0.1:4074`; `https://launcher.dylan.lol/health` returned `{"ok":true,"service":"social-backend"}`.
 
-Remaining operations note: `https://launcher.dylan.lol/health` did not resolve on 2026-06-29. The backend container is verified locally through WSL/Docker, but production DNS/reverse proxy still needs to point `launcher.dylan.lol` at the hosted backend.
+The production social endpoint is live as of this verification. If it fails later, confirm Caddy is running on Windows, the DNS A record still points to this host, and the hosted backend containers are running with `npm run social:status`.
 
 After reviewing and committing the v4 rewrite branch, replace `main` only with explicit approval:
 

@@ -12,8 +12,7 @@ Verified release evidence:
 - GitHub Release `v4.0.0` is published with MSI, NSIS setup exe, signatures, and `latest.json`.
 - The updater endpoint resolves through `https://github.com/dilllxd/theboyslauncher/releases/latest/download/latest.json`.
 - The released backend image `ghcr.io/dilllxd/theboyslauncher/social-backend:v4.0.0` runs locally through WSL/Docker and returns healthy on `http://127.0.0.1:4074/health`.
-
-Known operational gap: `https://launcher.dylan.lol/health` did not resolve during release verification, so DNS/reverse proxy still needs to be pointed at the hosted backend before remote clients can use the production social endpoint.
+- Local Windows Caddy reverse-proxies `launcher.dylan.lol` to the hosted backend on `127.0.0.1:4074`, and `https://launcher.dylan.lol/health` returns healthy.
 
 ## Context
 
