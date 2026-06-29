@@ -1845,14 +1845,18 @@ async fn repair_launch_artifacts_if_missing(
             if !launch_failure_missing_artifacts(&message) {
                 return Ok(false);
             }
-            repair_profile_inner(profile_id.to_owned(), event_log)
-                .await
-                .map_err(|repair_error| {
-                    native_operation_failure_message(
-                        "Automatic profile repair before launch failed",
-                        &repair_error.message,
-                    )
-                })?;
+            repair_profile_inner(
+                profile_id.to_owned(),
+                event_log,
+                "Profile repair completed.",
+            )
+            .await
+            .map_err(|repair_error| {
+                native_operation_failure_message(
+                    "Automatic profile repair before launch failed",
+                    &repair_error.message,
+                )
+            })?;
             Ok(true)
         }
     }
@@ -2393,7 +2397,7 @@ async fn repair_profile(
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Err(profile_repair_active_process_error(&profile_id, &process));
     }
-    match repair_profile_inner(profile_id.clone(), &event_log).await {
+    match repair_profile_inner(profile_id.clone(), &event_log, "Profile repair completed.").await {
         Ok(receipt) => Ok(receipt),
         Err(error) => {
             let message = native_operation_failure_message("Profile repair failed", &error.message);
@@ -2432,7 +2436,7 @@ async fn prepare_profile(
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Err(profile_repair_active_process_error(&profile_id, &process));
     }
-    repair_profile_inner(profile_id.clone(), &event_log)
+    repair_profile_inner(profile_id.clone(), &event_log, "Profile setup completed.")
         .await
         .map(|_| {
             completed_action_receipt(
@@ -2447,6 +2451,7 @@ async fn prepare_profile(
 async fn repair_profile_inner(
     profile_id: String,
     event_log: &LauncherEventLog,
+    completion_message: &'static str,
 ) -> Result<ActionReceipt, NativeOperationError> {
     let plan = core_plan_repair_profile(&profile_id)
         .map_err(|error| NativeOperationError::unplanned(error.to_string()))?;
@@ -2505,13 +2510,13 @@ async fn repair_profile_inner(
             plan.operation_id,
             LauncherOperation::RepairProfile,
             profile_id.clone(),
-            "Profile repair completed.",
+            completion_message,
         ))
         .map_err(|error| NativeOperationError::planned(plan.operation_id, error.to_string()))?;
     Ok(completed_action_receipt(
         LauncherAction::RepairProfile,
         profile_id,
-        "Profile repair completed.",
+        completion_message,
     ))
 }
 

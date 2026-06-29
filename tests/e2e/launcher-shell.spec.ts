@@ -2252,6 +2252,7 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
       memoryMb: number;
     } | null = null;
     const invoked: string[] = [];
+    let prepared = false;
     let callbackId = 1;
     const callbacks = new Map<number, (...args: unknown[]) => unknown>();
     const snapshot = () => ({
@@ -2323,6 +2324,7 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
             };
           }
           if (cmd === "prepare_profile") {
+            prepared = true;
             return {
               id: "receipt-prepare-native-created",
               action: "repair_profile",
@@ -2331,7 +2333,22 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
               message: "Profile setup completed.",
             };
           }
-          if (cmd === "list_launcher_events") return [];
+          if (cmd === "list_launcher_events") {
+            return prepared
+              ? [
+                  {
+                    id: "setup-completed",
+                    operationId: "setup-native-created",
+                    operation: "repair_profile",
+                    subjectId: "native-created",
+                    kind: "completed",
+                    message: "Profile setup completed.",
+                    progressPercent: 100,
+                    occurredAtUnixSeconds: Math.floor(Date.now() / 1000),
+                  },
+                ]
+              : [];
+          }
           if (cmd === "social_backend_status") {
             return {
               bindAddr: "127.0.0.1:4074",
@@ -2385,6 +2402,7 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
   await expect(createdProfile.getByLabel("Native Fabric profile summary")).toContainText("26w01a");
   await expect(createdProfile.getByLabel("Native Fabric profile summary")).toContainText("fabric");
   await expect(createdProfile.getByLabel("Native Fabric profile summary")).toContainText("8 GB RAM");
+  await expect(page.getByLabel("Launcher quick status")).toContainText("Set up files - completed");
   const invoked = await page.evaluate(() => (window as typeof window & { __nativeCreateProfileInvokes: string[] }).__nativeCreateProfileInvokes);
   expect(invoked.indexOf("create_profile")).toBeLessThan(invoked.indexOf("prepare_profile"));
   expect(invoked.indexOf("bootstrap_snapshot", invoked.indexOf("prepare_profile"))).toBeGreaterThan(invoked.indexOf("prepare_profile"));

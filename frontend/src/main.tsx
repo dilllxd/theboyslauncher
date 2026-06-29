@@ -1159,7 +1159,7 @@ function completedLifecycleMessage(event: LauncherEvent) {
     return /^Pack (installed|updated|reinstalled) successfully\.$/.test(event.message);
   }
   if (event.operation === "repair_profile") {
-    return event.message === "Profile repair completed.";
+    return event.message === "Profile repair completed." || event.message === "Profile setup completed.";
   }
   if (event.operation === "delete_profile") {
     return event.message === "Profile deleted." || event.message.includes("shared Minecraft downloads were kept");
@@ -1230,8 +1230,14 @@ function operationLabel(operation?: LauncherOperation) {
   }
 }
 
-function operationContextLabel(operation?: LauncherOperation, subjectId?: string) {
-  return subjectId ? `${operationLabel(operation)} - ${friendlyOperationSubject(subjectId)}` : operationLabel(operation);
+function operationLabelForMessage(operation: LauncherOperation | undefined, message?: string) {
+  if (operation === "repair_profile" && message === "Profile setup completed.") return "Set up files";
+  return operationLabel(operation);
+}
+
+function operationContextLabel(operation?: LauncherOperation, subjectId?: string, message?: string) {
+  const label = operationLabelForMessage(operation, message);
+  return subjectId ? `${label} - ${friendlyOperationSubject(subjectId)}` : label;
 }
 
 function friendlyOperationSubject(subjectId: string) {
@@ -1285,6 +1291,7 @@ function userFacingLauncherEventMessage(message: string) {
     .replace(/^Repair queued for/i, "File check queued for")
     .replace(/^Repair plan is ready to execute\./i, "File check is ready to start.")
     .replace(/^Profile repair completed\./i, "Files are ready.")
+    .replace(/^Profile setup completed\./i, "Files are ready.")
     .replace(/^(?:Error:\s*)?Profile repair failed:/i, "File check failed:");
 }
 
@@ -1860,7 +1867,7 @@ function App() {
   const latestOperationQuickLabel = lifecycleActionInProgress
     ? lifecycleActionLabel
     : latestLauncherEvent
-      ? `${operationLabel(latestLauncherEvent.operation)} - ${latestLauncherEvent.kind}`
+      ? `${operationLabelForMessage(latestLauncherEvent.operation, latestLauncherEvent.message)} - ${latestLauncherEvent.kind}`
       : "No operation yet";
   const processQuickLabel =
     activeManagedProcessCount === 0
@@ -5291,7 +5298,7 @@ function App() {
                         <span style={{ width: `${operation.progressPercent ?? 0}%` }} />
                       </div>
                       <span>
-                        {operationContextLabel(operation.operation, operation.subjectId)} - {operation.latestEvent.kind} -{" "}
+                        {operationContextLabel(operation.operation, operation.subjectId, operation.latestEvent.message)} - {operation.latestEvent.kind} -{" "}
                         {operation.eventCount} events
                       </span>
                     </div>
@@ -5308,6 +5315,7 @@ function App() {
                       {operationContextLabel(
                         latestOperationEvents[latestOperationEvents.length - 1].operation,
                         latestOperationEvents[latestOperationEvents.length - 1].subjectId,
+                        latestOperationEvents[latestOperationEvents.length - 1].message,
                       )}
                     </span>
                     <h3>{userFacingLauncherEventMessage(latestOperationEvents[latestOperationEvents.length - 1].message)}</h3>
@@ -5344,7 +5352,7 @@ function App() {
                           <span>
                             {event.kind}
                             {typeof event.progressPercent === "number" ? ` - ${event.progressPercent}%` : ""} -{" "}
-                            {operationContextLabel(event.operation, event.subjectId)} - {formatUnixDate(event.occurredAtUnixSeconds)}
+                            {operationContextLabel(event.operation, event.subjectId, event.message)} - {formatUnixDate(event.occurredAtUnixSeconds)}
                           </span>
                         </div>
                       </div>
@@ -5416,7 +5424,7 @@ function App() {
                           {event.kind}
                           {typeof event.progressPercent === "number" ? ` - ${event.progressPercent}%` : ""}
                         </span>
-                        <span>{operationContextLabel(event.operation, event.subjectId)}</span>
+                        <span>{operationContextLabel(event.operation, event.subjectId, event.message)}</span>
                         <span>{formatUnixDate(event.occurredAtUnixSeconds)}</span>
                       </div>
                       {playableProfile && (
