@@ -1818,7 +1818,7 @@ test("live file download events surface in the sidebar status card", async ({ pa
             id: "processor-verified",
             operationId: "processor-plan",
             operation: "download_artifacts",
-            subjectId: "winterpack-modloader-artifacts",
+            subjectId: "1.20.1",
             kind: "verifying",
             message: "Verified modloader installer processor 6/6 outputs.",
             progressPercent: 95,
@@ -1963,7 +1963,7 @@ test("live file download events surface in the sidebar status card", async ({ pa
 
   await expect(page.getByLabel("Launcher status", { exact: true })).toContainText("Downloading files");
   await expect(page.getByLabel("Launcher status message")).toContainText(
-    "winterpack - Verified modloader installer processor 6/6 outputs.",
+    "1.20.1 - Verified modloader installer processor 6/6 outputs.",
   );
 
   await page.evaluate(() =>

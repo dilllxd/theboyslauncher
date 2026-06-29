@@ -1147,6 +1147,8 @@ Latest setup-friction polish: the frontend now sanitizes native launch/setup err
 
 Latest profile-picker polish: the new-profile and customize profile version dropdowns now show an inline friendly empty-state hint when a selected category such as Snapshots, Old beta, or Old alpha has no manifest entries available, instead of leaving a disabled version dropdown unexplained. This keeps raw manual version entry out of the normal flow while making manifest/fallback limits understandable. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "library new profile action|library profile editor saves preview changes|library profile editor can choose snapshot"` and `npm run build`.
 
+Latest sidebar progress hardening: the bottom-left launcher status now clears older active `download_artifacts` events after any later install/setup lifecycle completion, even when the download subject is a shared Minecraft version like `1.20.1` rather than the pack id. This covers the previously observed `Verified modloader installer processor 6/6 outputs` message sticking after the pack had already completed. Newer active download events still surface normally. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "live file download events surface"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

@@ -1395,6 +1395,7 @@ function summarizeArtifactOperation(events: LauncherEvent[]): ArtifactOperationS
 function latestActiveDownloadEvent(events: LauncherEvent[]) {
   const downloadOperations = new Map<string, { events: LauncherEvent[]; latestIndex: number }>();
   const completedLifecycleIndexesBySubject = new Map<string, number>();
+  let latestCompletedLifecycleIndex = -1;
   events.forEach((event, index) => {
     if (
       event.subjectId &&
@@ -1402,6 +1403,7 @@ function latestActiveDownloadEvent(events: LauncherEvent[]) {
       (event.operation === "install_pack" || event.operation === "repair_profile")
     ) {
       completedLifecycleIndexesBySubject.set(operationSubjectRoot(event.subjectId), index);
+      latestCompletedLifecycleIndex = Math.max(latestCompletedLifecycleIndex, index);
     }
     if (event.operation !== "download_artifacts") return;
     const operationKey = event.operationId || `${event.subjectId ?? "download"}-${event.id}`;
@@ -1419,7 +1421,9 @@ function latestActiveDownloadEvent(events: LauncherEvent[]) {
       if (!event.subjectId) return true;
       const completedLifecycleIndex = completedLifecycleIndexesBySubject.get(operationSubjectRoot(event.subjectId));
       const operation = downloadOperations.get(event.operationId || `${event.subjectId ?? "download"}-${event.id}`);
-      return completedLifecycleIndex === undefined || !operation || completedLifecycleIndex < operation.latestIndex;
+      if (completedLifecycleIndex !== undefined && operation && completedLifecycleIndex >= operation.latestIndex) return false;
+      if (operation && latestCompletedLifecycleIndex >= operation.latestIndex) return false;
+      return true;
     });
 }
 
