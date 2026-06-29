@@ -1389,6 +1389,11 @@ function userFacingLauncherEventMessage(message: string) {
 function userFacingNativeErrorMessage(message: string) {
   return userFacingLauncherEventMessage(message)
     .replace(/^Automatic profile repair before launch failed:/i, "Automatic profile setup before launch failed:")
+    .replace(/^launch artifact is missing:\s*asset index is missing\..*$/i, "Game files are missing. The launcher will set them up automatically.")
+    .replace(/^launch artifact is missing:\s*natives directory is missing\..*$/i, "Game files are missing. The launcher will set them up automatically.")
+    .replace(/^launch artifacts? (?:is|are) missing:.*$/i, "Game files are missing. The launcher will set them up automatically.")
+    .replace(/^asset index is missing:.*$/i, "Game files are missing. The launcher will set them up automatically.")
+    .replace(/^natives directory is missing:.*$/i, "Game files are missing. The launcher will set them up automatically.")
     .replace(/\s*Install or repair the profile before launching\./i, " The launcher will set up missing files automatically.")
     .replace(/\brepair the profile\b/i, "set up the profile files");
 }
@@ -2569,7 +2574,7 @@ function App() {
   }
 
   function launchFailureNeedsRepair(message: string) {
-    return /install or repair|launch artifacts? (is|are) missing|asset index is missing|natives directory is missing/i.test(message);
+    return /install or repair|launch artifacts? (is|are) missing|asset index is missing|natives directory is missing|game files are missing|missing files/i.test(message);
   }
 
   function completedLifecycleEventCanLaunch(event: LauncherEvent) {

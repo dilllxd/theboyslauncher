@@ -1668,7 +1668,7 @@ test("successful pack update clears stale launch repair recovery", async ({ page
   const profile = page.locator(".profile-row").filter({ hasText: "WinterPack" });
   await profile.getByRole("button", { name: "Launch details" }).click();
 
-  await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
+  await expect(page.getByLabel("Launcher status message")).toContainText("Game files are missing");
   await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toBeVisible();
 
   await profile.getByLabel("WinterPack launch actions").getByRole("button", { name: "Update" }).click();
@@ -5622,7 +5622,7 @@ test("launch command preflight failure offers setup recovery", async ({ page }) 
   await page.getByRole("button", { name: "Library" }).click();
   await page.locator(".profile-row").filter({ hasText: "WinterPack" }).getByRole("button", { name: "Launch details" }).click();
 
-  await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
+  await expect(page.getByLabel("Launcher status message")).toContainText("Game files are missing");
   await expect(page.getByLabel("Launch details preview")).toHaveCount(0);
   const recoveryActions = page.getByLabel("Launcher recovery actions");
   await expect(recoveryActions.getByRole("button", { name: "Set up again" })).toBeVisible();
@@ -5727,7 +5727,7 @@ test("successful launch command preview clears stale repair recovery", async ({ 
   const profile = page.locator(".profile-row").filter({ hasText: "WinterPack" });
   await profile.getByRole("button", { name: "Launch details" }).click();
 
-  await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
+  await expect(page.getByLabel("Launcher status message")).toContainText("Game files are missing");
   await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toBeVisible();
 
   await profile.getByRole("button", { name: "Launch details" }).click();
@@ -7986,7 +7986,7 @@ test("library delete action clears stale launch recovery for removed profile", a
   await page.getByRole("button", { name: "Library" }).click();
   const profile = page.locator(".profile-row").filter({ hasText: "Latest Release" });
   await profile.getByRole("button", { name: "Launch details" }).click();
-  await expect(page.getByLabel("Launcher status message")).toContainText("asset index is missing");
+  await expect(page.getByLabel("Launcher status message")).toContainText("Game files are missing");
   await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Set up again" })).toBeVisible();
 
   await openProfileCustomize(profile);
