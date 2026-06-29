@@ -16157,6 +16157,11 @@ version = "safeVersion"
 
     #[test]
     fn offline_launch_plan_can_include_server_quick_join() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        seed_profiles_for_current_env(&[winterpack_profile_fixture()]);
+
         let _java = JavaRuntimeDiscoveryGuard::java_21();
         let settings = default_settings();
         let directories = LauncherDirectories {
@@ -16345,6 +16350,11 @@ version = "safeVersion"
 
     #[test]
     fn authenticated_launch_plan_uses_session_identity_and_token() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        seed_profiles_for_current_env(&[winterpack_profile_fixture()]);
+
         let _java = JavaRuntimeDiscoveryGuard::java_21();
         let settings = default_settings();
         let directories = LauncherDirectories {
@@ -16844,6 +16854,11 @@ version = "safeVersion"
 
     #[test]
     fn stored_authenticated_launch_plan_uses_persisted_session_identity() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        seed_profiles_for_current_env(&[winterpack_profile_fixture()]);
+
         let _java = JavaRuntimeDiscoveryGuard::java_21();
         let settings = default_settings();
         let directories = LauncherDirectories {
