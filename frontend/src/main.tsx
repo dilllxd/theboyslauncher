@@ -4832,7 +4832,7 @@ function App() {
                         onClick={() => setNewProfileAdvancedOpen((current) => !current)}
                       >
                         <Wrench size={16} />
-                        {newProfileAdvancedOpen ? "Hide advanced" : "Advanced"}
+                        {newProfileAdvancedOpen ? "Basic" : "Advanced"}
                       </button>
                     </div>
                     {newProfileAdvancedOpen && (
@@ -6765,7 +6765,7 @@ function ProfileEditor({
                 onClick={() => setShowAdvancedProfileSettings((current) => !current)}
               >
                 <Wrench size={16} />
-                {showAdvancedProfileSettings ? "Hide advanced" : "Advanced"}
+                {showAdvancedProfileSettings ? "Basic" : "Advanced"}
               </button>
             </div>
             {showAdvancedProfileSettings && (
