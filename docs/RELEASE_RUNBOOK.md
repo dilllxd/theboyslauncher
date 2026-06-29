@@ -23,6 +23,7 @@ npm run social:up
 ```
 
 Default local exposure is `http://127.0.0.1:4074`. Put the production reverse proxy for `https://launcher.dylan.lol` in front of that port, or set `THEBOYS_BACKEND_HOST` / `THEBOYS_BACKEND_PORT` before `social:up`.
+The hosted Postgres and backend containers are started with Docker restart policy `unless-stopped`.
 
 Useful commands:
 

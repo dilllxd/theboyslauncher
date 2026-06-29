@@ -4,16 +4,21 @@ import { spawnSync } from "node:child_process";
 const networkName = "theboyslauncher-social";
 const postgresContainer = "theboyslauncher-hosted-postgres";
 const backendContainer = "theboyslauncher-social-backend";
-const backendImage = process.env.THEBOYS_BACKEND_IMAGE ?? "theboyslauncher/social-backend:local";
+const backendImage =
+  process.env.THEBOYS_BACKEND_IMAGE ?? "theboyslauncher/social-backend:local";
 const databaseName = process.env.THEBOYS_POSTGRES_DB ?? "theboyslauncher";
 const databaseUser = process.env.THEBOYS_POSTGRES_USER ?? "theboyslauncher";
-const databasePassword = process.env.THEBOYS_POSTGRES_PASSWORD ?? "theboyslauncher";
+const databasePassword =
+  process.env.THEBOYS_POSTGRES_PASSWORD ?? "theboyslauncher";
 const hostAddress = process.env.THEBOYS_BACKEND_HOST ?? "127.0.0.1";
 const hostPort = process.env.THEBOYS_BACKEND_PORT ?? "4074";
-const corsOrigins = process.env.THEBOYS_BACKEND_CORS_ORIGINS ?? "https://launcher.dylan.lol";
+const corsOrigins =
+  process.env.THEBOYS_BACKEND_CORS_ORIGINS ?? "https://launcher.dylan.lol";
 
 function usage() {
-  console.error("Usage: node scripts/manage-hosted-social-backend.mjs <build|up|down|restart|logs|status|secret>");
+  console.error(
+    "Usage: node scripts/manage-hosted-social-backend.mjs <build|up|down|restart|logs|status|secret>",
+  );
 }
 
 function run(command, args, options = {}) {
@@ -43,7 +48,10 @@ function docker(runner, args, options = {}) {
 }
 
 function dockerInherit(runner, args) {
-  const result = docker(runner, args, { stdio: "inherit", encoding: undefined });
+  const result = docker(runner, args, {
+    stdio: "inherit",
+    encoding: undefined,
+  });
   if (result.status !== 0) {
     process.exit(result.status ?? 1);
   }
@@ -56,6 +64,18 @@ function inspectExists(runner, kind, name) {
 function containerRunning(runner, name) {
   const result = docker(runner, ["inspect", "-f", "{{.State.Running}}", name]);
   return result.status === 0 && result.stdout.trim() === "true";
+}
+
+function containerSummary(runner, name) {
+  const result = docker(runner, [
+    "inspect",
+    "-f",
+    "{{.State.Status}}|{{.Config.Image}}|{{.HostConfig.RestartPolicy.Name}}|{{json .NetworkSettings.Ports}}",
+    name,
+  ]);
+  if (result.status !== 0) return null;
+  const [state, image, restartPolicy, ports] = result.stdout.trim().split("|");
+  return { state, image, restartPolicy, ports };
 }
 
 function ensureNetwork(runner) {
@@ -93,7 +113,9 @@ function waitForPostgres(runner) {
     }
     sleep(1_000);
   }
-  throw new Error(`${postgresContainer} did not become ready within 90 seconds.`);
+  throw new Error(
+    `${postgresContainer} did not become ready within 90 seconds.`,
+  );
 }
 
 async function waitForBackendHealth() {
@@ -111,7 +133,9 @@ async function waitForBackendHealth() {
     }
     sleep(1_000);
   }
-  throw new Error(`${backendContainer} did not become healthy at ${healthUrl} within 90 seconds.`);
+  throw new Error(
+    `${backendContainer} did not become healthy at ${healthUrl} within 90 seconds.`,
+  );
 }
 
 function hostedDatabaseUrl() {
@@ -149,6 +173,8 @@ async function up(runner) {
       "-d",
       "--name",
       postgresContainer,
+      "--restart",
+      "unless-stopped",
       "--network",
       networkName,
       "-e",
@@ -172,6 +198,8 @@ async function up(runner) {
     "-d",
     "--name",
     backendContainer,
+    "--restart",
+    "unless-stopped",
     "--network",
     networkName,
     "-p",
@@ -187,7 +215,9 @@ async function up(runner) {
     backendImage,
   ]);
   await waitForBackendHealth();
-  console.log(`Hosted social backend is ready on http://${hostAddress}:${hostPort}`);
+  console.log(
+    `Hosted social backend is ready on http://${hostAddress}:${hostPort}`,
+  );
 }
 
 function down(runner) {
@@ -201,14 +231,24 @@ function logs(runner) {
 
 function status(runner) {
   for (const name of [postgresContainer, backendContainer]) {
-    const exists = inspectExists(runner, "container", name);
-    console.log(`${name}: ${exists ? (containerRunning(runner, name) ? "running" : "stopped") : "missing"}`);
+    const summary = containerSummary(runner, name);
+    if (!summary) {
+      console.log(`${name}: missing`);
+      continue;
+    }
+    console.log(
+      `${name}: ${summary.state}; image=${summary.image}; restart=${summary.restartPolicy}; ports=${summary.ports}`,
+    );
   }
 }
 
 async function main() {
   const action = process.argv[2];
-  if (!["build", "up", "down", "restart", "logs", "status", "secret"].includes(action)) {
+  if (
+    !["build", "up", "down", "restart", "logs", "status", "secret"].includes(
+      action,
+    )
+  ) {
     usage();
     process.exit(2);
   }
