@@ -3747,6 +3747,8 @@ test("library play action opens native process supervisor after launch", async (
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByLabel("Launcher quick status")).toContainText("1 active process");
+  await expect(page.getByLabel("Launcher status message")).not.toContainText("javaw.exe");
+  await expect(page.getByLabel("Launcher status message")).not.toContainText("Minecraft client starting");
   await expect(page.getByLabel("Activity views").getByRole("button", { name: "Processes" })).toHaveClass(/active/);
   await expect(page.getByLabel("Activity tools").getByRole("button", { name: "Live" })).toHaveClass(/active/);
   const processRow = page.locator(".process-row").filter({ hasText: "Minecraft client starting" });
@@ -5054,10 +5056,15 @@ test("library play action surfaces native Java runtime recovery and retry", asyn
   await page.locator(".profile-row").filter({ hasText: "Modern Vanilla" }).getByRole("button", { name: "Play" }).click();
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
-  await expect(page.getByLabel("Activity views").getByRole("button", { name: "Processes" })).toHaveClass(/active/);
+  await page.getByLabel("Activity views").getByRole("button", { name: "Processes" }).click();
   await expect(page.locator(".process-row").filter({ hasText: "Minecraft started with Java 21" })).toBeVisible();
   await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Java" })).toHaveCount(0);
   await expect(page.getByRole("complementary").getByRole("button", { name: "Repair" })).toHaveCount(0);
+  await page.getByLabel("Activity views").getByRole("button", { name: "Events" }).click();
+  const javaFailureEvent = page.locator(".event-row").filter({ hasText: "Preparing Java 21 automatically" });
+  await expect(javaFailureEvent).toBeVisible();
+  await expect(javaFailureEvent).not.toContainText("Install a managed Java runtime from Settings before launching");
+  await expect(javaFailureEvent.getByRole("button", { name: "Java" })).toHaveCount(0);
   const invoked = await page.evaluate(() => (window as typeof window & { __javaRecoveryInvokes: string[] }).__javaRecoveryInvokes);
   expect(invoked).toContain("start_launch_process");
   expect(invoked).toContain("recommended_java_runtime_manifest");
@@ -5068,13 +5075,17 @@ test("library play action surfaces native Java runtime recovery and retry", asyn
   expect(invoked).not.toContain("plan_repair_profile");
 });
 
-test("missing managed Java executable path offers Java recovery", async ({ page }) => {
+test("missing managed Java executable path auto-installs Java and retries", async ({ page }) => {
   await page.addInitScript(() => {
     const message =
       "Java executable C:/Users/test/AppData/Roaming/TheBoysLauncher/runtimes/temurin-21-windows-x64/bin/java.exe is missing. Install a managed Java runtime from Settings before launching.";
+    const invoked: string[] = [];
+    let launchAttempts = 0;
+    let runtimeInstalled = false;
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       value: {
         invoke: async (cmd: string) => {
+          invoked.push(cmd);
           if (cmd === "bootstrap_snapshot") {
             return {
               settings: {
@@ -5104,7 +5115,32 @@ test("missing managed Java executable path offers Java recovery", async ({ page 
               imports: [],
             };
           }
-          if (cmd === "start_launch_process") throw new Error(message);
+          if (cmd === "start_launch_process") {
+            launchAttempts += 1;
+            if (launchAttempts === 1) throw new Error(message);
+            return {
+              id: "missing-java-retry-process",
+              processId: 4343,
+              state: "running",
+              startedAtUnixSeconds: 1_781_000_000,
+              runtimeSeconds: 2,
+              totalOutputLineCount: 1,
+              droppedOutputLineCount: 0,
+              command: {
+                executable: "javaw.exe",
+                args: ["-jar", "minecraft.jar"],
+                env: [
+                  {
+                    key: "THEBOYSLAUNCHER_PROFILE_ID",
+                    value: "modern-vanilla",
+                    sensitive: false,
+                  },
+                ],
+                workingDirectory: "C:/Users/test/AppData/Roaming/TheBoysLauncher/data/profiles/modern-vanilla",
+              },
+              output: [{ stream: "stdout", line: "Minecraft started after Java reinstall", timestampUnixSeconds: 1_781_000_001 }],
+            };
+          }
           if (cmd === "list_launcher_events") {
             return [
               {
@@ -5118,6 +5154,36 @@ test("missing managed Java executable path offers Java recovery", async ({ page 
                 occurredAtUnixSeconds: 1_710_000_000,
               },
             ];
+          }
+          if (cmd === "build_managed_java_runtime_download_plan") {
+            return {
+              versionId: "temurin-21-windows-x64",
+              totalBytes: 1234,
+              items: [
+                {
+                  id: "java-runtime-archive-temurin-21-windows-x64",
+                  kind: "java_runtime_archive",
+                  url: "https://downloads.example/temurin-21.zip",
+                  destination: "C:/Users/test/AppData/Roaming/TheBoysLauncher/cache/java/temurin-21.zip",
+                  size: 1234,
+                },
+              ],
+            };
+          }
+          if (cmd === "execute_download_plan") {
+            return {
+              operation: "download_artifacts",
+              subject: "temurin-21-windows-x64",
+              events: [{ kind: "completed", message: "Java runtime archive downloaded.", progressPercent: 100 }],
+            };
+          }
+          if (cmd === "execute_managed_java_runtime_install") {
+            runtimeInstalled = true;
+            return {
+              operation: "install_java_runtime",
+              subject: "temurin-21-windows-x64",
+              events: [{ kind: "completed", message: "Java runtime temurin-21-windows-x64 is installed.", progressPercent: 100 }],
+            };
           }
           if (cmd === "recommended_java_runtime_manifest") {
             return [
@@ -5133,7 +5199,20 @@ test("missing managed Java executable path offers Java recovery", async ({ page 
               },
             ];
           }
-          if (cmd === "discover_java_runtimes") return [];
+          if (cmd === "discover_java_runtimes") {
+            return runtimeInstalled
+              ? [
+                  {
+                    id: "java-21-temurin",
+                    path: "C:/Users/test/AppData/Roaming/TheBoysLauncher/runtimes/temurin-21-windows-x64/bin/java.exe",
+                    version: "21.0.6",
+                    majorVersion: 21,
+                    source: "bundled",
+                  },
+                ]
+              : [];
+          }
+          if (cmd === "list_managed_processes") return [];
           if (cmd === "social_backend_status") {
             return {
               bindAddr: "127.0.0.1:4074",
@@ -5152,6 +5231,10 @@ test("missing managed Java executable path offers Java recovery", async ({ page 
       },
       configurable: true,
     });
+    Object.defineProperty(window, "__missingJavaInvokes", {
+      value: invoked,
+      configurable: true,
+    });
     Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
       value: {
         unregisterListener: () => undefined,
@@ -5165,17 +5248,18 @@ test("missing managed Java executable path offers Java recovery", async ({ page 
   await page.locator(".profile-row").filter({ hasText: "Modern Vanilla" }).getByRole("button", { name: "Play" }).click();
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
-  await expect(page.getByLabel("Activity views").getByRole("button", { name: "Overview" })).toHaveClass(/active/);
-  await expect(page.getByRole("heading", { name: /Java executable .* is missing/ })).toBeVisible();
-  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Java" })).toBeVisible();
+  await page.getByLabel("Activity views").getByRole("button", { name: "Processes" }).click();
+  await expect(page.locator(".process-row").filter({ hasText: "Minecraft started after Java reinstall" })).toBeVisible();
+  await expect(page.getByLabel("Launcher recovery actions").getByRole("button", { name: "Java" })).toHaveCount(0);
   await expect(page.getByRole("complementary").getByRole("button", { name: "Repair" })).toHaveCount(0);
-
   await page.getByRole("button", { name: "Events", exact: true }).click();
-  const failedJavaEvent = page.locator(".event-row").filter({ hasText: "Java executable" });
-  await expect(failedJavaEvent.getByRole("button", { name: "Java" })).toBeVisible();
-  await failedJavaEvent.getByRole("button", { name: "Java" }).click();
-  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
-  await expect(page.getByLabel("Managed Java runtime ID")).toHaveValue("temurin-21-windows-x64");
+  const failedJavaEvent = page.locator(".event-row").filter({ hasText: "Preparing Java automatically" });
+  await expect(failedJavaEvent).toBeVisible();
+  await expect(failedJavaEvent).not.toContainText("Install a managed Java runtime from Settings before launching");
+  await expect(failedJavaEvent.getByRole("button", { name: "Java" })).toHaveCount(0);
+  const invoked = await page.evaluate(() => (window as typeof window & { __missingJavaInvokes: string[] }).__missingJavaInvokes);
+  expect(invoked.filter((cmd) => cmd === "start_launch_process")).toHaveLength(2);
+  expect(invoked).toContain("execute_managed_java_runtime_install");
 });
 
 test("library launch command action falls back to web preview mock", async ({ page }) => {
@@ -5670,7 +5754,7 @@ test("launch command Java preflight failure offers Java recovery", async ({ page
   await page.locator(".profile-row").filter({ hasText: "WinterPack" }).getByRole("button", { name: "Launch details" }).click();
 
   await expect(page.getByLabel("Launcher status message")).toContainText(
-    "Install a managed Java runtime from Settings before launching",
+    "Preparing the right Java automatically for this Minecraft version.",
   );
   await expect(page.getByLabel("Launch details preview")).toHaveCount(0);
   const recoveryActions = page.getByLabel("Launcher recovery actions");

@@ -869,6 +869,16 @@ function managedProcessDisplayName(process: ManagedProcessSummary, profiles: Pro
   return profile?.name ?? "Minecraft";
 }
 
+function managedProcessActivitySummary(process: ManagedProcessSummary, profiles: ProfileSummary[]) {
+  const displayName = managedProcessDisplayName(process, profiles);
+  if (process.state === "running") return `${displayName} is running`;
+  if (process.state === "stop_requested") return `Stopping ${displayName}`;
+  if (typeof process.exitCode === "number") {
+    return process.exitCode === 0 ? `${displayName} closed` : `${displayName} closed unexpectedly`;
+  }
+  return `${displayName} process updated`;
+}
+
 function activeManagedProfileIds(processes: ManagedProcessSummary[]) {
   return new Set(
     processes
@@ -1344,6 +1354,18 @@ function fileEventMessageKind(message: string) {
 
 function userFacingLauncherEventMessage(message: string) {
   return message
+    .replace(
+      /Minecraft requires Java (\d+) or newer,.*?Install a managed Java runtime from Settings before launching\./i,
+      "Preparing Java $1 automatically for this Minecraft version.",
+    )
+    .replace(
+      /^Install a managed Java runtime from Settings before launching\.?$/i,
+      "Preparing the right Java automatically for this Minecraft version.",
+    )
+    .replace(
+      /Java executable .*? is missing\. Install a managed Java runtime from Settings before launching\./i,
+      "Preparing Java automatically for this Minecraft version.",
+    )
     .replace(/^Artifact download queued/i, "File download queued")
     .replace(/^Artifact pending:/i, "File pending:")
     .replace(/^Downloading artifact:/i, "Downloading file:")
@@ -1790,12 +1812,7 @@ function App() {
     listen<ManagedProcessSummary>("managed-process", (event) => {
       setManagedProcesses((current) => upsertManagedProcessSummary(current, event.payload));
       void clearPlayingPresenceForExitedProcess(event.payload);
-      const latestOutput = event.payload.output[event.payload.output.length - 1];
-      setActivity(
-        latestOutput
-          ? `${event.payload.command.executable}: ${latestOutput.line}`
-          : `${event.payload.command.executable} ${event.payload.state}`,
-      );
+      setActivity(managedProcessActivitySummary(event.payload, snapshot.profiles));
     }).then((cleanup) => {
       unlistenManagedProcess = cleanup;
     });
@@ -1803,7 +1820,7 @@ function App() {
       unlistenLauncherEvent?.();
       unlistenManagedProcess?.();
     };
-  }, [isNative]);
+  }, [isNative, snapshot.profiles]);
 
   useEffect(() => {
     if (!isNative) return;
@@ -2553,7 +2570,9 @@ function App() {
   }
 
   function launchFailureNeedsJava(message: string) {
-    return /requires Java \d+ or newer|Install a managed Java runtime from Settings/i.test(message);
+    return /requires Java \d+ or newer|Install a managed Java runtime from Settings|Preparing (?:Java(?: \d+)?|the right Java) automatically/i.test(
+      message,
+    );
   }
 
   function requiredJavaMajorVersionFromLaunchFailure(message: string) {
@@ -2655,7 +2674,7 @@ function App() {
         setActivityMode("processes");
         setProcessAutoRefresh(true);
       }
-      setActivity(authenticated ? "Authenticated launch queued" : "Launching profile queued");
+      setActivity(managedProcessActivitySummary(process, snapshot.profiles));
     } catch (error) {
       const message = nativeFailureActivity(
         error,
@@ -5689,7 +5708,9 @@ function App() {
                     event.kind === "failed" &&
                     event.subjectId &&
                     event.operation === "launch_profile" &&
-                    launchFailureNeedsJava(event.message)
+                    launchFailureNeedsJava(event.message) &&
+                    launchJavaRecoveryNeeded &&
+                    launchJavaRecoveryProfileId === event.subjectId
                       ? snapshot.profiles.find((profile) => profile.id === event.subjectId)
                       : undefined;
                   const sessionFailedLaunchProfile =
