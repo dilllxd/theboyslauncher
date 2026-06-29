@@ -1159,6 +1159,8 @@ Latest setup-recovery polish: the sidebar's generic missing-file recovery action
 
 Latest native setup wording polish: the Tauri bridge no longer tells users to stop a running profile before "repairing" when setup is blocked by an active process; the message now says to stop it before `setting up files`. Verified with `cargo test -p theboyslauncher active_managed_process_for_profile_matches_running_and_stop_requested_processes -- --test-threads=1` and `cargo fmt --all --check`.
 
+Latest automatic-launch setup wording polish: automatic missing-artifact setup failures in the Tauri launch path now say `Automatic profile setup before launch failed` instead of `Automatic profile repair before launch failed`. A focused regression test locks that wording. Verified with `cargo test -p theboyslauncher automatic -- --test-threads=1` and `cargo fmt --all --check`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

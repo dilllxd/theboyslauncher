@@ -1856,7 +1856,7 @@ async fn repair_launch_artifacts_if_missing(
             .await
             .map_err(|repair_error| {
                 native_operation_failure_message(
-                    "Automatic profile repair before launch failed",
+                    "Automatic profile setup before launch failed",
                     &repair_error.message,
                 )
             })?;
@@ -3513,6 +3513,17 @@ mod tests {
         assert!(!launch_failure_missing_artifacts(
             "Java executable C:/Java/bin/java.exe is missing. Install a managed Java runtime from Settings before launching."
         ));
+    }
+
+    #[test]
+    fn automatic_launch_setup_failure_uses_setup_wording() {
+        assert_eq!(
+            native_operation_failure_message(
+                "Automatic profile setup before launch failed",
+                "asset index is missing",
+            ),
+            "Automatic profile setup before launch failed: asset index is missing"
+        );
     }
 
     fn install_plan_fixture(queued_message: &str) -> OperationPlan {
