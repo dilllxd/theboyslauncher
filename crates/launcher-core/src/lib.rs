@@ -1413,6 +1413,8 @@ struct CurseForgeManifestFile {
     project_id: u64,
     #[serde(alias = "fileID")]
     file_id: u64,
+    #[serde(default, alias = "fileName")]
+    file_name: Option<String>,
     #[serde(default)]
     download_url: Option<String>,
     #[serde(default = "default_true")]
@@ -1550,14 +1552,14 @@ fn validate_curseforge_manifest(manifest: &CurseForgeModpackManifest) -> Result<
     ensure_safe_relative_path(&manifest.overrides, "CurseForge overrides path")?;
     for file in &manifest.files {
         if file.required {
-            let url = file.download_url.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "CurseForge file {}:{} is required but does not include a direct download URL yet",
-                    file.project_id,
-                    file.file_id
-                )
-            })?;
-            validate_http_download_url(url)?;
+            ensure!(file.project_id > 0, "CurseForge project id is required");
+            ensure!(file.file_id > 0, "CurseForge file id is required");
+            if let Some(url) = curseforge_manifest_file_direct_download_url(file) {
+                validate_http_download_url(url)?;
+            }
+            if let Some(file_name) = file.file_name.as_deref() {
+                ensure_safe_path_segment(file_name.trim(), "CurseForge mod filename")?;
+            }
         }
     }
     Ok(())
@@ -1598,14 +1600,8 @@ fn build_curseforge_modpack_mod_download_plan(
     let mods_dir = profile_root.join("mods");
     let mut items = Vec::new();
     for file in manifest.files.iter().filter(|file| file.required) {
-        let url = file.download_url.as_deref().ok_or_else(|| {
-            anyhow!(
-                "CurseForge file {}:{} is missing downloadUrl",
-                file.project_id,
-                file.file_id
-            )
-        })?;
-        let filename = filename_from_download_url(url)?;
+        let url = curseforge_manifest_file_download_url(file)?;
+        let filename = curseforge_manifest_file_destination_name(file, &url)?;
         ensure_safe_path_segment(&filename, "CurseForge mod filename")?;
         let destination = mods_dir.join(filename);
         ensure!(
@@ -1630,6 +1626,51 @@ fn build_curseforge_modpack_mod_download_plan(
         version_id: format!("{profile_id}-curseforge-mods"),
         items,
     })
+}
+
+fn curseforge_manifest_file_download_url(file: &CurseForgeManifestFile) -> Result<String> {
+    if let Some(url) = curseforge_manifest_file_direct_download_url(file) {
+        validate_http_download_url(url)?;
+        return Ok(url.to_owned());
+    }
+    curseforge_public_file_download_url(file.project_id, file.file_id)
+}
+
+fn curseforge_manifest_file_destination_name(
+    file: &CurseForgeManifestFile,
+    url: &str,
+) -> Result<String> {
+    if let Some(file_name) = file
+        .file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|file_name| !file_name.is_empty())
+    {
+        ensure_safe_path_segment(file_name, "CurseForge mod filename")?;
+        return Ok(file_name.to_owned());
+    }
+    if curseforge_manifest_file_direct_download_url(file).is_some() {
+        return filename_from_download_url(url);
+    }
+    Ok(format!(
+        "curseforge-{}-{}.jar",
+        file.project_id, file.file_id
+    ))
+}
+
+fn curseforge_manifest_file_direct_download_url(file: &CurseForgeManifestFile) -> Option<&str> {
+    file.download_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+}
+
+fn curseforge_public_file_download_url(project_id: u64, file_id: u64) -> Result<String> {
+    ensure!(project_id > 0, "CurseForge project id is required");
+    ensure!(file_id > 0, "CurseForge file id is required");
+    Ok(format!(
+        "https://www.curseforge.com/api/v1/mods/{project_id}/files/{file_id}/download"
+    ))
 }
 
 fn filename_from_download_url(url: &str) -> Result<String> {
@@ -23172,6 +23213,62 @@ JAVA_VERSION="21.0.4"
                 .as_deref(),
             Some("43.4.23")
         );
+    }
+
+    #[test]
+    fn curseforge_archive_plan_resolves_required_files_without_download_urls() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive_path = root.path().join("NoDirectUrls.zip");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let manifest = br#"{
+          "name": "NoDirectUrls",
+          "minecraft": {
+            "version": "1.20.1",
+            "modLoaders": [{ "primary": true, "id": "forge-47.4.0" }]
+          },
+          "manifestVersion": 1,
+          "manifestType": "minecraftModpack",
+          "files": [
+            {
+              "projectID": 238222,
+              "fileID": 4974757,
+              "fileName": "jei-1.20.1-forge-15.3.0.4.jar",
+              "required": true
+            },
+            {
+              "projectID": 306770,
+              "fileID": 4031402,
+              "downloadUrl": "",
+              "required": true
+            }
+          ],
+          "overrides": "overrides"
+        }"#;
+        write_zip_archive(&archive_path, &[("manifest.json", manifest)]);
+
+        let plan = build_curseforge_modpack_archive_install_plan(&archive_path, None, &directories)
+            .expect("curseforge archive should plan without direct download URLs");
+
+        assert_eq!(plan.mod_download_plan.items.len(), 2);
+        assert_eq!(
+            plan.mod_download_plan.items[0].url,
+            "https://www.curseforge.com/api/v1/mods/238222/files/4974757/download"
+        );
+        assert!(plan.mod_download_plan.items[0]
+            .destination
+            .ends_with("profiles/nodirecturls/mods/jei-1.20.1-forge-15.3.0.4.jar"));
+        assert_eq!(
+            plan.mod_download_plan.items[1].url,
+            "https://www.curseforge.com/api/v1/mods/306770/files/4031402/download"
+        );
+        assert!(plan.mod_download_plan.items[1]
+            .destination
+            .ends_with("profiles/nodirecturls/mods/curseforge-306770-4031402.jar"));
     }
 
     #[test]
