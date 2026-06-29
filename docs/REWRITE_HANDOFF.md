@@ -1189,6 +1189,8 @@ Latest snapshot lane result: the delegated snapshot `555-614` lane passed all 60
 
 Latest release compatibility result: the delegated full `release` lane passed 99 of 102 Mojang releases on first pass with `npm run smoke:live:vanilla:compat -- --all --type release --jobs 3 --quiet`. Initial failures were `1.21.6` and `1.21.2` transient asset download errors plus `1.19` exiting during startup with `Some(-1073741819)` while building the data fixer. The exact retry `npm run smoke:live:vanilla:compat -- --version 1.21.6 --version 1.21.2 --version 1.19 --jobs 3 --quiet` passed all three, so release coverage is 102/102 after retry. Remaining vanilla compatibility lane is snapshot `350-414`.
 
+Latest vanilla compatibility completion: the final delegated snapshot `350-414` lane passed all 65 selected versions with `npm run smoke:live:vanilla:compat -- --all --type snapshot --offset 350 --limit 65 --jobs 1 --quiet`, including `20w13b` through `19w11a`; no retry failures remained. Combined with earlier documented lanes, the vanilla coverage sweep now has passing evidence for all Mojang releases, old beta, old alpha, and all snapshot offsets previously left open after `240`, including the recovered `415` gap and the old-snapshot `675-735` fixes. Final cleanup check found no leftover `target/live-smoke/vanilla-compat` roots and no live `node`/`cargo`/`java`/`javaw`/`rustup` vanilla-smoke processes; C: had about 15.4 GB free.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
