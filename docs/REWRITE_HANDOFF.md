@@ -1263,6 +1263,8 @@ Latest Activity progress polish: Activity overview operation rows now render act
 
 Latest vanilla campaign result logging: `scripts/run-vanilla-compat-campaign.mjs` now appends each completed live version result to `target/live-smoke/vanilla-compat-results.jsonl` immediately after the version smoke exits, including campaign label, selected type/offset/limit, version id, pass/fail status, exit code, and signal. This makes long snapshot chunks easier to resume or audit if a shell/agent dies late in a large range. Verified without adding more Minecraft load using `node --check scripts/run-vanilla-compat-campaign.mjs` and `npm run smoke:live:vanilla:compat -- --all --type snapshot --offset 75 --limit 2 --dry-run`; the active five-agent snapshot sweep was left running.
 
+Latest profile-create polish: the Library `New profile` flow now defaults the profile name to the selected latest release, such as `Minecraft 1.21.8`, instead of a generic `Custom Profile N`, while keeping the existing version dropdown and automatic setup-after-create behavior. Duplicate default names are made unique with a numeric suffix. Verified with `npm run build` and `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "empty launcher guides first profile setup"`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

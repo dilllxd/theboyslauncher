@@ -113,6 +113,8 @@ test("empty launcher guides first profile setup from home and library", async ({
   await page.getByRole("navigation").getByRole("button", { name: "Library" }).click();
   await expect(page.getByRole("heading", { name: "No profiles yet" })).toBeVisible();
   await page.getByRole("button", { name: "Create and set up profile" }).click();
+  await expect(page.getByLabel("New profile name")).toHaveValue("Minecraft 1.21.8");
+  await expect(page.getByLabel("New profile game version")).toHaveValue("1.21.8");
   await expect(page.getByRole("button", { name: "Create and set up", exact: true })).toBeVisible();
 });
 

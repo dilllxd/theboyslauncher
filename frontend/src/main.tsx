@@ -932,6 +932,20 @@ function uniqueProfileIdFromName(name: string, profiles: ProfileSummary[]) {
   return `${base}-${Date.now()}`;
 }
 
+function uniqueProfileName(baseName: string, profiles: ProfileSummary[]) {
+  const names = new Set(profiles.map((profile) => profile.name.toLowerCase()));
+  if (!names.has(baseName.toLowerCase())) return baseName;
+  for (let suffix = 2; suffix < 1000; suffix += 1) {
+    const candidate = `${baseName} ${suffix}`;
+    if (!names.has(candidate.toLowerCase())) return candidate;
+  }
+  return `${baseName} ${Date.now()}`;
+}
+
+function defaultProfileNameForVersion(gameVersion: string, profiles: ProfileSummary[]) {
+  return uniqueProfileName(gameVersion ? `Minecraft ${gameVersion}` : "Minecraft profile", profiles);
+}
+
 function mergeManagedProcessSummary(
   existing: ManagedProcessSummary | undefined,
   incoming: ManagedProcessSummary,
@@ -3924,12 +3938,12 @@ function App() {
   }
 
   async function openProfileCreator() {
-    const nextIndex = snapshot.profiles.length + 1;
     const versions = await loadMinecraftVersionsForProfileCreator();
-    setNewProfileName(`Custom Profile ${nextIndex}`);
+    const defaultVersion = versions.length > 0 ? minecraftVersionsForType(versions, "release")[0]?.id ?? "" : "";
+    setNewProfileName(defaultProfileNameForVersion(defaultVersion, snapshot.profiles));
     setNewProfileLoader("vanilla");
     setNewProfileVersionType("release");
-    setNewProfileGameVersion(versions.length > 0 ? minecraftVersionsForType(versions, "release")[0]?.id ?? "" : "");
+    setNewProfileGameVersion(defaultVersion);
     setNewProfileMemoryMb(snapshot.settings.maxMemoryMb);
     setNewProfileAdvancedOpen(false);
     setProfileCreatorOpen(true);
