@@ -1242,9 +1242,12 @@ function summarizeLauncherOperations(events: LauncherEvent[]): LauncherOperation
   return [...grouped.entries()]
     .map(([operationId, group]) => {
       const operationEvents = group.events;
-      const latestEvent = operationEvents[operationEvents.length - 1];
+      const terminalLifecycleEvent = [...operationEvents]
+        .reverse()
+        .find((event) => completedLifecycleMessage(event));
+      const latestEvent = terminalLifecycleEvent ?? operationEvents[operationEvents.length - 1];
       const progressPercent =
-        latestEvent.kind === "completed" ? 100 : latestProgressPercent(operationEvents);
+        terminalLifecycleEvent || latestEvent.kind === "completed" ? 100 : latestProgressPercent(operationEvents);
       const metadataEvent = [...operationEvents]
         .reverse()
         .find((event) => event.operation || event.subjectId);
@@ -4631,7 +4634,6 @@ function App() {
                 onClose={() => setSelectedPackDetailsId(null)}
                 onInstall={installPack}
                 onPlay={(packId, packName) => launchProfile(packId, packName)}
-                onRepair={repairProfile}
               />
             )}
 
@@ -6310,7 +6312,6 @@ function PackDetailsPanel({
   onClose,
   onInstall,
   onPlay,
-  onRepair,
 }: {
   pack: PackSummary;
   hasActiveProcess: boolean;
@@ -6322,7 +6323,6 @@ function PackDetailsPanel({
   onClose: () => void;
   onInstall: (packId: string) => void;
   onPlay: (packId: string, packName: string) => void;
-  onRepair: (packId: string) => void;
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const isRepairAction = pack.status === "repair_needed";
@@ -6392,18 +6392,6 @@ function PackDetailsPanel({
           </button>
           {moreOpen && (
             <div className="pack-more-menu-list" role="menu" aria-label={`${pack.name} more menu`}>
-              <button
-                type="button"
-                role="menuitem"
-                disabled={hasActiveProcess || isRepairing || globalLifecycleActionInProgress}
-                onClick={() => {
-                  setMoreOpen(false);
-                  onRepair(pack.id);
-                }}
-              >
-                <Wrench size={16} />
-                Verify files
-              </button>
               <button
                 type="button"
                 role="menuitem"

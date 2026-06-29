@@ -1592,6 +1592,9 @@ test("terminal repair event clears stuck native repair busy state", async ({ pag
           if (cmd === "repair_profile") {
             return new Promise(() => undefined);
           }
+          if (cmd === "start_launch_process") {
+            throw new Error("launch artifact is missing: asset index is missing. Install or repair the profile before launching.");
+          }
           if (cmd === "list_launcher_events" || cmd === "list_managed_processes") return [];
           if (cmd === "social_backend_status") {
             return {
@@ -1628,9 +1631,7 @@ test("terminal repair event clears stuck native repair busy state", async ({ pag
   await page.goto("/");
 
   const card = page.locator(".pack-card").filter({ hasText: "WinterPack" });
-  await card.getByRole("button", { name: "Details" }).click();
-  await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
+  await card.getByRole("button", { name: "Play" }).click();
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByLabel("Launcher quick status")).toContainText("Setting up...");
 
@@ -5350,13 +5351,13 @@ test("home details action falls back to web preview mock", async ({ page }) => {
   await expect(page.getByText("Pack details are using preview data")).toBeVisible();
   await expect(page.getByLabel("WinterPack pack details")).toBeVisible();
   await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await expect(page.getByRole("menu", { name: "WinterPack more menu" })).toContainText("Verify files");
+  await expect(page.getByRole("menu", { name: "WinterPack more menu" })).not.toContainText("Verify files");
   await expect(page.getByRole("menu", { name: "WinterPack more menu" })).toContainText("Close details");
   await page.getByRole("button", { name: "Close WinterPack details" }).click();
   await expect(page.getByLabel("WinterPack pack details")).toHaveCount(0);
 });
 
-test("pack detail file check refreshes native bootstrap snapshot status", async ({ page }) => {
+test("pack play setup refreshes native bootstrap snapshot status", async ({ page }) => {
   await page.addInitScript(() => {
     let repaired = false;
     let callbackId = 1;
@@ -5441,6 +5442,27 @@ test("pack detail file check refreshes native bootstrap snapshot status", async 
               message: "Profile repair completed.",
             };
           }
+          if (cmd === "start_launch_process") {
+            if (!repaired) {
+              throw new Error("launch artifact is missing: asset index is missing. Install or repair the profile before launching.");
+            }
+            return {
+              id: "winterpack-process",
+              processId: 4300,
+              command: {
+                executable: "javaw.exe",
+                args: ["-Xmx6144M", "net.minecraft.client.main.Main"],
+                workingDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/profiles/winterpack",
+                env: [{ key: "THEBOYSLAUNCHER_PROFILE_ID", value: "winterpack" }],
+              },
+              state: "running",
+              startedAtUnixSeconds: 1_710_000_000,
+              runtimeSeconds: 1,
+              totalOutputLineCount: 0,
+              droppedOutputLineCount: 0,
+              output: [],
+            };
+          }
           if (cmd === "list_launcher_events") {
             return [
               {
@@ -5491,17 +5513,19 @@ test("pack detail file check refreshes native bootstrap snapshot status", async 
 
   const card = page.locator(".pack-card").filter({ hasText: "WinterPack" });
   await expect(card.getByRole("button", { name: "Repair" })).toHaveCount(0);
-  await card.getByRole("button", { name: "Details" }).click();
-  await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
+  await card.getByRole("button", { name: "Play" }).click();
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
+  await expect(page.getByRole("button", { name: "Processes", exact: true })).toHaveClass(/active/);
+  await page.getByLabel("Activity views").getByRole("button", { name: "Events" }).click();
   await expect(page.locator(".event-row").filter({ hasText: "Files are ready." })).toBeVisible();
+  await expect(page.getByLabel("Launcher quick status")).toContainText("Set up files - completed");
   await page.locator("nav").getByRole("button", { name: "Play" }).click();
+  await expect(card.getByRole("button", { name: "Repair" })).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Play" })).toBeEnabled();
   const invoked = await page.evaluate(() => (window as typeof window & { __repairInvokes: string[] }).__repairInvokes);
   expect(invoked.filter((cmd) => cmd === "bootstrap_snapshot").length).toBeGreaterThanOrEqual(2);
+  expect(invoked.indexOf("start_launch_process")).toBeLessThan(invoked.indexOf("plan_repair_profile"));
   expect(invoked.indexOf("plan_repair_profile")).toBeLessThan(invoked.indexOf("repair_profile"));
   expect(invoked.indexOf("bootstrap_snapshot", invoked.indexOf("repair_profile"))).toBeGreaterThan(invoked.indexOf("repair_profile"));
   expect(invoked.indexOf("list_launcher_events", invoked.indexOf("repair_profile"))).toBeGreaterThan(invoked.indexOf("repair_profile"));
@@ -5689,6 +5713,9 @@ test("failed native repair surfaces the failed launcher event", async ({ page })
           if (cmd === "repair_profile") {
             throw new Error("Profile repair failed: asset index is missing");
           }
+          if (cmd === "start_launch_process") {
+            throw new Error("launch artifact is missing: asset index is missing. Install or repair the profile before launching.");
+          }
           if (cmd === "list_launcher_events") {
             return [
               {
@@ -5738,9 +5765,7 @@ test("failed native repair surfaces the failed launcher event", async ({ page })
   await page.goto("/");
 
   const card = page.locator(".pack-card").filter({ hasText: "WinterPack" });
-  await card.getByRole("button", { name: "Details" }).click();
-  await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
+  await card.getByRole("button", { name: "Play" }).click();
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
@@ -5866,6 +5891,9 @@ test("home repair action shows pending native repair state", async ({ page }) =>
               completeRepair = resolve;
             });
           }
+          if (cmd === "start_launch_process") {
+            throw new Error("launch artifact is missing: asset index is missing. Install or repair the profile before launching.");
+          }
           if (cmd === "list_launcher_events") {
             return [
               repaired
@@ -5948,9 +5976,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
   await page.goto("/");
 
   const card = page.locator(".pack-card").filter({ hasText: "WinterPack" });
-  await card.getByRole("button", { name: "Details" }).click();
-  await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
+  await card.getByRole("button", { name: "Play" }).click();
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
   const pendingRepairPlanEvent = page.locator(".event-row").filter({ hasText: "Setup is ready to start." });
@@ -5987,6 +6013,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
   );
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
+  await page.getByLabel("Activity views").getByRole("button", { name: "Events" }).click();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
   const completedRepairEvent = page.locator(".event-row").filter({ hasText: "Files are ready." });
   await expect(completedRepairEvent).toBeVisible();
