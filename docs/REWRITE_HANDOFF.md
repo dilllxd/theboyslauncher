@@ -1179,6 +1179,8 @@ Latest setup wording core cleanup: the launcher core now emits `Setup queued for
 
 Latest verification refresh: while the remaining compatibility lanes continued, a broad Rust workspace check passed in an isolated target directory with `CARGO_TARGET_DIR=target/codex-workspace-check cargo check --workspace`, avoiding the live-smoke workers' Windows test-binary locks. Release packaging checks still pass: `npm run verify:tauri-security` and `npm run verify:tauri-bundles` both succeeded. The remaining active vanilla snapshot lanes at the time of this note were `350-414` and `555-614`.
 
+Latest vanilla compatibility parallelization: the runner now recovers exact stale per-version `.lock` directories when their recorded owner PID is no longer running, while still refusing roots whose owner PID is alive and reporting the owning version/PID. Verified the script change with `node --check scripts/run-vanilla-compat-campaign.mjs` and `node scripts/run-vanilla-compat-campaign.mjs --version 1.21.8 --dry-run`. Five non-overlapping compatibility lanes are active: snapshot offsets `350-414` and `555-614` from earlier delegated workers, plus new delegated lanes for `release` (`--jobs 3`), `old_beta` (`--jobs 2`), and `old_alpha` (`--jobs 2`). Last observed live roots showed ongoing progress through snapshots around `1.15-pre4` and `15w35e`, releases around `1.21.x`, beta around `b1.6.x`, and alpha around `a1.2.0.x`; do not duplicate those lanes unless a worker finishes or fails.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
