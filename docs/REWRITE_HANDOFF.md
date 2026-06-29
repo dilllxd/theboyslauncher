@@ -1187,6 +1187,8 @@ Latest vanilla family compatibility results: the delegated `old_alpha` lane pass
 
 Latest snapshot lane result: the delegated snapshot `555-614` lane passed all 60 selected versions with `npm run smoke:live:vanilla:compat -- --all --type snapshot --offset 555 --limit 60 --jobs 1 --quiet`. `16w06a` and `15w43c` had initial failures and both passed exact-version retry; no failures remained after retry. The worker reported no leftover cargo/java processes or roots attributable to that slice. Remaining compatibility lanes are snapshot `350-414` and full `release`. Low-conflict verification also passed with `cargo fmt --all --check` and `CARGO_TARGET_DIR=target/codex-goal-check cargo check --workspace`.
 
+Latest release compatibility result: the delegated full `release` lane passed 99 of 102 Mojang releases on first pass with `npm run smoke:live:vanilla:compat -- --all --type release --jobs 3 --quiet`. Initial failures were `1.21.6` and `1.21.2` transient asset download errors plus `1.19` exiting during startup with `Some(-1073741819)` while building the data fixer. The exact retry `npm run smoke:live:vanilla:compat -- --version 1.21.6 --version 1.21.2 --version 1.19 --jobs 3 --quiet` passed all three, so release coverage is 102/102 after retry. Remaining vanilla compatibility lane is snapshot `350-414`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
