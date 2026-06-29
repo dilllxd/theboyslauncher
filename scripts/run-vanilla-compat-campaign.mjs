@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const manifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
@@ -171,6 +171,54 @@ function assertSharedCacheRootIsSafe(rootPath) {
   }
 }
 
+function processIsRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function readLockOwner(lockPath) {
+  try {
+    return JSON.parse(readFileSync(resolve(lockPath, "owner.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function acquireVersionLock(lockPath, version, versionRoot) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(lockPath, { recursive: false });
+      writeFileSync(
+        resolve(lockPath, "owner.json"),
+        `${JSON.stringify({ pid: process.pid, version, versionRoot, startedAt: new Date().toISOString() }, null, 2)}\n`,
+      );
+      return;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+
+      const owner = readLockOwner(lockPath);
+      if (owner?.pid && processIsRunning(owner.pid)) {
+        throw new Error(
+          `Vanilla compatibility root is already in use: ${versionRoot} (pid ${owner.pid}, version ${owner.version ?? "unknown"})`,
+        );
+      }
+
+      assertRootIsSafe(lockPath);
+      rmSync(lockPath, { recursive: true, force: true });
+      console.log(`Removed stale vanilla compatibility lock: ${lockPath}`);
+    }
+  }
+
+  throw new Error(`Vanilla compatibility root is already in use: ${versionRoot}`);
+}
+
 async function fetchManifest() {
   const response = await fetch(manifestUrl);
   if (!response.ok) {
@@ -243,18 +291,7 @@ function runVersion(version, options) {
     assertSharedCacheRootIsSafe(sharedCacheRoot);
     mkdirSync(sharedCacheRoot, { recursive: true });
   }
-  try {
-    mkdirSync(lockPath, { recursive: false });
-    writeFileSync(
-      resolve(lockPath, "owner.json"),
-      `${JSON.stringify({ pid: process.pid, version, versionRoot, startedAt: new Date().toISOString() }, null, 2)}\n`,
-    );
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      throw new Error(`Vanilla compatibility root is already in use: ${versionRoot}`);
-    }
-    throw error;
-  }
+  acquireVersionLock(lockPath, version, versionRoot);
 
   assertRootIsSafe(versionRoot);
   rmSync(versionRoot, { recursive: true, force: true });
