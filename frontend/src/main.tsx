@@ -4482,11 +4482,18 @@ function App() {
                 {launchJavaRecoveryProfileId && !launchJavaRecoveryNeeded && (
                   <button
                     className="inline-action"
-                    disabled={activeProcessProfileIds.has(launchJavaRecoveryProfileId) || lifecycleActionInProgress}
+                    disabled={
+                      activeProcessProfileIds.has(launchJavaRecoveryProfileId) ||
+                      profileLifecycleInProgress(launchJavaRecoveryProfileId)
+                    }
                     onClick={() => launchProfile(launchJavaRecoveryProfileId)}
                   >
                     <Play size={14} />
-                    {lifecycleActionInProgress ? lifecycleActionLabel : "Play"}
+                    {activeProcessProfileIds.has(launchJavaRecoveryProfileId)
+                      ? "Running"
+                      : profileLifecycleInProgress(launchJavaRecoveryProfileId)
+                        ? profileLifecycleLabel(launchJavaRecoveryProfileId)
+                        : "Play"}
                   </button>
                 )}
                 {sessionRecoveryNeeded && (
@@ -4498,11 +4505,18 @@ function App() {
                 {sessionRecoveryProfileId && !sessionRecoveryNeeded && (
                   <button
                     className="inline-action"
-                    disabled={activeProcessProfileIds.has(sessionRecoveryProfileId) || lifecycleActionInProgress}
+                    disabled={
+                      activeProcessProfileIds.has(sessionRecoveryProfileId) ||
+                      profileLifecycleInProgress(sessionRecoveryProfileId)
+                    }
                     onClick={() => launchProfile(sessionRecoveryProfileId)}
                   >
                     <Play size={14} />
-                    {lifecycleActionInProgress ? lifecycleActionLabel : "Play"}
+                    {activeProcessProfileIds.has(sessionRecoveryProfileId)
+                      ? "Running"
+                      : profileLifecycleInProgress(sessionRecoveryProfileId)
+                        ? profileLifecycleLabel(sessionRecoveryProfileId)
+                        : "Play"}
                   </button>
                 )}
               </div>
@@ -5520,11 +5534,11 @@ function App() {
                         {canRelaunch && relaunchProfile && (
                           <button
                             className="primary-button compact"
-                            disabled={lifecycleActionInProgress}
+                            disabled={profileLifecycleInProgress(relaunchProfile.id)}
                             onClick={() => launchProfile(relaunchProfile.id, relaunchProfile.name)}
                           >
                             <Play size={17} />
-                            {lifecycleActionInProgress ? lifecycleActionLabel : "Play"}
+                            {profileLifecycleInProgress(relaunchProfile.id) ? profileLifecycleLabel(relaunchProfile.id) : "Play"}
                           </button>
                         )}
                         {process.state !== "exited" && (

@@ -3732,6 +3732,16 @@ test("library play action is disabled while native launch is pending", async ({ 
       friends: [],
       packs: [
         {
+          id: "otherpack",
+          name: "Other Pack",
+          tagline: "An unrelated install lane.",
+          version: "1.0.0",
+          status: "not_installed",
+          accent: "#38bdf8",
+          installedPlayers: 0,
+          defaultServer: "Other Server",
+        },
+        {
           id: "winterpack",
           name: "WinterPack",
           tagline: "Cozy survival with friends.",
@@ -9503,6 +9513,16 @@ test("exited native process row can relaunch its profile from Activity", async (
       runtimeSeconds: 1,
       output: [{ stream: "stdout", line: "WinterPack relaunched from Activity" }],
     };
+    const otherPack = {
+      id: "otherpack",
+      name: "Other Pack",
+      tagline: "An unrelated install lane.",
+      version: "1.0.0",
+      status: "not_installed",
+      accent: "#38bdf8",
+      installedPlayers: 0,
+      defaultServer: "Other Server",
+    };
     const snapshot = () => ({
       settings: {
         maxMemoryMb: 6144,
@@ -9518,6 +9538,7 @@ test("exited native process row can relaunch its profile from Activity", async (
       },
       friends: [],
       packs: [
+        otherPack,
         {
           id: "winterpack",
           name: "WinterPack",
@@ -9554,6 +9575,18 @@ test("exited native process row can relaunch its profile from Activity", async (
           if (cmd === "bootstrap_snapshot") return snapshot();
           if (cmd === "list_launcher_events") return [];
           if (cmd === "list_managed_processes") return relaunched ? [runningProcess] : [exitedProcess];
+          if (cmd === "plan_install_pack") {
+            return {
+              operationId: "otherpack-install",
+              operation: "install_pack",
+              subjectId: "otherpack",
+              events: [
+                { kind: "queued", message: "Install queued for Other Pack", progressPercent: 0 },
+                { kind: "completed", message: "Install plan is ready to execute.", progressPercent: 100 },
+              ],
+            };
+          }
+          if (cmd === "install_pack") return new Promise(() => undefined);
           if (cmd === "start_launch_process") {
             relaunched = true;
             return runningProcess;
@@ -9586,13 +9619,15 @@ test("exited native process row can relaunch its profile from Activity", async (
   });
 
   await page.goto("/");
+  await page.locator(".pack-card").filter({ hasText: "Other Pack" }).getByRole("button", { name: "Install" }).click();
+  await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await page.getByRole("button", { name: "Activity" }).click();
   await page.getByLabel("Activity views").getByRole("button", { name: "Processes", exact: true }).click();
 
   const exitedRow = page.locator(".process-row").filter({ hasText: "Ready to relaunch" });
   await expect(exitedRow).toContainText("Exited cleanly");
   const exitedProcessActions = exitedRow.getByLabel("WinterPack process actions");
-  await expect(exitedProcessActions).toContainText("Play");
+  await expect(exitedProcessActions.getByRole("button", { name: "Play" })).toBeEnabled();
   await expect(exitedProcessActions.getByRole("button", { name: "Stop" })).toHaveCount(0);
   await expect(exitedProcessActions).toContainText("Save log");
   await exitedProcessActions.getByRole("button", { name: "Play" }).click();

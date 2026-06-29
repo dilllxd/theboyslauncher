@@ -1167,6 +1167,10 @@ Latest renderer setup-wording fallback: renderer-side native error sanitization 
 
 Latest launch concurrency backend fix: the Tauri launch commands no longer reject profile launches just because an unrelated install/setup/delete lifecycle operation is active. Launch still reuses or rejects by per-profile active process state, while mutating lifecycle operations keep the global gate. This matches the intended UI behavior where a ready instance can be opened while another pack is installing. Verified with `cargo test -p theboyslauncher lifecycle_operation_gate -- --test-threads=1`, `cargo test -p theboyslauncher active_managed_process_for_profile_matches_running_and_stop_requested_processes -- --test-threads=1`, and `cargo fmt --all --check`.
 
+Latest launch concurrency UI fix: sidebar launch-recovery Play buttons and Activity process-row relaunch now use the target profile lifecycle state instead of the global lifecycle busy flag, so unrelated installs no longer disable relaunch/play affordances for a ready profile. The Activity relaunch regression now starts an unrelated pack install and still relaunches an exited WinterPack process. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "exited native process row can relaunch|activity play stays available"` and `npm run build`.
+
+Latest vanilla snapshot worker result: the delegated `615-674` snapshot lane passed all 60 selected versions from `1.8.2-pre6` through `14w08a` using `--all --type snapshot --offset 615 --limit 60 --jobs 1 --quiet`. `1.8-pre2` had one transient exit `4294967295` and then passed on the required exact-version retry. The worker reported no failures after retry, no leftover roots from that exact slice, and no leftover Java/javaw processes. Remaining active coverage lanes at the time of this note were `350-414`, `525-554`, `555-614`, plus the old-snapshot single retry lane descended from the `675-735` worker.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
