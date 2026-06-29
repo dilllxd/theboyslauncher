@@ -1209,6 +1209,8 @@ Latest CurseForge archive compatibility: CurseForge zip archive planning no long
 
 Latest release workflow safety cleanup: the legacy Go/Fyne `Stable Release` and `Dev Prerelease` workflows have been replaced with tiny manual-dispatch stubs that fail immediately and point maintainers to `.github/workflows/v4-release-channels.yml` with `channel=stable` or `channel=dev`. They now use read-only contents permissions and no longer contain Go setup/build, `version.env` mutation, Inno Setup, or legacy `actions/create-release@v1` publishing steps, so an accidental click cannot publish non-v4 assets. Verified with `npx prettier --check .github/workflows/stable-release.yml .github/workflows/dev-prerelease.yml .github/workflows/v4-release-channels.yml` and `rg` checks for removed legacy release commands.
 
+Latest Activity process polish: Activity > Processes no longer shows the full Java executable path in the normal process row. The row now shows a friendly compact summary (`pid ... - ... launch args`), timing, and output summary, while executable path, working directory, and environment count live behind `View technical details`; `View output` remains dedicated to stdout/stderr. This keeps long managed Java paths from cluttering normal launcher use while preserving diagnostics when needed. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity process actions stay visible with long Java paths"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

@@ -456,7 +456,11 @@ test("activity process actions stay visible with long Java paths", async ({ page
 
   const processRow = page.locator(".process-row").filter({ hasText: "Modern Vanilla" });
   await expect(processRow).toContainText("Minecraft 1.21.8 is running");
+  await expect(processRow).toContainText("pid 4242 - 2 launch args");
+  await expect(processRow.getByLabel("Modern Vanilla technical details")).toBeHidden();
   await expect(processRow.getByRole("button", { name: "Stop" })).toBeVisible();
+  await processRow.getByText("View technical details").click();
+  await expect(processRow.getByLabel("Modern Vanilla technical details")).toContainText("jdk-21.0.11");
 
   const metrics = await page.evaluate(() => {
     const workspace = document.querySelector(".workspace");

@@ -5553,11 +5553,21 @@ function App() {
                         <strong>{processDisplayName}</strong>
                         <span className={processStatusClass(process)}>{processStatusLabel(process)}</span>
                         <span>
-                          {process.command.executable} - pid {process.processId}
+                          pid {process.processId}
                           {typeof process.exitCode === "number" ? ` - exit ${process.exitCode}` : ""} - {process.command.args.length} launch args
                         </span>
                         <span>{processTimingLabel(process)}</span>
                         <span>{processOutputSummary(process)}</span>
+                        <details className="technical-details process-output-details">
+                          <summary>View technical details</summary>
+                          <div className="process-technical-details" aria-label={`${processDisplayName} technical details`}>
+                            <code>executable: {process.command.executable}</code>
+                            <code>working directory: {process.command.workingDir}</code>
+                            {(process.command.env?.length ?? 0) > 0 && (
+                              <code>environment: {process.command.env?.length ?? 0} launcher variables</code>
+                            )}
+                          </div>
+                        </details>
                         <details className="technical-details process-output-details">
                           <summary>View output</summary>
                           <div className="process-output" aria-label={`${processDisplayName} output`}>

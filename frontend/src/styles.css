@@ -1181,7 +1181,8 @@ h1 {
   white-space: nowrap;
 }
 
-.process-output {
+.process-output,
+.process-technical-details {
   display: grid;
   gap: 4px;
   margin-top: 8px;
@@ -1222,7 +1223,8 @@ h1 {
   margin-top: 8px;
 }
 
-.process-output code {
+.process-output code,
+.process-technical-details code {
   display: block;
   overflow: hidden;
   color: var(--muted);
