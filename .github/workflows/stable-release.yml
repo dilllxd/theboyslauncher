@@ -1,9 +1,9 @@
 name: Stable Release
 
+# Legacy Go/Fyne release workflow kept for reference only. V4 releases are
+# handled by .github/workflows/v4-foundation.yml.
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -61,7 +61,7 @@ jobs:
             # Normal patch increment
             PATCH=$((PATCH + 1))
           fi
-          
+
           VERSION="$MAJOR.$MINOR.$PATCH"
           PRERELEASE=""
           FULL_VERSION="${VERSION}"
@@ -137,7 +137,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '^1.23'
+          go-version: "^1.23"
           cache: true
           cache-dependency-path: go.sum
 
@@ -255,12 +255,12 @@ jobs:
         shell: pwsh
         run: |
           $fullVersion = "${{ needs.bump_version.outputs.full_version }}"
-          
+
           Write-Host "Looking for installer files..."
           Get-ChildItem -Filter "*.exe" | ForEach-Object {
             Write-Host "Found: $($_.Name) ($($_.Length) bytes)"
           }
-          
+
           $exe = Get-ChildItem -Filter "TheBoysLauncher-Setup-*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $exe) {
             Write-Error "Installer not found after build."
@@ -293,7 +293,6 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.binary_name }}
           retention-days: 14
-
 
       - name: Upload Windows installer
         if: ${{ matrix.platform == 'windows' }}
@@ -331,7 +330,7 @@ jobs:
           else
             CHANGELOG=$(git log --pretty=format:"- %s (%an)" ${PREV_TAG}..${TAG})
           fi
-          
+
           # Generate formatted release notes
           cat << EOF > release_notes.md
           ## TheBoysLauncher $VERSION
@@ -374,7 +373,7 @@ jobs:
           ### 📝 Changes:
           $CHANGELOG
           EOF
-          
+
           {
             echo "body<<EOF"
             cat release_notes.md

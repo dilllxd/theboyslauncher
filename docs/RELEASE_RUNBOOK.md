@@ -40,6 +40,11 @@ becomes manually dispatchable after the v4 branch replaces `main` or after a rel
 
 Normal PR and branch pushes run verification only. Windows packaging runs only for `v*` tags or manual dispatch with `package_windows=true` or `publish_release=true`.
 
+The legacy Go/Fyne release workflows (`stable-release.yml`, `dev-prerelease.yml`, and
+`reset-dev-after-release.yml`) are preserved for reference but are manual-only in the
+v4 branch. This keeps the old release automation from running on the first v4 `main`
+promotion or consuming Actions minutes with obsolete Go builds.
+
 For the first v4 release:
 
 ```powershell
