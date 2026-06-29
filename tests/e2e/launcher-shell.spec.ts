@@ -8971,6 +8971,82 @@ test("activity screen loads event log fallback", async ({ page }) => {
   );
 });
 
+test("activity active operation without percent uses working progress", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string) => {
+          if (cmd === "bootstrap_snapshot") {
+            return {
+              settings: {
+                maxMemoryMb: 6144,
+                minMemoryMb: 2048,
+                offlineUsername: "Player",
+                telemetryEnabled: false,
+              },
+              directories: {
+                dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+                configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+                cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+                logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+              },
+              friends: [],
+              packs: [],
+              profiles: [],
+              imports: [],
+            };
+          }
+          if (cmd === "list_launcher_events") {
+            return [
+              {
+                id: "working-event",
+                operationId: "working-operation",
+                operation: "download_artifacts",
+                subjectId: "winterpack",
+                kind: "active",
+                message: "Preparing files",
+                occurredAtUnixSeconds: 1_710_000_000,
+              },
+            ];
+          }
+          if (cmd === "list_managed_processes" || cmd === "list_minecraft_accounts") return [];
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        listen: async () => () => undefined,
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Activity" }).click();
+
+  const operationRow = page.locator(".operation-row").filter({ hasText: "Preparing files" });
+  await expect(operationRow).toContainText("Working");
+  const progressbar = page.getByRole("progressbar", { name: "Preparing files progress" });
+  await expect(progressbar).toBeVisible();
+  await expect(progressbar).not.toHaveAttribute("aria-valuenow", /.+/);
+});
+
 test("native event log refresh failure preserves real activity state", async ({ page }) => {
   await page.addInitScript(() => {
     let failEventRefresh = false;

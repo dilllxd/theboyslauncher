@@ -1259,6 +1259,8 @@ Latest vanilla snapshot parallel-smoke checkpoint: the next snapshot chunk passe
 
 Latest vanilla campaign-runner hardening: `scripts/run-vanilla-compat-campaign.mjs` now creates a per-campaign lock under `target/live-smoke/vanilla-compat-campaign-locks` for non-dry-run executions, keyed by mode/type/offset/limit or explicit versions. This prevents accidentally starting the exact same large offset range twice while still allowing different offset chunks to run in parallel. Stale campaign locks are removed only when the recorded owner PID is no longer running, mirroring the existing per-version lock behavior. Verified with `node --check scripts/run-vanilla-compat-campaign.mjs`, `npm run smoke:live:vanilla:compat -- --all --type snapshot --offset 75 --limit 2 --dry-run`, and a fake active-owner lock for `all-snapshot-offset-75-limit-1`, which made the runner fail before any Minecraft download or launch with `Vanilla compatibility campaign is already running`.
 
+Latest Activity progress polish: Activity overview operation rows now render active operations without a numeric `progressPercent` as an indeterminate `Working` state with a small pulsing progress fill instead of a dead-looking `--` label and 0-width bar. Known numeric progress still renders the exact percentage and ARIA value. Verified with `npm run build` and `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity active operation without percent uses working progress"`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

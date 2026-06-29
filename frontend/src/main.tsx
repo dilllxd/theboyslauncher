@@ -5915,31 +5915,35 @@ function App() {
             )}
             {activityMode === "overview" && launcherOperationSummaries.length > 0 && (
               <div className="operation-list" aria-label="Launcher operations">
-                {launcherOperationSummaries.map((operation) => (
-                  <div className={operationRowClass(operation.latestEvent)} key={operation.operationId}>
-                    <Activity size={20} />
-                    <div className="operation-main">
-                      <div className="operation-heading">
-                        <strong>{userFacingLauncherEventMessage(operation.latestEvent.message)}</strong>
-                        <span>{typeof operation.progressPercent === "number" ? `${operation.progressPercent}%` : "--"}</span>
+                {launcherOperationSummaries.map((operation) => {
+                  const operationProgressKnown = typeof operation.progressPercent === "number";
+                  const operationProgressValue = operationProgressKnown ? operation.progressPercent ?? 0 : 0;
+                  return (
+                    <div className={operationRowClass(operation.latestEvent)} key={operation.operationId}>
+                      <Activity size={20} />
+                      <div className="operation-main">
+                        <div className="operation-heading">
+                          <strong>{userFacingLauncherEventMessage(operation.latestEvent.message)}</strong>
+                          <span>{operationProgressKnown ? `${operation.progressPercent}%` : "Working"}</span>
+                        </div>
+                        <div
+                          className={operationProgressKnown ? "operation-progress" : "operation-progress starting"}
+                          role="progressbar"
+                          aria-label={`${userFacingLauncherEventMessage(operation.latestEvent.message)} progress`}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={operationProgressKnown ? operation.progressPercent : undefined}
+                        >
+                          <span style={{ width: `${operationProgressKnown ? Math.max(6, operationProgressValue) : 18}%` }} />
+                        </div>
+                        <span>
+                          {operationContextLabel(operation.operation, operation.subjectId, operation.latestEvent.message)} - {operation.latestEvent.kind} -{" "}
+                          {operation.eventCount} events
+                        </span>
                       </div>
-                      <div
-                        className="operation-progress"
-                        role="progressbar"
-                        aria-label={`${userFacingLauncherEventMessage(operation.latestEvent.message)} progress`}
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={operation.progressPercent}
-                      >
-                        <span style={{ width: `${operation.progressPercent ?? 0}%` }} />
-                      </div>
-                      <span>
-                        {operationContextLabel(operation.operation, operation.subjectId, operation.latestEvent.message)} - {operation.latestEvent.kind} -{" "}
-                        {operation.eventCount} events
-                      </span>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
             {activityMode === "overview" && latestOperationEvents.length > 0 && (
