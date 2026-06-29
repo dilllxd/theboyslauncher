@@ -5893,12 +5893,13 @@ test("failed native repair surfaces the failed launcher event", async ({ page })
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
   await expect(page.getByRole("complementary")).toContainText("Setup failed: asset index is missing");
+  await expect(page.getByText("Install or repair")).toHaveCount(0);
   const failedEvent = page.locator(".event-row").filter({ hasText: "Setup failed: asset index is missing" });
   await expect(failedEvent).toBeVisible();
   await expect(failedEvent.getByRole("button", { name: "Play" })).toHaveCount(0);
-  await expect(failedEvent.getByRole("button", { name: "Try again" })).toBeVisible();
+  await expect(failedEvent.getByRole("button", { name: "Set up again" })).toBeVisible();
   await expect(page.locator(".event-row").filter({ hasText: "Setup is ready to start." })).toHaveCount(0);
-  await failedEvent.getByRole("button", { name: "Try again" }).click();
+  await failedEvent.getByRole("button", { name: "Set up again" }).click();
   await expect(page.getByRole("complementary")).toContainText("Setup failed: asset index is missing");
 
   const invoked = await page.evaluate(

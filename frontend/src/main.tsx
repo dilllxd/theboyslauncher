@@ -1353,6 +1353,12 @@ function userFacingLauncherEventMessage(message: string) {
     .replace(/^(?:Error:\s*)?Profile repair failed:/i, "Setup failed:");
 }
 
+function userFacingNativeErrorMessage(message: string) {
+  return userFacingLauncherEventMessage(message)
+    .replace(/\s*Install or repair the profile before launching\./i, " The launcher will set up missing files automatically.")
+    .replace(/\brepair the profile\b/i, "set up the profile files");
+}
+
 function summarizeArtifactOperation(events: LauncherEvent[]): ArtifactOperationSummary | undefined {
   const artifactEvents = events
     .map((event) => ({
@@ -2490,7 +2496,7 @@ function App() {
   function nativeFailureActivity(error: unknown, fallback: string) {
     if (!isNative) return fallback;
     const message = error instanceof Error ? error.message : String(error || "");
-    return message.trim() || fallback;
+    return userFacingNativeErrorMessage(message).trim() || fallback;
   }
 
   function launchFailureNeedsRepair(message: string) {
@@ -5739,7 +5745,7 @@ function App() {
                           onClick={() => repairProfile(failedRepairProfile.id)}
                         >
                           <Wrench size={17} />
-                          {failedRepairIsActive ? "Running" : failedRepairIsRetrying ? "Setting up..." : "Try again"}
+                          {failedRepairIsActive ? "Running" : failedRepairIsRetrying ? "Setting up..." : "Set up again"}
                         </button>
                       )}
                     </div>
