@@ -1157,6 +1157,8 @@ Latest sidebar active-operation polish: when there is no live file-download even
 
 Latest setup-recovery polish: the sidebar's generic missing-file recovery action now says `Set up again` instead of `Try again`, keeping repair/check-files language out of the normal flow. Successful `repair_profile` receipts are also merged into the local launcher event stream as terminal completion events, so sparse native event logs cannot leave synthetic `Setup is running` progress stuck after setup succeeds. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "launch command preflight failure offers setup recovery|successful launch command preview clears stale repair recovery|successful pack update clears stale launch repair recovery|library delete action clears stale launch recovery"`, `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "pending native install .*sidebar|pending native install plan surfaces|live file download events surface"`, and `npm run build`.
 
+Latest native setup wording polish: the Tauri bridge no longer tells users to stop a running profile before "repairing" when setup is blocked by an active process; the message now says to stop it before `setting up files`. Verified with `cargo test -p theboyslauncher active_managed_process_for_profile_matches_running_and_stop_requested_processes -- --test-threads=1` and `cargo fmt --all --check`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

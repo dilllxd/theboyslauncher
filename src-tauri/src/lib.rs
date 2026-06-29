@@ -2259,7 +2259,7 @@ fn profile_repair_active_process_error(
     process: &ManagedProcessSummary,
 ) -> String {
     format!(
-        "profile '{profile_id}' has a running managed process (PID {}). Stop it before repairing.",
+        "profile '{profile_id}' has a running managed process (PID {}). Stop it before setting up files.",
         process.process_id
     )
 }
@@ -3894,7 +3894,7 @@ mod tests {
         assert!(profile_install_active_process_error("winterpack", &running)
             .contains("Stop it before installing or updating"));
         assert!(profile_repair_active_process_error("winterpack", &running)
-            .contains("Stop it before repairing"));
+            .contains("Stop it before setting up files"));
     }
 
     #[test]
