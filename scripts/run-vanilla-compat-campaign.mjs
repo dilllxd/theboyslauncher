@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 const manifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const testName = "live_vanilla_compat_version_launch_process_survives_startup_and_can_stop";
 const defaultRoot = resolve("target", "live-smoke", "vanilla-compat");
 const defaultSharedCacheRoot = resolve("target", "live-smoke", "vanilla-compat-shared-cache");
 const defaultCampaignLockRoot = resolve("target", "live-smoke", "vanilla-compat-campaign-locks");
+const defaultResultLogPath = resolve("target", "live-smoke", "vanilla-compat-results.jsonl");
 
 function usage() {
   console.log(`Usage:
@@ -242,6 +243,24 @@ function campaignLockName(options, versions) {
   return safePathSegment(`versions-${versions.join("+")}`);
 }
 
+function recordResult(options, campaignLabel, result) {
+  mkdirSync(dirname(defaultResultLogPath), { recursive: true });
+  appendFileSync(
+    defaultResultLogPath,
+    `${JSON.stringify({
+      recordedAt: new Date().toISOString(),
+      campaign: campaignLabel,
+      type: options.types.length === 1 ? options.types[0] : options.types,
+      offset: options.offset,
+      limit: options.limit,
+      version: result.version,
+      status: result.code === 0 ? "passed" : "failed",
+      exitCode: result.code,
+      signal: result.signal ?? null,
+    })}\n`,
+  );
+}
+
 function acquireCampaignLock(options, versions) {
   mkdirSync(defaultCampaignLockRoot, { recursive: true });
   const label = campaignLockName(options, versions);
@@ -415,7 +434,9 @@ async function runVersions(versions, options) {
   if (options.jobs === 1) {
     const results = [];
     for (const version of versions) {
-      results.push(await runVersion(version, options));
+      const result = await runVersion(version, options);
+      results.push(result);
+      if (options.campaignLabel) recordResult(options, options.campaignLabel, result);
     }
     return results;
   }
@@ -428,7 +449,9 @@ async function runVersions(versions, options) {
       while (nextIndex < versions.length) {
         const currentIndex = nextIndex;
         nextIndex += 1;
-        results[currentIndex] = await runVersion(versions[currentIndex], options);
+        const result = await runVersion(versions[currentIndex], options);
+        results[currentIndex] = result;
+        if (options.campaignLabel) recordResult(options, options.campaignLabel, result);
       }
     }),
   );
@@ -466,6 +489,7 @@ if (options.dryRun) {
 }
 
 const campaignLockPath = acquireCampaignLock(options, versions);
+options.campaignLabel = campaignLockName(options, versions);
 let results;
 try {
   results = await runVersions(versions, options);

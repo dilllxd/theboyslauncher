@@ -1261,6 +1261,8 @@ Latest vanilla campaign-runner hardening: `scripts/run-vanilla-compat-campaign.m
 
 Latest Activity progress polish: Activity overview operation rows now render active operations without a numeric `progressPercent` as an indeterminate `Working` state with a small pulsing progress fill instead of a dead-looking `--` label and 0-width bar. Known numeric progress still renders the exact percentage and ARIA value. Verified with `npm run build` and `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity active operation without percent uses working progress"`.
 
+Latest vanilla campaign result logging: `scripts/run-vanilla-compat-campaign.mjs` now appends each completed live version result to `target/live-smoke/vanilla-compat-results.jsonl` immediately after the version smoke exits, including campaign label, selected type/offset/limit, version id, pass/fail status, exit code, and signal. This makes long snapshot chunks easier to resume or audit if a shell/agent dies late in a large range. Verified without adding more Minecraft load using `node --check scripts/run-vanilla-compat-campaign.mjs` and `npm run smoke:live:vanilla:compat -- --all --type snapshot --offset 75 --limit 2 --dry-run`; the active five-agent snapshot sweep was left running.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
