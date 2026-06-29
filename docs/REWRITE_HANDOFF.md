@@ -1211,6 +1211,8 @@ Latest release workflow safety cleanup: the legacy Go/Fyne `Stable Release` and 
 
 Latest Activity process polish: Activity > Processes no longer shows the full Java executable path in the normal process row. The row now shows a friendly compact summary (`pid ... - ... launch args`), timing, and output summary, while executable path, working directory, and environment count live behind `View technical details`; `View output` remains dedicated to stdout/stderr. This keeps long managed Java paths from cluttering normal launcher use while preserving diagnostics when needed. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity process actions stay visible with long Java paths"` and `npm run build`.
 
+Latest profile-creation setup clarity: the Library new-profile primary action now says `Create and set up` instead of plain `Create`, matching the native flow that immediately calls `prepare_profile` after profile creation. The action shows `Setting up...` while that new profile is in setup and remains disabled during setup, and the native/web-preview/profile-version-failure Playwright coverage now targets the clearer label. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "creating a profile refreshes|profile creator blocks|library new profile action"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

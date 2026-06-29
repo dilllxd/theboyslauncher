@@ -1726,6 +1726,8 @@ function App() {
   const [installInProgressPackId, setInstallInProgressPackId] = useState<string | null>(null);
   const [deleteInProgressProfileId, setDeleteInProgressProfileId] = useState<string | null>(null);
   const [lifecycleActionInProgressKey, setLifecycleActionInProgressKey] = useState<string | null>(null);
+  const profileCreatorSetupInProgress =
+    setupInProgressProfileId === uniqueProfileIdFromName(newProfileName, snapshot.profiles);
   const [importInProgress, setImportInProgress] = useState(false);
   const [managedJavaInstallInProgress, setManagedJavaInstallInProgress] = useState(false);
   const lifecycleActionInProgressRef = useRef<string | null>(null);
@@ -4989,11 +4991,11 @@ function App() {
                   <div className="profile-action-group">
                     <button
                       className="primary-button compact"
-                      disabled={Boolean(newProfileValidationMessage)}
+                      disabled={Boolean(newProfileValidationMessage) || profileCreatorSetupInProgress}
                       onClick={() => createProfile(newProfileDraft)}
                     >
                       <Save size={17} />
-                      Create
+                      {profileCreatorSetupInProgress ? "Setting up..." : "Create and set up"}
                     </button>
                     <button
                       className="secondary-button compact"

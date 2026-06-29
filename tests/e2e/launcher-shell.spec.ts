@@ -2796,7 +2796,7 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
   await expect(page.getByLabel("New profile advanced settings")).toBeVisible();
   await page.getByLabel("New profile loader").selectOption("fabric");
   await page.getByLabel("New profile memory").fill("8192");
-  await page.getByRole("button", { name: "Create" }).click();
+  await page.getByRole("button", { name: "Create and set up" }).click();
 
   await expect(page.getByText("Native Fabric created and ready")).toBeVisible();
   const createdProfile = page.locator(".profile-row").filter({ hasText: "Native Fabric" });
@@ -2885,7 +2885,7 @@ test("profile creator blocks native profile creation when Minecraft versions fai
 
   await expect(page.getByText("Minecraft versions could not load. Check your connection and try again.")).toBeVisible();
   await expect(page.getByLabel("New profile game version")).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Create" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Create and set up" })).toBeDisabled();
   await expect(page.getByText("Mojang manifest unavailable")).toBeVisible();
 
   const invoked = await page.evaluate(
@@ -7192,12 +7192,12 @@ test("library new profile action falls back to web preview mock", async ({ page 
   await page.getByRole("button", { name: "New profile" }).click();
   await expect(page.getByLabel("New profile editor")).toBeVisible();
   await page.getByLabel("New profile name").fill("");
-  await expect(page.getByRole("button", { name: "Create" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Create and set up" })).toBeDisabled();
   await page.getByLabel("New profile name").fill("Preview NeoForge");
   await page.getByLabel("New profile version type").selectOption("snapshot");
   await expect(page.getByText("No versions are available for Snapshots right now. Try Releases or refresh later.")).toBeVisible();
   await expect(page.getByLabel("New profile game version")).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Create" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Create and set up" })).toBeDisabled();
   await page.getByLabel("New profile version type").selectOption("release");
   await page.getByLabel("New profile game version").selectOption("1.21.1");
   await expect(page.getByLabel("New profile advanced settings")).toHaveCount(0);
@@ -7205,8 +7205,8 @@ test("library new profile action falls back to web preview mock", async ({ page 
   await expect(page.getByLabel("New profile advanced settings")).toBeVisible();
   await page.getByLabel("New profile loader").selectOption("neoforge");
   await page.getByLabel("New profile memory").fill("7168");
-  await expect(page.getByRole("button", { name: "Create" })).toBeEnabled();
-  await page.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByRole("button", { name: "Create and set up" })).toBeEnabled();
+  await page.getByRole("button", { name: "Create and set up" }).click();
 
   await expect(page.getByText("Creating profile is mocked in web preview")).toBeVisible();
   const profile = page.locator(".profile-row").filter({ hasText: "Preview NeoForge" });
