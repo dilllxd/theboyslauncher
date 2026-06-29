@@ -1201,6 +1201,8 @@ Latest profile customization cleanup: Library profile customization now mirrors 
 
 Latest packaged profile-customize smoke: after rebuilding `target/release/theboyslauncher.exe` with `npx tauri build --no-bundle`, the real desktop app was launched against `target/packaged-goal-smoke-ui-latest` and Library > Latest Release > Customize was inspected with Computer Use. The default editor shows only Name/Version controls, Advanced opens loader/memory/window/server/JVM/Java override, and the Advanced/Basic toggle now has a fixed-width action column so its label no longer collapses in the packaged app. Verified again with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "library profile editor saves preview changes|library new profile action"` and `npm run build`.
 
+Latest native setup wording cleanup: launcher-core missing-artifact and modloader-processor preflight errors no longer emit `Install or repair the profile...`; they now say `Set up the profile files...` while preserving the precise missing artifact paths for automatic setup detection and diagnostics. The renderer still keeps legacy sanitizers/tests for older cached messages, but new Rust/Tauri errors use setup wording at the source. Verified with `cargo test -p launcher-core process_command_spec -- --test-threads=1`, `cargo test -p launcher-core modloader_processor_command_spec_rejects_missing_classpath_entries -- --test-threads=1`, `cargo test -p theboyslauncher missing_launch_artifact_errors_trigger_automatic_repair -- --test-threads=1`, `cargo fmt --all --check`, and `$env:CARGO_TARGET_DIR='target/codex-goal-check'; cargo check --workspace`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

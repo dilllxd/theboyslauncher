@@ -3465,10 +3465,10 @@ mod tests {
     #[test]
     fn missing_launch_artifact_errors_trigger_automatic_repair() {
         assert!(launch_failure_missing_artifacts(
-            "launch artifact is missing: cache/assets/indexes/1.21.8.json. Install or repair the profile before launching."
+            "launch artifact is missing: cache/assets/indexes/1.21.8.json. Set up the profile files before launching."
         ));
         assert!(launch_failure_missing_artifacts(
-            "launch artifacts are missing: library.jar; natives directory. Install or repair the profile before launching."
+            "launch artifacts are missing: library.jar; natives directory. Set up the profile files before launching."
         ));
         assert!(!launch_failure_missing_artifacts(
             "Java executable C:/Java/bin/java.exe is missing. Install a managed Java runtime from Settings before launching."

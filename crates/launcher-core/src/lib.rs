@@ -3459,7 +3459,7 @@ pub fn build_modloader_installer_processor_command_spec(
     for classpath_entry in &processor.classpath {
         ensure!(
             Path::new(classpath_entry).is_file(),
-            "modloader processor classpath entry '{}' has not been downloaded. Install or repair the profile before running installer processors.",
+            "modloader processor classpath entry '{}' has not been downloaded. Set up the profile files before running installer processors.",
             classpath_entry
         );
     }
@@ -4701,12 +4701,12 @@ fn validate_launch_plan_artifacts(launch_plan: &LaunchPlan) -> Result<()> {
     }
     if missing.len() == 1 {
         bail!(
-            "launch artifact is missing: {}. Install or repair the profile before launching.",
+            "launch artifact is missing: {}. Set up the profile files before launching.",
             missing[0]
         );
     }
     bail!(
-        "launch artifacts are missing: {}. Install or repair the profile before launching.",
+        "launch artifacts are missing: {}. Set up the profile files before launching.",
         missing.join("; ")
     );
 }
@@ -15796,7 +15796,7 @@ hash = "987654321"
             .contains("modloader processor classpath entry"));
         assert!(error
             .to_string()
-            .contains("Install or repair the profile before running installer processors"));
+            .contains("Set up the profile files before running installer processors"));
     }
 
     #[test]
@@ -18446,7 +18446,7 @@ version = "safeVersion"
             .expect_err("missing concrete classpath entry should fail");
 
         assert!(error.to_string().contains("launch artifact is missing"));
-        assert!(error.to_string().contains("Install or repair"));
+        assert!(error.to_string().contains("Set up the profile files"));
     }
 
     #[test]
@@ -18515,7 +18515,7 @@ version = "safeVersion"
             .expect_err("missing module path entry should fail before Java starts");
 
         assert!(error.to_string().contains("module path"));
-        assert!(error.to_string().contains("Install or repair"));
+        assert!(error.to_string().contains("Set up the profile files"));
     }
 
     #[test]
@@ -18541,7 +18541,7 @@ version = "safeVersion"
 
         assert!(message.contains("launch artifact is missing"));
         assert!(message.contains("classpath wildcard directory"));
-        assert!(message.contains("Install or repair"));
+        assert!(message.contains("Set up the profile files"));
     }
 
     #[test]
@@ -18617,7 +18617,7 @@ version = "safeVersion"
 
         assert!(error.to_string().contains("launch artifact is missing"));
         assert!(error.to_string().contains("asset index"));
-        assert!(error.to_string().contains("Install or repair"));
+        assert!(error.to_string().contains("Set up the profile files"));
     }
 
     #[test]
@@ -18670,7 +18670,7 @@ version = "safeVersion"
         assert!(error.to_string().contains("launch artifact is missing"));
         assert!(error.to_string().contains("natives directory"));
         assert!(error.to_string().contains(&display_path(&natives_dir)));
-        assert!(error.to_string().contains("Install or repair"));
+        assert!(error.to_string().contains("Set up the profile files"));
     }
 
     #[test]
@@ -18707,7 +18707,7 @@ version = "safeVersion"
         assert!(message.contains(&display_path(&missing_library)));
         assert!(message.contains(&format!("asset index {}", display_path(&asset_index))));
         assert!(message.contains(&format!("natives directory {}", display_path(&natives_dir))));
-        assert!(message.contains("Install or repair"));
+        assert!(message.contains("Set up the profile files"));
     }
 
     #[test]
