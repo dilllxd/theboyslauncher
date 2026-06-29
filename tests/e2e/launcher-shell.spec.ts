@@ -5726,14 +5726,14 @@ test("failed native repair surfaces the failed launcher event", async ({ page })
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
-  await expect(page.getByRole("complementary")).toContainText("File check failed: asset index is missing");
-  const failedEvent = page.locator(".event-row").filter({ hasText: "File check failed: asset index is missing" });
+  await expect(page.getByRole("complementary")).toContainText("Setup failed: asset index is missing");
+  const failedEvent = page.locator(".event-row").filter({ hasText: "Setup failed: asset index is missing" });
   await expect(failedEvent).toBeVisible();
   await expect(failedEvent.getByRole("button", { name: "Play" })).toHaveCount(0);
   await expect(failedEvent.getByRole("button", { name: "Try again" })).toBeVisible();
-  await expect(page.locator(".event-row").filter({ hasText: "File check is ready to start." })).toHaveCount(0);
+  await expect(page.locator(".event-row").filter({ hasText: "Setup is ready to start." })).toHaveCount(0);
   await failedEvent.getByRole("button", { name: "Try again" }).click();
-  await expect(page.getByRole("complementary")).toContainText("File check failed: asset index is missing");
+  await expect(page.getByRole("complementary")).toContainText("Setup failed: asset index is missing");
 
   const invoked = await page.evaluate(
     () => (window as typeof window & { __failedRepairInvokes: string[] }).__failedRepairInvokes,
@@ -5867,7 +5867,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
                     operation: "repair_profile",
                     subjectId: "winterpack",
                     kind: "active",
-                    message: "Checking profile files",
+                    message: "Setting up profile files",
                     progressPercent: 45,
                     occurredAtUnixSeconds: 1_710_000_000,
                   },
@@ -5935,7 +5935,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
   await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Check files" }).click();
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
-  const pendingRepairPlanEvent = page.locator(".event-row").filter({ hasText: "File check is ready to start." });
+  const pendingRepairPlanEvent = page.locator(".event-row").filter({ hasText: "Setup is ready to start." });
   await expect(pendingRepairPlanEvent).toBeVisible();
   await expect(pendingRepairPlanEvent.getByRole("button", { name: "Play" })).toHaveCount(0);
   await page.locator("nav").getByRole("button", { name: "Play" }).click();
@@ -5952,7 +5952,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
   await page.getByRole("button", { name: "Activity" }).click();
   await page.getByLabel("Activity views").getByRole("button", { name: "Processes" }).click();
   const exitedProcessActions = page.locator(".process-row").filter({ hasText: "Ready after previous launch" }).getByLabel("WinterPack process actions");
-  await expect(exitedProcessActions.getByRole("button", { name: "Checking files..." })).toBeDisabled();
+  await expect(exitedProcessActions.getByRole("button", { name: "Setting up..." })).toBeDisabled();
   await expect
     .poll(() =>
       page.evaluate(() => (window as typeof window & { __pendingRepairInvokes: string[] }).__pendingRepairInvokes),
@@ -7692,7 +7692,7 @@ test("activity repair retry is disabled while the target profile process is runn
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await page.getByLabel("Activity views").getByRole("button", { name: "Events", exact: true }).click();
 
-  const failedRepairEvent = page.locator(".event-row").filter({ hasText: "File check failed: asset index is missing" });
+  const failedRepairEvent = page.locator(".event-row").filter({ hasText: "Setup failed: asset index is missing" });
   await expect(failedRepairEvent.getByRole("button", { name: "Running" })).toBeDisabled();
   await failedRepairEvent.getByRole("button", { name: "Running" }).click({ force: true });
   const invoked = await page.evaluate(() => (window as typeof window & { __runningRepairRetryInvokes: string[] }).__runningRepairRetryInvokes);

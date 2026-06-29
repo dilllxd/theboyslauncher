@@ -661,7 +661,7 @@ function packActionProgressLabel(status: PackSummary["status"]) {
     case "installed":
       return "Reinstalling pack";
     case "repair_needed":
-      return "Checking files";
+      return "Setting up files";
     default:
       return "Installing pack";
   }
@@ -1288,11 +1288,11 @@ function userFacingLauncherEventMessage(message: string) {
     .replace(/^Downloaded artifact:/i, "Downloaded file:")
     .replace(/^Artifact already present:/i, "File already present:")
     .replace(/^Failed artifact:/i, "Failed file:")
-    .replace(/^Repair queued for/i, "File check queued for")
-    .replace(/^Repair plan is ready to execute\./i, "File check is ready to start.")
+    .replace(/^Repair queued for/i, "Setup queued for")
+    .replace(/^Repair plan is ready to execute\./i, "Setup is ready to start.")
     .replace(/^Profile repair completed\./i, "Files are ready.")
     .replace(/^Profile setup completed\./i, "Files are ready.")
-    .replace(/^(?:Error:\s*)?Profile repair failed:/i, "File check failed:");
+    .replace(/^(?:Error:\s*)?Profile repair failed:/i, "Setup failed:");
 }
 
 function summarizeArtifactOperation(events: LauncherEvent[]): ArtifactOperationSummary | undefined {
@@ -1814,7 +1814,7 @@ function App() {
     : setupInProgressProfileId
       ? "Setting up..."
     : repairInProgressProfileId
-      ? "Checking files..."
+      ? "Setting up..."
       : deleteInProgressProfileId
         ? "Deleting..."
         : importInProgress
@@ -1850,7 +1850,7 @@ function App() {
     if (!profileId) return lifecycleActionLabel;
     if (installInProgressPackId === profileId) return "Installing...";
     if (setupInProgressProfileId === profileId) return "Setting up...";
-    if (repairInProgressProfileId === profileId) return "Checking files...";
+    if (repairInProgressProfileId === profileId) return "Setting up...";
     if (deleteInProgressProfileId === profileId) return "Deleting...";
     if (profileId && launchInProgressProfileIds.has(profileId)) return "Launching...";
     return lifecycleActionLabel;
@@ -2614,7 +2614,7 @@ function App() {
     if (!pack || pack.status === "installed") return true;
 
     if (pack.status === "repair_needed") {
-      setActivity(`Checking files for ${pack.name} before joining ${friend.name}`);
+      setActivity(`Setting up files for ${pack.name} before joining ${friend.name}`);
       return repairProfile(profileId);
     }
 
@@ -3747,13 +3747,13 @@ function App() {
       setLauncherEvents((current) =>
         mergeLauncherEvents(current, [
           ...launcherEventsFromOperationPlan(plan),
-          launcherOperationActiveEvent(plan, "File check is running"),
+          launcherOperationActiveEvent(plan, "Setup is running"),
         ]),
       );
-      setActivity(finalEvent ? userFacingLauncherEventMessage(finalEvent.message) : "File check ready");
+      setActivity(finalEvent ? userFacingLauncherEventMessage(finalEvent.message) : "Setup ready");
       setActiveView("activity");
       setActivityMode("events");
-      setActivity("Checking profile files");
+      setActivity("Setting up profile files");
       const receipt = await invoke<ActionReceipt>("repair_profile", { profileId });
       await loadBootstrapSnapshot();
       await loadLauncherEvents();
@@ -3770,7 +3770,7 @@ function App() {
         setActiveView("activity");
         setActivityMode("events");
       }
-      setActivity(userFacingLauncherEventMessage(nativeFailureActivity(error, "Checking profile files is mocked in web preview")));
+      setActivity(userFacingLauncherEventMessage(nativeFailureActivity(error, "Setting up profile files is mocked in web preview")));
       return !isNative;
     } finally {
       if (lifecycleActionInProgressRef.current === operationKey) {
@@ -4302,7 +4302,7 @@ function App() {
                     {activeProcessProfileIds.has(launchRecoveryProfileId)
                       ? "Running"
                       : repairInProgressProfileId === launchRecoveryProfileId
-                        ? "Checking..."
+                        ? "Setting up..."
                         : launchRecoveryAction === "repair_and_join"
                           ? "Try join again"
                           : launchRecoveryAction === "repair_and_launch"
@@ -5466,7 +5466,7 @@ function App() {
                           {repairableFailedLaunchIsActive
                             ? "Running"
                             : repairableFailedLaunchIsRepairing
-                              ? "Checking..."
+                              ? "Setting up..."
                               : failedLaunchRecoveryAction === "repair_and_join"
                                 ? "Try join again"
                                 : "Try play again"}
@@ -5516,7 +5516,7 @@ function App() {
                           onClick={() => repairProfile(failedRepairProfile.id)}
                         >
                           <Wrench size={17} />
-                          {failedRepairIsActive ? "Running" : failedRepairIsRetrying ? "Checking..." : "Try again"}
+                          {failedRepairIsActive ? "Running" : failedRepairIsRetrying ? "Setting up..." : "Try again"}
                         </button>
                       )}
                     </div>
@@ -6198,7 +6198,7 @@ function PackDetailsPanel({
           onClick={() => (isRepairAction || isPlayAction ? onPlay(pack.id, pack.name) : onInstall(pack.id))}
         >
           <ActionIcon size={18} />
-          {isRepairing ? "Checking..." : isInstalling ? pendingActionLabel : visibleActionLabel}
+          {isRepairing ? "Setting up..." : isInstalling ? pendingActionLabel : visibleActionLabel}
         </button>
         <div className="pack-more-menu">
           <button
@@ -6322,7 +6322,7 @@ function PackCard({
           onClick={() => (isRepairAction || isPlayAction ? onPlay(pack.id, pack.name) : onInstall(pack.id))}
         >
           <ActionIcon size={17} />
-          {isRepairing ? "Checking..." : isInstalling ? pendingActionLabel : visibleActionLabel}
+          {isRepairing ? "Setting up..." : isInstalling ? pendingActionLabel : visibleActionLabel}
         </button>
       </div>
     </article>
