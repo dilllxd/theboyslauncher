@@ -4440,7 +4440,12 @@ function App() {
     }
   }
 
-  async function loadManagedProcesses(silent = false) {
+  async function loadManagedProcesses(
+    options: boolean | { silent?: boolean; suppressSuccessActivity?: boolean } = false,
+  ) {
+    const silent = typeof options === "boolean" ? options : Boolean(options.silent);
+    const suppressSuccessActivity =
+      typeof options === "boolean" ? false : Boolean(options.suppressSuccessActivity);
     if (!silent) setActivity("Loading processes");
     try {
       const processes = await invoke<ManagedProcessSummary[]>("list_managed_processes");
@@ -4457,7 +4462,7 @@ function App() {
         return processIds.has(id) ? [] : [entry.process];
       });
       setManagedProcesses((current) => mergeManagedProcessList(current, [...processes, ...recentProcesses]));
-      if (!silent) {
+      if (!silent && !suppressSuccessActivity) {
         setActivity(processes.length === 1 ? "Loaded 1 process" : `Loaded ${processes.length} processes`);
       }
     } catch (error) {
@@ -5772,7 +5777,7 @@ function App() {
                   className="secondary-button"
                   onClick={() => {
                     loadLauncherEvents();
-                    loadManagedProcesses();
+                    loadManagedProcesses({ suppressSuccessActivity: true });
                   }}
                 >
                   <RefreshCw size={18} />

@@ -1251,6 +1251,8 @@ Latest Activity cached setup-failure polish: the common launcher-event formatter
 
 Latest packaged executable refresh after cached setup-failure polish: refreshed checks and rebuilt the local release executable after the Activity cached-event sanitization. `npm run verify:tauri-security`, `npm run verify:package-resources`, `npm run build`, and `$env:CARGO_TARGET_DIR='target/codex-goal-check'; cargo check --workspace` passed, then `npx tauri build --no-bundle` rebuilt `target/release/theboyslauncher.exe` at `21,535,232` bytes with modified time `2026-06-29T18:46:04-04:00`. No `theboyslauncher`, `social-backend`, `java`, or `javaw` processes were left running afterward.
 
+Latest Activity refresh status polish: Activity's combined Refresh action now refreshes managed processes without overwriting a launcher-event refresh failure with a lower-priority success message like `Loaded 0 processes`. Process refresh errors still surface normally; only the success activity line is suppressed during the combined refresh. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "native event log refresh failure preserves real activity state|activity event log sanitizes cached launch setup failures"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
