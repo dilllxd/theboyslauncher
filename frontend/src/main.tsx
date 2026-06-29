@@ -2586,6 +2586,14 @@ function App() {
       setActivity("Wait for this profile to finish its current launcher operation before launching");
       return;
     }
+    const knownPack = snapshot.packs.find((pack) => pack.id === profileId);
+    if (knownPack?.status === "repair_needed" && !options?.repairAttempted) {
+      setActivity(`Setting up files for ${knownPack.name} before launch`);
+      const repaired = await repairProfile(profileId);
+      if (!repaired) return;
+      await launchProfile(profileId, profileName, { ...options, repairAttempted: true });
+      return;
+    }
     const authenticated = storedMinecraftSessionCanAuthenticate(minecraftSession);
     setActivity(authenticated ? "Launching authenticated profile" : "Launching profile");
     let launchStarted = false;

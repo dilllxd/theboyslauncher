@@ -5528,9 +5528,9 @@ test("pack play setup refreshes native bootstrap snapshot status", async ({ page
   await expect(card.getByRole("button", { name: "Play" })).toBeEnabled();
   const invoked = await page.evaluate(() => (window as typeof window & { __repairInvokes: string[] }).__repairInvokes);
   expect(invoked.filter((cmd) => cmd === "bootstrap_snapshot").length).toBeGreaterThanOrEqual(2);
-  expect(invoked.indexOf("start_launch_process")).toBeLessThan(invoked.indexOf("plan_repair_profile"));
   expect(invoked.indexOf("plan_repair_profile")).toBeLessThan(invoked.indexOf("repair_profile"));
   expect(invoked.indexOf("bootstrap_snapshot", invoked.indexOf("repair_profile"))).toBeGreaterThan(invoked.indexOf("repair_profile"));
+  expect(invoked.indexOf("start_launch_process")).toBeGreaterThan(invoked.indexOf("repair_profile"));
   expect(invoked.indexOf("list_launcher_events", invoked.indexOf("repair_profile"))).toBeGreaterThan(invoked.indexOf("repair_profile"));
 });
 
