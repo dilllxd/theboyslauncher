@@ -1835,18 +1835,14 @@ async fn repair_launch_artifacts_if_missing(
             if !launch_failure_missing_artifacts(&message) {
                 return Ok(false);
             }
-            repair_profile_inner(
-                profile_id.to_owned(),
-                event_log,
-                "Profile repair completed.",
-            )
-            .await
-            .map_err(|repair_error| {
-                native_operation_failure_message(
-                    "Automatic profile setup before launch failed",
-                    &repair_error.message,
-                )
-            })?;
+            repair_profile_inner(profile_id.to_owned(), event_log, "Profile setup completed.")
+                .await
+                .map_err(|repair_error| {
+                    native_operation_failure_message(
+                        "Automatic profile setup before launch failed",
+                        &repair_error.message,
+                    )
+                })?;
             Ok(true)
         }
     }
@@ -2298,6 +2294,12 @@ fn build_modpack_archive_download_plan(
     }
     Url::parse(url).map_err(|error| format!("modpack URL is invalid: {error}"))?;
     let file_name = modpack_archive_file_name_from_url(url)?;
+    if file_name.to_ascii_lowercase().ends_with(".mrpack") {
+        return Err(
+            "Modrinth .mrpack archives are planned, but this build only installs CurseForge zip exports."
+                .to_owned(),
+        );
+    }
     let archive_id = uuid::Uuid::new_v4().to_string();
     let archive_path = PathBuf::from(&directories.cache_dir)
         .join("modpack-archives")
@@ -2534,10 +2536,10 @@ async fn repair_profile(
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Err(profile_repair_active_process_error(&profile_id, &process));
     }
-    match repair_profile_inner(profile_id.clone(), &event_log, "Profile repair completed.").await {
+    match repair_profile_inner(profile_id.clone(), &event_log, "Profile setup completed.").await {
         Ok(receipt) => Ok(receipt),
         Err(error) => {
-            let message = native_operation_failure_message("Profile repair failed", &error.message);
+            let message = native_operation_failure_message("Profile setup failed", &error.message);
             let event = match error.operation_id {
                 Some(operation_id) => failed_planned_native_operation_event(
                     operation_id,
@@ -2553,7 +2555,7 @@ async fn repair_profile(
             };
             event_log.record_event(event).map_err(|record_error| {
                 format!(
-                    "{}; additionally failed to record repair failure event: {record_error}",
+                    "{}; additionally failed to record setup failure event: {record_error}",
                     error.message
                 )
             })?;
@@ -3476,6 +3478,26 @@ mod tests {
     }
 
     #[test]
+    fn modrinth_archive_urls_fail_before_download_plan() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/launcher/data".to_owned(),
+            config_dir: "C:/launcher/config".to_owned(),
+            cache_dir: "C:/launcher/cache".to_owned(),
+            log_dir: "C:/launcher/logs".to_owned(),
+        };
+        let request = InstallModpackArchiveRequest {
+            url: "https://example.com/packs/awesome.mrpack".to_owned(),
+            name: Some("Awesome Pack".to_owned()),
+        };
+
+        let error = build_modpack_archive_download_plan(&request, &directories)
+            .expect_err(".mrpack should fail before any download work");
+
+        assert!(error.contains("Modrinth .mrpack archives are planned"));
+        assert!(error.contains("CurseForge zip exports"));
+    }
+
+    #[test]
     fn automatic_launch_setup_failure_uses_setup_wording() {
         assert_eq!(
             native_operation_failure_message(
@@ -3528,14 +3550,14 @@ mod tests {
         let event = completed_native_operation_event(
             LauncherOperation::RepairProfile,
             "winterpack",
-            "Profile repair completed.",
+            "Profile setup completed.",
         );
 
         assert_eq!(event.operation, Some(LauncherOperation::RepairProfile));
         assert_eq!(event.subject_id.as_deref(), Some("winterpack"));
         assert_eq!(event.kind, LauncherEventKind::Completed);
         assert_eq!(event.progress_percent, Some(100));
-        assert_eq!(event.message, "Profile repair completed.");
+        assert_eq!(event.message, "Profile setup completed.");
         assert_eq!(event.occurred_at_unix_seconds, 0);
     }
 
@@ -3564,7 +3586,7 @@ mod tests {
             operation_id,
             LauncherOperation::RepairProfile,
             "winterpack",
-            "Profile repair failed: asset index is missing",
+            "Profile setup failed: asset index is missing",
         );
 
         assert_eq!(event.operation_id, operation_id);
@@ -3574,7 +3596,7 @@ mod tests {
         assert_eq!(event.progress_percent, Some(100));
         assert_eq!(
             event.message,
-            "Profile repair failed: asset index is missing"
+            "Profile setup failed: asset index is missing"
         );
     }
 
@@ -3601,8 +3623,8 @@ mod tests {
             "Pack install failed: checksum mismatch"
         );
         assert_eq!(
-            native_operation_failure_message("Profile repair failed", "asset index is missing"),
-            "Profile repair failed: asset index is missing"
+            native_operation_failure_message("Profile setup failed", "asset index is missing"),
+            "Profile setup failed: asset index is missing"
         );
         assert_eq!(
             native_operation_failure_message("Profile delete failed", "profile is missing"),

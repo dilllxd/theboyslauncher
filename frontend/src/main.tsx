@@ -2565,7 +2565,7 @@ function App() {
       return /pack (installed|updated|reinstalled) successfully/i.test(event.message);
     }
     if (event.operation === "repair_profile") {
-      return /profile repair completed/i.test(event.message);
+      return /profile (repair|setup) completed/i.test(event.message);
     }
     return false;
   }
@@ -4504,7 +4504,7 @@ function App() {
                       }
                     }}
                   >
-                    <Wrench size={14} />
+                    <Download size={14} />
                     {activeProcessProfileIds.has(launchRecoveryProfileId)
                       ? "Running"
                       : repairInProgressProfileId === launchRecoveryProfileId
@@ -5794,7 +5794,7 @@ function App() {
                             }
                           }}
                         >
-                          <Wrench size={17} />
+                          <Play size={17} />
                           {repairableFailedLaunchIsActive
                             ? "Running"
                             : repairableFailedLaunchIsRepairing
@@ -5847,7 +5847,7 @@ function App() {
                           disabled={failedRepairIsActive || failedRepairIsRetrying || lifecycleActionInProgress}
                           onClick={() => repairProfile(failedRepairProfile.id)}
                         >
-                          <Wrench size={17} />
+                          <RefreshCw size={17} />
                           {failedRepairIsActive ? "Running" : failedRepairIsRetrying ? "Setting up..." : "Set up again"}
                         </button>
                       )}
@@ -6451,14 +6451,14 @@ function AccountsModal({
                   {removeConfirmId === account.accountId ? (
                     <>
                       <button className="secondary-button danger compact" onClick={() => onRemove(account)}>
-                        Confirm remove
+                        Confirm sign out
                       </button>
                       <button className="secondary-button compact" onClick={onCancelRemove}>
                         Cancel
                       </button>
                     </>
                   ) : (
-                    <button aria-label="Remove" className="secondary-button compact quiet-danger" onClick={() => onRemove(account)}>
+                    <button className="secondary-button compact quiet-danger" onClick={() => onRemove(account)}>
                       Sign out
                     </button>
                   )}

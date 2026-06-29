@@ -2173,7 +2173,7 @@ fn pack_install_action_label(status: PackStatus) -> &'static str {
     match status {
         PackStatus::UpdateAvailable => "Update",
         PackStatus::Installed => "Reinstall",
-        PackStatus::RepairNeeded => "Repair",
+        PackStatus::RepairNeeded => "Set up",
         PackStatus::NotInstalled => "Install",
     }
 }
@@ -12445,6 +12445,29 @@ mod tests {
             .expect("plan has first event")
             .message
             .contains("Reinstall queued for Remote Pack"));
+    }
+
+    #[test]
+    fn install_pack_plan_uses_setup_label_for_repair_needed_profiles() {
+        let pack = PackSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            tagline: "Private pack".to_owned(),
+            version: "2.3.7".to_owned(),
+            status: PackStatus::RepairNeeded,
+            accent: "#38d996".to_owned(),
+            installed_players: 0,
+            default_server: None,
+        };
+
+        let plan = build_install_operation_plan(&pack);
+
+        assert!(plan
+            .events
+            .first()
+            .expect("plan has first event")
+            .message
+            .contains("Set up queued for WinterPack"));
     }
 
     #[test]

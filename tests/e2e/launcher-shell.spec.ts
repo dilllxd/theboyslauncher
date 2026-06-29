@@ -6425,7 +6425,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
           action: "repair_profile",
           subjectId: "winterpack",
           status: "completed",
-          message: "Profile repair completed.",
+          message: "Profile setup completed.",
         });
       },
       configurable: true,
@@ -6463,7 +6463,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
                     operation: "repair_profile",
                     subjectId: "winterpack",
                     kind: "completed",
-                    message: "Profile repair completed.",
+                    message: "Profile setup completed.",
                     progressPercent: 100,
                     occurredAtUnixSeconds: 1_710_000_000,
                   }
@@ -10814,11 +10814,11 @@ test("settings can remove a stored Minecraft account with confirmation", async (
   await expect(accountsList).toContainText("Dilll");
   await expect(accountsList).toContainText("Builder");
 
-  await accountsList.getByRole("button", { name: "Remove" }).first().click();
-  await expect(accountsList.getByRole("button", { name: "Confirm remove" })).toBeVisible();
+  await accountsList.getByRole("button", { name: "Sign out" }).first().click();
+  await expect(accountsList.getByRole("button", { name: "Confirm sign out" })).toBeVisible();
   await expect.poll(() => removeCallCount).toBe(0);
 
-  await accountsList.getByRole("button", { name: "Confirm remove" }).click();
+  await accountsList.getByRole("button", { name: "Confirm sign out" }).click();
   await expect(accountsList).not.toContainText("Dilll");
   await expect(accountsList).toContainText("Builder");
   await expect(accountsList).toContainText("Signed in and selected");
