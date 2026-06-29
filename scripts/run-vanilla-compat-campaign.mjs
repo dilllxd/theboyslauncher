@@ -6,6 +6,7 @@ const manifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.
 const testName = "live_vanilla_compat_version_launch_process_survives_startup_and_can_stop";
 const defaultRoot = resolve("target", "live-smoke", "vanilla-compat");
 const defaultSharedCacheRoot = resolve("target", "live-smoke", "vanilla-compat-shared-cache");
+const defaultCampaignLockRoot = resolve("target", "live-smoke", "vanilla-compat-campaign-locks");
 
 function usage() {
   console.log(`Usage:
@@ -171,6 +172,17 @@ function assertSharedCacheRootIsSafe(rootPath) {
   }
 }
 
+function assertCampaignLockRootIsSafe(rootPath) {
+  const resolvedRoot = resolve(rootPath);
+  if (
+    resolvedRoot !== defaultCampaignLockRoot &&
+    !resolvedRoot.startsWith(`${defaultCampaignLockRoot}\\`) &&
+    !resolvedRoot.startsWith(`${defaultCampaignLockRoot}/`)
+  ) {
+    throw new Error(`Refusing to clean outside ${defaultCampaignLockRoot}: ${resolvedRoot}`);
+  }
+}
+
 function processIsRunning(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -217,6 +229,51 @@ function acquireVersionLock(lockPath, version, versionRoot) {
   }
 
   throw new Error(`Vanilla compatibility root is already in use: ${versionRoot}`);
+}
+
+function campaignLockName(options, versions) {
+  if (options.all) {
+    const types = options.types.length > 0 ? options.types.join("+") : "all-types";
+    const limit = options.limit === null ? "end" : String(options.limit);
+    return safePathSegment(`all-${types}-offset-${options.offset}-limit-${limit}`);
+  }
+  if (options.matrix) return "matrix";
+  if (options.sample) return "sample";
+  return safePathSegment(`versions-${versions.join("+")}`);
+}
+
+function acquireCampaignLock(options, versions) {
+  mkdirSync(defaultCampaignLockRoot, { recursive: true });
+  const label = campaignLockName(options, versions);
+  const lockPath = resolve(defaultCampaignLockRoot, `${label}.lock`);
+  assertCampaignLockRootIsSafe(lockPath);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(lockPath, { recursive: false });
+      writeFileSync(
+        resolve(lockPath, "owner.json"),
+        `${JSON.stringify({ pid: process.pid, label, startedAt: new Date().toISOString(), versions }, null, 2)}\n`,
+      );
+      return lockPath;
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+
+      const owner = readLockOwner(lockPath);
+      if (owner?.pid && processIsRunning(owner.pid)) {
+        throw new Error(
+          `Vanilla compatibility campaign is already running: ${label} (pid ${owner.pid}, started ${owner.startedAt ?? "unknown"})`,
+        );
+      }
+
+      rmSync(lockPath, { recursive: true, force: true });
+      console.log(`Removed stale vanilla compatibility campaign lock: ${lockPath}`);
+    }
+  }
+
+  throw new Error(`Vanilla compatibility campaign is already running: ${label}`);
 }
 
 async function fetchManifest() {
@@ -408,7 +465,13 @@ if (options.dryRun) {
   process.exit(0);
 }
 
-const results = await runVersions(versions, options);
+const campaignLockPath = acquireCampaignLock(options, versions);
+let results;
+try {
+  results = await runVersions(versions, options);
+} finally {
+  rmSync(campaignLockPath, { recursive: true, force: true });
+}
 
 const failed = results.filter((result) => result.code !== 0);
 console.log("\nVanilla compatibility results:");
