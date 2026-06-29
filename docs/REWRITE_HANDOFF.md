@@ -1163,6 +1163,8 @@ Latest automatic-launch setup wording polish: automatic missing-artifact setup f
 
 Latest automatic-setup status polish: the frontend now says `Setting up missing files before launch/joining` instead of `Installing missing files` for automatic missing-artifact recovery paths, keeping pack installation separate from profile setup in user-visible status. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "pack play setup refreshes|friend join surfaces native launch preflight"` and `npm run build`.
 
+Latest renderer setup-wording fallback: renderer-side native error sanitization now also rewrites legacy/cached `Automatic profile repair before launch failed:` messages to `Automatic profile setup before launch failed:`. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "launch command preflight failure offers setup recovery|failed native repair surfaces"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

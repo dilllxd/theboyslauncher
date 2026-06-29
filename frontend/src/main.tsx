@@ -1359,6 +1359,7 @@ function userFacingLauncherEventMessage(message: string) {
 
 function userFacingNativeErrorMessage(message: string) {
   return userFacingLauncherEventMessage(message)
+    .replace(/^Automatic profile repair before launch failed:/i, "Automatic profile setup before launch failed:")
     .replace(/\s*Install or repair the profile before launching\./i, " The launcher will set up missing files automatically.")
     .replace(/\brepair the profile\b/i, "set up the profile files");
 }
