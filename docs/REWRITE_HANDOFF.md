@@ -1185,6 +1185,8 @@ Latest profile-creator hardening: native profile creation now treats a failed Mo
 
 Latest vanilla family compatibility results: the delegated `old_alpha` lane passed all 35 Mojang old-alpha versions with `npm run smoke:live:vanilla:compat -- --all --type old_alpha --jobs 2 --quiet`. The delegated `old_beta` lane passed 25 of 26 versions and failed `b1.2_02` only because C: ran out of disk while writing the managed Java 8 download; after removing exact old generated proof roots under `target/live-smoke` (`neoforge`, `fabric`, `ui-clean-install-proof`, `ui-proof`, `winterpack`, `vanilla`, `delete-proof`) C: free space rose to about 14.4 GB and `npm run smoke:live:vanilla:compat -- --version b1.2_02 --quiet` passed. Treat old beta coverage as all 26 passed after exact retry. The release lane and two remaining snapshot lanes are still active.
 
+Latest snapshot lane result: the delegated snapshot `555-614` lane passed all 60 selected versions with `npm run smoke:live:vanilla:compat -- --all --type snapshot --offset 555 --limit 60 --jobs 1 --quiet`. `16w06a` and `15w43c` had initial failures and both passed exact-version retry; no failures remained after retry. The worker reported no leftover cargo/java processes or roots attributable to that slice. Remaining compatibility lanes are snapshot `350-414` and full `release`. Low-conflict verification also passed with `cargo fmt --all --check` and `CARGO_TARGET_DIR=target/codex-goal-check cargo check --workspace`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
