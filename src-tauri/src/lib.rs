@@ -28,6 +28,7 @@ use launcher_core::{
     build_modloader_dependency_download_plan_for_profile as core_build_modloader_dependency_download_plan_for_profile,
     build_modloader_download_plan as core_build_modloader_download_plan,
     build_modloader_download_plan_for_profile_with_loader_version as core_build_modloader_download_plan_for_profile_with_loader_version,
+    build_modrinth_modpack_archive_install_plan as core_build_modrinth_modpack_archive_install_plan,
     build_offline_launch_plan as core_build_offline_launch_plan,
     build_offline_launch_plan_with_server as core_build_offline_launch_plan_with_server,
     build_process_command_spec as core_build_process_command_spec,
@@ -45,6 +46,7 @@ use launcher_core::{
     execute_modloader_installer_processors_for_profile_with_event_callback as core_execute_modloader_installer_processors_for_profile_with_event_callback,
     extract_curseforge_modpack_archive as core_extract_curseforge_modpack_archive,
     extract_modloader_installer_metadata_for_profile as core_extract_modloader_installer_metadata_for_profile,
+    extract_modrinth_modpack_archive as core_extract_modrinth_modpack_archive,
     extract_native_libraries_from_download_plan as core_extract_native_libraries_from_download_plan,
     fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog as core_fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog,
     fetch_minecraft_entitlements as core_fetch_minecraft_entitlements,
@@ -60,6 +62,7 @@ use launcher_core::{
     managed_process_lifecycle_event as core_managed_process_lifecycle_event,
     mark_profile_launched as core_mark_profile_launched,
     minecraft_version_summaries as core_minecraft_version_summaries,
+    modpack_archive_contains_modrinth_index as core_modpack_archive_contains_modrinth_index,
     persist_installed_pack_profile as core_persist_installed_pack_profile,
     plan_download_artifacts as core_plan_download_artifacts,
     plan_install_pack_with_remote_catalog as core_plan_install_pack_with_remote_catalog,
@@ -2294,12 +2297,6 @@ fn build_modpack_archive_download_plan(
     }
     Url::parse(url).map_err(|error| format!("modpack URL is invalid: {error}"))?;
     let file_name = modpack_archive_file_name_from_url(url)?;
-    if file_name.to_ascii_lowercase().ends_with(".mrpack") {
-        return Err(
-            "Modrinth .mrpack archives are planned, but this build only installs CurseForge zip exports."
-                .to_owned(),
-        );
-    }
     let archive_id = uuid::Uuid::new_v4().to_string();
     let archive_path = PathBuf::from(&directories.cache_dir)
         .join("modpack-archives")
@@ -2344,20 +2341,56 @@ async fn install_modpack_archive(
         build_modpack_archive_download_plan(&request, &directories)?;
     execute_download_plan_recording_events(&archive_download_plan, &event_log).await?;
 
-    let install_plan = core_build_curseforge_modpack_archive_install_plan(
-        &archive_path,
-        request.name.as_deref(),
-        &directories,
-    )
-    .map_err(|error| {
-        native_operation_failure_message("Modpack install failed", &error.to_string())
-    })?;
-    let profile = install_plan.profile.clone();
-    let extraction =
-        core_extract_curseforge_modpack_archive(&archive_path, &install_plan, &directories)
-            .map_err(|error| {
-                native_operation_failure_message("Modpack install failed", &error.to_string())
-            })?;
+    let archive_file_name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_modrinth_archive = archive_file_name.ends_with(".mrpack")
+        || core_modpack_archive_contains_modrinth_index(&archive_path).unwrap_or(false);
+    let (profile, loader_version, mut auxiliary_plan, extraction) = if is_modrinth_archive {
+        let install_plan = core_build_modrinth_modpack_archive_install_plan(
+            &archive_path,
+            request.name.as_deref(),
+            &directories,
+        )
+        .map_err(|error| {
+            native_operation_failure_message("Modpack install failed", &error.to_string())
+        })?;
+        let profile = install_plan.profile.clone();
+        let extraction =
+            core_extract_modrinth_modpack_archive(&archive_path, &install_plan, &directories)
+                .map_err(|error| {
+                    native_operation_failure_message("Modpack install failed", &error.to_string())
+                })?;
+        (
+            profile,
+            install_plan.loader_version.clone(),
+            install_plan.file_download_plan.clone(),
+            extraction,
+        )
+    } else {
+        let install_plan = core_build_curseforge_modpack_archive_install_plan(
+            &archive_path,
+            request.name.as_deref(),
+            &directories,
+        )
+        .map_err(|error| {
+            native_operation_failure_message("Modpack install failed", &error.to_string())
+        })?;
+        let profile = install_plan.profile.clone();
+        let extraction =
+            core_extract_curseforge_modpack_archive(&archive_path, &install_plan, &directories)
+                .map_err(|error| {
+                    native_operation_failure_message("Modpack install failed", &error.to_string())
+                })?;
+        (
+            profile,
+            install_plan.loader_version.clone(),
+            install_plan.mod_download_plan.clone(),
+            extraction,
+        )
+    };
     event_log
         .record_plan(&extraction)
         .map_err(|error| error.to_string())?;
@@ -2373,11 +2406,10 @@ async fn install_modpack_archive(
         native_operation_failure_message("Modpack install failed", &error.to_string())
     })?;
 
-    let mut auxiliary_plan = install_plan.mod_download_plan.clone();
     if profile.loader != shared::ModLoader::Vanilla {
         let modloader_plan = core_build_modloader_download_plan_for_profile_with_loader_version(
             &profile,
-            install_plan.loader_version.as_deref(),
+            loader_version.as_deref(),
             &directories,
         )
         .map_err(|error| {
@@ -3478,7 +3510,7 @@ mod tests {
     }
 
     #[test]
-    fn modrinth_archive_urls_fail_before_download_plan() {
+    fn modrinth_archive_urls_build_download_plan() {
         let directories = LauncherDirectories {
             data_dir: "C:/launcher/data".to_owned(),
             config_dir: "C:/launcher/config".to_owned(),
@@ -3490,11 +3522,15 @@ mod tests {
             name: Some("Awesome Pack".to_owned()),
         };
 
-        let error = build_modpack_archive_download_plan(&request, &directories)
-            .expect_err(".mrpack should fail before any download work");
+        let (plan, archive_path) = build_modpack_archive_download_plan(&request, &directories)
+            .expect(".mrpack should download before provider detection");
 
-        assert!(error.contains("Modrinth .mrpack archives are planned"));
-        assert!(error.contains("CurseForge zip exports"));
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].url,
+            "https://example.com/packs/awesome.mrpack"
+        );
+        assert!(archive_path.ends_with("awesome.mrpack"));
     }
 
     #[test]

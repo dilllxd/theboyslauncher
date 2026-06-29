@@ -221,10 +221,12 @@ test("discover shows provider plan and archive install entry point", async ({ pa
   await expect(page.getByText("Browse providers, install packs, and keep setup automatic.")).toBeVisible();
   await expect(page.getByLabel("Discover providers")).toContainText("CurseForge");
   await expect(page.getByLabel("Discover providers")).toContainText("Modrinth");
+  await expect(page.getByText("Install Modrinth .mrpack archives now")).toBeVisible();
   await expect(page.getByLabel("Discover providers")).toContainText("ATLauncher");
   await expect(page.getByLabel("Discover providers")).toContainText("FTB Legacy");
   await expect(page.getByLabel("Pack name")).toHaveValue("Enigmatica 9 Expert");
   await expect(page.getByLabel("Archive URL")).toHaveValue(/Enigmatica9Expert-1\.27\.0\.zip/);
+  await expect(page.getByText("CurseForge zip, Modrinth .mrpack")).toBeVisible();
 
   await page.getByRole("button", { name: "Install", exact: true }).click();
   await expect(page.getByText("Discover installs require the desktop app")).toBeVisible();

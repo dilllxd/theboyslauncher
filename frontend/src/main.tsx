@@ -656,8 +656,8 @@ const discoverProviders: DiscoverProvider[] = [
   {
     id: "modrinth",
     name: "Modrinth",
-    status: "coming_soon",
-    summary: "Planned support for .mrpack archives and Modrinth catalog browsing.",
+    status: "available",
+    summary: "Install Modrinth .mrpack archives now; searchable catalog support can follow.",
   },
   {
     id: "atlauncher",
@@ -4813,8 +4813,9 @@ function App() {
                   <span className="section-kicker">Install from archive</span>
                   <h3>Paste a modpack download link</h3>
                   <p>
-                    Standard CurseForge zip exports can be installed now. The launcher copies overrides,
-                    downloads mods in parallel, prepares Minecraft, and sets up Forge automatically.
+                    Standard CurseForge zip exports and Modrinth .mrpack archives can be installed now.
+                    The launcher copies overrides, downloads pack files in parallel, prepares Minecraft,
+                    and sets up the right loader automatically.
                   </p>
                   <form className="discover-install-form" onSubmit={installDiscoveredArchive}>
                     <label>
@@ -4830,7 +4831,7 @@ function App() {
                       <input
                         value={discoverArchiveUrl}
                         onChange={(event) => setDiscoverArchiveUrl(event.target.value)}
-                        placeholder="https://example.com/modpack.zip"
+                        placeholder="https://example.com/modpack.zip or .mrpack"
                       />
                     </label>
                     <button
@@ -4870,7 +4871,7 @@ function App() {
                   Modrinth, and Technic. Profile imports should later move into a first-run suggestion flow.
                 </p>
                 <div className="settings-mini-grid">
-                  <Setting label="Archive imports" value="CurseForge zip" />
+                  <Setting label="Archive imports" value="CurseForge zip, Modrinth .mrpack" />
                   <Setting label="Search catalogs" value="Next slice" />
                   <Setting label="Mod downloads" value="Parallel" />
                   <Setting label="Java" value="Automatic" />

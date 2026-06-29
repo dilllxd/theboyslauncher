@@ -114,6 +114,9 @@ const IMPORTABLE_PROFILE_PATHS: &[(ImportPlanItemKind, &str)] = &[
 const CURSEFORGE_MANIFEST_FILE: &str = "manifest.json";
 const CURSEFORGE_PROFILE_METADATA_DIR: &str = ".theboys/curseforge";
 const CURSEFORGE_PROFILE_MANIFEST_PATH: &str = ".theboys/curseforge/manifest.json";
+const MODRINTH_INDEX_FILE: &str = "modrinth.index.json";
+const MODRINTH_PROFILE_METADATA_DIR: &str = ".theboys/modrinth";
+const MODRINTH_PROFILE_INDEX_PATH: &str = ".theboys/modrinth/modrinth.index.json";
 
 pub fn bootstrap_snapshot() -> Result<AppSnapshot> {
     let directories = prepare_launcher_directories()?;
@@ -1376,6 +1379,13 @@ pub struct CurseForgeModpackArchiveInstallPlan {
     pub mod_download_plan: DownloadPlan,
 }
 
+#[derive(Clone, Debug)]
+pub struct ModrinthModpackArchiveInstallPlan {
+    pub profile: ProfileSummary,
+    pub loader_version: Option<String>,
+    pub file_download_plan: DownloadPlan,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CurseForgeModpackManifest {
@@ -1419,6 +1429,52 @@ struct CurseForgeManifestFile {
     download_url: Option<String>,
     #[serde(default = "default_true")]
     required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModrinthModpackIndex {
+    format_version: u32,
+    game: String,
+    name: String,
+    version_id: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    files: Vec<ModrinthIndexFile>,
+    dependencies: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModrinthIndexFile {
+    path: String,
+    hashes: ModrinthIndexFileHashes,
+    #[serde(default)]
+    env: Option<ModrinthIndexFileEnv>,
+    #[serde(default)]
+    downloads: Vec<String>,
+    #[serde(default)]
+    file_size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+struct ModrinthIndexFileEnv {
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default)]
+    server: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ModrinthIndexFileHashes {
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    sha512: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1762,6 +1818,286 @@ fn local_curseforge_loader_version_for_profile(
         return Ok(version);
     }
     Ok(None)
+}
+
+pub fn modpack_archive_contains_modrinth_index(archive_path: &Path) -> Result<bool> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let contains_index = archive.by_name(MODRINTH_INDEX_FILE).is_ok();
+    Ok(contains_index)
+}
+
+pub fn build_modrinth_modpack_archive_install_plan(
+    archive_path: &Path,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+) -> Result<ModrinthModpackArchiveInstallPlan> {
+    let index = read_modrinth_modpack_index_from_archive(archive_path)?;
+    let profile_name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| index.name.trim());
+    ensure!(
+        !profile_name.is_empty(),
+        "Modrinth modpack name is required"
+    );
+    let profile_id = profile_id_from_name(profile_name);
+    ensure_safe_path_segment(&profile_id, "profile id")?;
+    let minecraft_version = modrinth_minecraft_version(&index)?;
+    let (loader, loader_version) = modrinth_primary_modloader(&index)?;
+    let profile_root = profile_data_dir(directories, &profile_id)?;
+    let file_download_plan =
+        build_modrinth_modpack_file_download_plan(&index, &profile_id, &profile_root)?;
+
+    Ok(ModrinthModpackArchiveInstallPlan {
+        profile: ProfileSummary {
+            id: profile_id,
+            name: profile_name.to_owned(),
+            loader,
+            game_version: minecraft_version,
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: default_settings().max_memory_mb.max(6144),
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        },
+        loader_version,
+        file_download_plan,
+    })
+}
+
+pub fn extract_modrinth_modpack_archive(
+    archive_path: &Path,
+    plan: &ModrinthModpackArchiveInstallPlan,
+    directories: &LauncherDirectories,
+) -> Result<OperationPlan> {
+    validate_profiles(std::slice::from_ref(&plan.profile))?;
+    let profile_root = profile_data_dir(directories, &plan.profile.id)?;
+    fs::create_dir_all(&profile_root)?;
+
+    let index = read_modrinth_modpack_index_from_archive(archive_path)?;
+    let metadata_dir = profile_root.join(MODRINTH_PROFILE_METADATA_DIR);
+    fs::create_dir_all(&metadata_dir)?;
+    fs::write(
+        profile_root.join(MODRINTH_PROFILE_INDEX_PATH),
+        serde_json::to_vec_pretty(&index)?,
+    )?;
+    extract_modrinth_overrides_from_archive(archive_path, &profile_root)?;
+
+    let operation_id = Uuid::new_v4();
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::ImportProfile,
+        subject_id: plan.profile.id.clone(),
+        events: vec![
+            operation_event(
+                operation_id,
+                LauncherEventKind::Planning,
+                format!("Prepared Modrinth modpack {}", plan.profile.name),
+                Some(20),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Completed,
+                "Copied Modrinth overrides and saved the Modrinth index.",
+                Some(100),
+            ),
+        ],
+    })
+}
+
+fn read_modrinth_modpack_index_from_archive(archive_path: &Path) -> Result<ModrinthModpackIndex> {
+    let file = fs::File::open(archive_path).with_context(|| {
+        format!(
+            "failed to open Modrinth archive {}",
+            display_path(archive_path)
+        )
+    })?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut index_entry = archive
+        .by_name(MODRINTH_INDEX_FILE)
+        .map_err(|_| anyhow!("Modrinth archive is missing modrinth.index.json"))?;
+    let mut body = String::new();
+    index_entry.read_to_string(&mut body)?;
+    let index = serde_json::from_str::<ModrinthModpackIndex>(&body)?;
+    validate_modrinth_index(&index)?;
+    Ok(index)
+}
+
+fn validate_modrinth_index(index: &ModrinthModpackIndex) -> Result<()> {
+    ensure!(
+        index.format_version == 1,
+        "unsupported Modrinth formatVersion {}",
+        index.format_version
+    );
+    ensure!(
+        index.game.trim().eq_ignore_ascii_case("minecraft"),
+        "Modrinth archive game must be minecraft"
+    );
+    ensure!(
+        !index.name.trim().is_empty(),
+        "Modrinth pack name is required"
+    );
+    modrinth_minecraft_version(index)?;
+    modrinth_primary_modloader(index)?;
+    for file in &index.files {
+        ensure_safe_relative_path(file.path.trim(), "Modrinth file path")?;
+        if !modrinth_index_file_applies_to_client(file) {
+            continue;
+        }
+        let url = modrinth_index_file_download_url(file)?;
+        validate_http_download_url(&url)?;
+    }
+    Ok(())
+}
+
+fn modrinth_minecraft_version(index: &ModrinthModpackIndex) -> Result<String> {
+    let version = index
+        .dependencies
+        .get("minecraft")
+        .map(String::as_str)
+        .unwrap_or(index.version_id.as_str())
+        .trim();
+    ensure!(
+        looks_like_minecraft_version(version),
+        "Modrinth pack has unsupported Minecraft version '{version}'"
+    );
+    Ok(version.to_owned())
+}
+
+fn modrinth_primary_modloader(index: &ModrinthModpackIndex) -> Result<(ModLoader, Option<String>)> {
+    for (dependency, loader) in [
+        ("forge", ModLoader::Forge),
+        ("neoforge", ModLoader::Neoforge),
+        ("fabric-loader", ModLoader::Fabric),
+        ("quilt-loader", ModLoader::Quilt),
+    ] {
+        if let Some(version) = index.dependencies.get(dependency) {
+            let version = version.trim();
+            ensure!(
+                !version.is_empty(),
+                "Modrinth dependency '{dependency}' version is required"
+            );
+            ensure_safe_path_segment(version, "Modrinth modloader version")?;
+            return Ok((loader, Some(version.to_owned())));
+        }
+    }
+    Ok((ModLoader::Vanilla, None))
+}
+
+fn build_modrinth_modpack_file_download_plan(
+    index: &ModrinthModpackIndex,
+    profile_id: &str,
+    profile_root: &Path,
+) -> Result<DownloadPlan> {
+    let mut items = Vec::new();
+    for file in index
+        .files
+        .iter()
+        .filter(|file| modrinth_index_file_applies_to_client(file))
+    {
+        let relative_path = file.path.trim();
+        ensure_safe_relative_path(relative_path, "Modrinth file path")?;
+        let destination = profile_root.join(relative_path);
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "Modrinth file destination is outside the profile directory"
+        );
+        items.push(DownloadItem {
+            id: format!("modrinth-file-{}", download_item_safe_id(relative_path)),
+            kind: DownloadKind::PackFile,
+            url: modrinth_index_file_download_url(file)?,
+            sha1: normalized_optional_hash(file.hashes.sha1.as_deref()),
+            sha256: normalized_optional_hash(file.hashes.sha256.as_deref()),
+            sha512: normalized_optional_hash(file.hashes.sha512.as_deref()),
+            md5: None,
+            murmur2: None,
+            size: file.file_size,
+            destination: display_path(&destination),
+        });
+    }
+
+    Ok(DownloadPlan {
+        version_id: format!("{profile_id}-modrinth-files"),
+        items,
+    })
+}
+
+fn modrinth_index_file_applies_to_client(file: &ModrinthIndexFile) -> bool {
+    let Some(env) = file.env.as_ref() else {
+        return true;
+    };
+    !matches!(
+        env.client.as_deref().map(str::trim),
+        Some("unsupported") | Some("optional")
+    )
+}
+
+fn modrinth_index_file_download_url(file: &ModrinthIndexFile) -> Result<String> {
+    file.downloads
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .find(|url| !url.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("Modrinth file '{}' has no download URL", file.path))
+}
+
+fn normalized_optional_hash(hash: Option<&str>) -> Option<String> {
+    hash.map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .map(|hash| hash.to_ascii_lowercase())
+}
+
+fn download_item_safe_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned()
+}
+
+fn extract_modrinth_overrides_from_archive(archive_path: &Path, profile_root: &Path) -> Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let raw_name = entry.name().replace('\\', "/");
+        let Some(relative) = raw_name
+            .strip_prefix("overrides/")
+            .or_else(|| raw_name.strip_prefix("client-overrides/"))
+        else {
+            continue;
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        ensure_safe_relative_path(relative.trim_end_matches('/'), "Modrinth override path")?;
+        let destination = profile_root.join(relative);
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "Modrinth override destination is outside the profile directory"
+        );
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut output = fs::File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn execute_import_plan(plan: &ImportPlan) -> Result<OperationPlan> {
@@ -23269,6 +23605,108 @@ JAVA_VERSION="21.0.4"
         assert!(plan.mod_download_plan.items[1]
             .destination
             .ends_with("profiles/nodirecturls/mods/curseforge-306770-4031402.jar"));
+    }
+
+    #[test]
+    fn modrinth_archive_plan_reads_index_and_extracts_overrides() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive_path = root.path().join("MoreModVariants.mrpack");
+        let data_dir = root.path().join("data");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&data_dir),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let modrinth_index = br#"{
+          "formatVersion": 1,
+          "game": "minecraft",
+          "versionId": "1.20.1",
+          "name": "More Mod Variants",
+          "summary": "Fixture pack",
+          "files": [
+            {
+              "path": "mods/sodium-fabric.jar",
+              "hashes": {
+                "sha1": "0123456789abcdef0123456789abcdef01234567",
+                "sha512": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+              },
+              "env": { "client": "required", "server": "unsupported" },
+              "downloads": ["https://cdn.modrinth.com/data/example/versions/version/sodium-fabric.jar"],
+              "fileSize": 12345
+            },
+            {
+              "path": "mods/server-only.jar",
+              "hashes": { "sha1": "1111111111111111111111111111111111111111" },
+              "env": { "client": "unsupported", "server": "required" },
+              "downloads": ["https://cdn.modrinth.com/data/example/versions/version/server-only.jar"],
+              "fileSize": 10
+            },
+            {
+              "path": "mods/optional.jar",
+              "hashes": { "sha1": "2222222222222222222222222222222222222222" },
+              "env": { "client": "optional", "server": "optional" },
+              "downloads": ["https://cdn.modrinth.com/data/example/versions/version/optional.jar"],
+              "fileSize": 10
+            }
+          ],
+          "dependencies": {
+            "minecraft": "1.20.1",
+            "fabric-loader": "0.15.11"
+          }
+        }"#;
+        write_zip_archive(
+            &archive_path,
+            &[
+                ("modrinth.index.json", modrinth_index),
+                ("overrides/config/example.toml", b"enabled=true"),
+                ("client-overrides/options.txt", b"autoJump:false"),
+                ("server-overrides/server.properties", b"motd=skip"),
+            ],
+        );
+
+        assert!(modpack_archive_contains_modrinth_index(&archive_path)
+            .expect("archive should be readable"));
+        let plan = build_modrinth_modpack_archive_install_plan(&archive_path, None, &directories)
+            .expect("modrinth archive should plan");
+
+        assert_eq!(plan.profile.id, "more-mod-variants");
+        assert_eq!(plan.profile.loader, ModLoader::Fabric);
+        assert_eq!(plan.profile.game_version, "1.20.1");
+        assert_eq!(plan.loader_version.as_deref(), Some("0.15.11"));
+        assert_eq!(plan.file_download_plan.items.len(), 1);
+        assert_eq!(
+            plan.file_download_plan.items[0].url,
+            "https://cdn.modrinth.com/data/example/versions/version/sodium-fabric.jar"
+        );
+        assert_eq!(
+            plan.file_download_plan.items[0].sha1.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(plan.file_download_plan.items[0].size, Some(12345));
+        assert!(plan.file_download_plan.items[0]
+            .destination
+            .ends_with("profiles/more-mod-variants/mods/sodium-fabric.jar"));
+
+        extract_modrinth_modpack_archive(&archive_path, &plan, &directories)
+            .expect("overrides should extract");
+
+        assert_eq!(
+            fs::read_to_string(data_dir.join("profiles/more-mod-variants/config/example.toml"))
+                .expect("override should write"),
+            "enabled=true"
+        );
+        assert_eq!(
+            fs::read_to_string(data_dir.join("profiles/more-mod-variants/options.txt"))
+                .expect("client override should write"),
+            "autoJump:false"
+        );
+        assert!(!data_dir
+            .join("profiles/more-mod-variants/server.properties")
+            .exists());
+        assert!(data_dir
+            .join("profiles/more-mod-variants/.theboys/modrinth/modrinth.index.json")
+            .is_file());
     }
 
     #[test]
