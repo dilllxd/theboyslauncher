@@ -11422,6 +11422,27 @@ mod tests {
         }
     }
 
+    fn winterpack_profile_fixture() -> ProfileSummary {
+        ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: Some("2.3.7".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        }
+    }
+
+    fn seed_profiles_for_current_env(profiles: &[ProfileSummary]) {
+        let path = profiles_path().expect("profiles path should resolve");
+        save_profiles_to_path(&path, profiles).expect("profiles should save");
+    }
+
     struct LiveSmokeRoot {
         _env: LauncherDirEnvGuard,
         _temp: Option<tempfile::TempDir>,
@@ -11718,16 +11739,24 @@ mod tests {
 
     #[test]
     fn snapshot_contains_local_launcher_data_without_demo_friends() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        seed_profiles_for_current_env(&demo_profiles());
+
         let snapshot = bootstrap_snapshot().expect("snapshot should build");
 
         assert_eq!(snapshot.settings.max_memory_mb, 6144);
-        assert!(snapshot.directories.data_dir.contains("TheBoysLauncher"));
+        assert_eq!(
+            snapshot.directories.data_dir,
+            display_path(&root.path().join("data"))
+        );
         assert!(snapshot.friends.is_empty());
         assert!(snapshot.packs.iter().any(|pack| pack.id == "winterpack"));
         assert!(snapshot
             .profiles
             .iter()
-            .any(|profile| profile.loader == ModLoader::Fabric));
+            .any(|profile| profile.id == "latest-release" && profile.loader == ModLoader::Vanilla));
     }
 
     #[test]
@@ -11838,6 +11867,11 @@ mod tests {
 
     #[test]
     fn native_actions_validate_required_subjects() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        seed_profiles_for_current_env(&[winterpack_profile_fixture()]);
+
         assert!(launch_profile("").is_err());
         assert!(install_pack("winterpack").is_ok());
         assert!(repair_profile("winterpack").is_ok());
@@ -14081,6 +14115,11 @@ hash = "987654321"
 
     #[test]
     fn offline_launch_plan_uses_profile_settings_and_directories() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        seed_profiles_for_current_env(&[winterpack_profile_fixture()]);
+
         let _java = JavaRuntimeDiscoveryGuard::java_21();
         let settings = LauncherSettings {
             max_memory_mb: 8192,
@@ -14114,7 +14153,7 @@ hash = "987654321"
         );
         let classpath = launch_argument_value(&plan.arguments, "-cp").expect("classpath exists");
         assert!(classpath.contains(
-            "C:/Users/test/AppData/Local/TheBoysLauncher/cache/versions/1.21.1/client.jar"
+            "C:/Users/test/AppData/Local/TheBoysLauncher/cache/versions/1.20.1/client.jar"
         ));
         assert!(classpath.contains("C:/Users/test/AppData/Local/TheBoysLauncher/cache/libraries/*"));
     }
@@ -14367,6 +14406,7 @@ hash = "987654321"
 
     #[test]
     fn launch_plan_substitutes_minecraft_version_type_from_metadata() {
+        let _java = JavaRuntimeDiscoveryGuard::java_8();
         let settings = LauncherSettings {
             max_memory_mb: 8192,
             min_memory_mb: 1024,
@@ -19589,12 +19629,27 @@ JAVA_VERSION="21.0.4"
 
         let plan = build_managed_java_runtime_download_plan(request, &directories)
             .expect("recommended runtime should plan");
+        let runtime_id = recommended_java_runtime_manifest()
+            .first()
+            .expect("recommendation should exist")
+            .runtime_id
+            .clone();
+        let archive_file_name = recommended_java_runtime_manifest()
+            .first()
+            .expect("recommendation should exist")
+            .archive_file_name
+            .as_deref()
+            .expect("recommendation should include an archive file name")
+            .to_owned();
 
-        assert_eq!(plan.version_id, "temurin-21-windows-x64");
+        assert_eq!(plan.version_id, runtime_id);
         assert_eq!(plan.items.len(), 1);
-        assert!(plan.items[0].destination.replace('\\', "/").ends_with(
-            "data/runtimes/temurin-21-windows-x64/downloads/temurin-21-windows-x64.zip"
-        ));
+        assert!(plan.items[0]
+            .destination
+            .replace('\\', "/")
+            .ends_with(&format!(
+                "data/runtimes/{runtime_id}/downloads/{archive_file_name}"
+            )));
     }
 
     #[test]
@@ -19892,7 +19947,7 @@ JAVA_VERSION="21.0.4"
         let _env = LauncherDirEnvGuard::isolated();
         let root = tempfile::tempdir().expect("tempdir should be available");
         env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
-        load_profiles().expect("profiles should seed");
+        seed_profiles_for_current_env(&[winterpack_profile_fixture()]);
 
         let before = current_unix_seconds();
         let updated =
@@ -21249,8 +21304,13 @@ JAVA_VERSION="21.0.4"
             log_dir: "C:/logs".to_owned(),
         };
 
-        let plan = build_install_auxiliary_download_plan("winterpack", &directories)
-            .expect("auxiliary plan should build");
+        let plan = build_install_auxiliary_download_plan_from_catalog(
+            "winterpack",
+            &demo_packs(),
+            &[winterpack_profile_fixture()],
+            &directories,
+        )
+        .expect("auxiliary plan should build");
 
         assert_eq!(plan.version_id, "winterpack");
         assert!(plan
@@ -21260,7 +21320,7 @@ JAVA_VERSION="21.0.4"
         assert!(plan
             .items
             .iter()
-            .any(|item| item.kind == DownloadKind::ModLoaderMetadata));
+            .any(|item| item.kind == DownloadKind::ModLoaderInstaller));
     }
 
     #[test]
@@ -22385,7 +22445,7 @@ JAVA_VERSION="21.0.4"
 
         assert_eq!(
             download_plan_summary_message(&plan),
-            "Resolved 2 artifact(s), 6 B known plus 1 unknown-size file."
+            "Resolved 2 file(s), 6 B known plus 1 unknown-size file."
         );
         assert_eq!(
             download_plan_size_label(&plan),
