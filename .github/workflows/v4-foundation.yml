@@ -47,8 +47,6 @@ on:
       - "docs/REWRITE_HANDOFF.md"
   push:
     branches:
-      - main
-      - dev
       - "codex/**"
     paths:
       - ".github/workflows/v4-foundation.yml"
