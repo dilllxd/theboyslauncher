@@ -37,6 +37,17 @@ test("home screen fits the configured desktop minimum width", async ({ page }) =
   expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.viewportWidth);
 });
 
+test("settings exposes stable and dev launcher update channels", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByRole("heading", { name: "Launcher updates" })).toBeVisible();
+  await expect(page.getByLabel("Launcher update channel").getByRole("button", { name: "Stable" })).toBeVisible();
+  await page.getByLabel("Launcher update channel").getByRole("button", { name: "Dev" }).click();
+  await expect(page.getByText("Dev installs as a separate signed app.")).toBeVisible();
+  await expect(page.getByText("Installed: Stable. Selected: Dev.")).toBeVisible();
+});
+
 test("backend pack refresh preserves native installed pack state", async ({ page }) => {
   await page.route("**/packs", async (route) => {
     await route.fulfill({

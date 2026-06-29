@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     ffi::OsString,
     fs,
@@ -1429,6 +1431,48 @@ async fn social_backend_status(
     Ok(backend.status().await)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+fn open_external_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://github.com/dilllxd/theboyslauncher/releases/download/") {
+        return Err("Only TheBoysLauncher release downloads can be opened.".to_owned());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Process",
+                &url,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("failed to open download: {error}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|error| format!("failed to open download: {error}"))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|error| format!("failed to open download: {error}"))?;
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_social_backend(
     backend: State<'_, SocialBackendService>,
@@ -2804,6 +2848,7 @@ pub fn run() {
             remove_minecraft_account,
             clear_minecraft_session,
             social_backend_status,
+            open_external_url,
             start_social_backend,
             stop_social_backend,
             launch_profile,

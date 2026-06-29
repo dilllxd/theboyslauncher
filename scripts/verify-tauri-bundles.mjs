@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -6,16 +6,34 @@ const repoRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const tauriConfigPath = join(repoRoot, "src-tauri", "tauri.conf.json");
 const tauriConfig = JSON.parse(readFileSync(tauriConfigPath, "utf8"));
 const version = tauriConfig.version;
+const productName = tauriConfig.productName;
+const manifestName = process.env.THEBOYS_UPDATER_MANIFEST_NAME || "latest.json";
 
 if (typeof version !== "string" || version.length === 0) {
   throw new Error("src-tauri/tauri.conf.json must define a bundle version");
 }
+if (typeof productName !== "string" || productName.length === 0) {
+  throw new Error("src-tauri/tauri.conf.json must define a productName");
+}
 
+if (!/^latest(?:-[a-z0-9-]+)?\.json$/.test(manifestName)) {
+  throw new Error(`Updater manifest name must look like latest.json or latest-dev.json; received ${manifestName}`);
+}
+
+const msiDir = join(repoRoot, "target", "release", "bundle", "msi");
+const nsisDir = join(repoRoot, "target", "release", "bundle", "nsis");
+const expectedManifest = join(repoRoot, "target", "release", "bundle", manifestName);
+const bundlePrefix = `${productName}_${version}_`;
+const msiName = existsSync(msiDir)
+  ? readdirSync(msiDir).find((name) => name.startsWith(bundlePrefix) && name.endsWith(".msi"))
+  : undefined;
+const setupName = existsSync(nsisDir)
+  ? readdirSync(nsisDir).find((name) => name.startsWith(bundlePrefix) && name.endsWith("-setup.exe"))
+  : undefined;
 const expectedBundles = [
-  join(repoRoot, "target", "release", "bundle", "msi", `TheBoysLauncher_${version}_x64_en-US.msi`),
-  join(repoRoot, "target", "release", "bundle", "nsis", `TheBoysLauncher_${version}_x64-setup.exe`),
+  msiName ? join(msiDir, msiName) : join(msiDir, `${bundlePrefix}x64_en-US.msi`),
+  setupName ? join(nsisDir, setupName) : join(nsisDir, `${bundlePrefix}x64-setup.exe`),
 ];
-const expectedManifest = join(repoRoot, "target", "release", "bundle", "latest.json");
 
 const missing = [];
 for (const bundle of expectedBundles) {
@@ -41,7 +59,7 @@ const manifest = JSON.parse(readFileSync(expectedManifest, "utf8"));
 if (manifest.version !== version) {
   throw new Error(`Updater manifest version ${manifest.version} does not match Tauri version ${version}`);
 }
-if (typeof manifest.url !== "string" || !manifest.url.endsWith(`TheBoysLauncher_${version}_x64-setup.exe`)) {
+if (typeof manifest.url !== "string" || !setupName || !manifest.url.endsWith(setupName)) {
   throw new Error("Updater manifest must point at the Windows NSIS setup executable");
 }
 if (typeof manifest.signature !== "string" || manifest.signature.trim().length === 0) {

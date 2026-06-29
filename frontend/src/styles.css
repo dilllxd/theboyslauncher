@@ -1885,6 +1885,48 @@ h1 {
   white-space: nowrap;
 }
 
+.update-channel-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.update-channel-row button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.update-channel-row button:hover:not(:disabled),
+.update-channel-row button.selected {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.update-channel-row button.selected {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent), transparent 58%);
+}
+
+.update-channel-row button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.settings-helper-text {
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .settings-account-list {
   display: grid;
   gap: 8px;

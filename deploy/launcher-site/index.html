@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="TheBoysLauncher is a social Minecraft launcher for modpacks, friends, Java setup, and automatic updates."
+    />
+    <title>TheBoysLauncher</title>
+    <link rel="icon" href="/assets/icon.ico" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="TheBoysLauncher home">
+        <img src="/assets/icon.ico" alt="" />
+        <span>TheBoys<span>Launcher</span></span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#downloads">Downloads</a>
+        <a href="#status">Status</a>
+        <a href="https://github.com/dilllxd/theboyslauncher">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Social Minecraft launcher</p>
+          <h1>Minecraft with your friends, without the setup spiral.</h1>
+          <p class="lede">
+            TheBoysLauncher handles modpacks, Java, assets, accounts, and friend presence so new PC players can just
+            open the launcher and play.
+          </p>
+          <div class="hero-actions">
+            <a class="primary-action" id="stable-download" href="https://github.com/dilllxd/theboyslauncher/releases/latest">
+              Download Stable
+            </a>
+            <a class="secondary-action" id="dev-download" href="https://github.com/dilllxd/theboyslauncher/releases/tag/dev-latest">
+              Try Dev Build
+            </a>
+          </div>
+          <p class="download-note" id="download-note">Stable is recommended for most players. Dev gets fixes first.</p>
+        </div>
+        <div class="hero-preview" aria-label="TheBoysLauncher app preview">
+          <img src="/assets/launcher-site-preview.png" alt="Dark TheBoysLauncher app preview" />
+        </div>
+      </section>
+
+      <section class="feature-grid" id="features" aria-label="Launcher features">
+        <article>
+          <span class="feature-icon">1</span>
+          <h2>One-click modpacks</h2>
+          <p>Browse, install, update, and play curated packs without zip files, folders, or manual setup.</p>
+        </article>
+        <article>
+          <span class="feature-icon">2</span>
+          <h2>Smart Java and assets</h2>
+          <p>The launcher picks the right Java and prepares Minecraft files in the background before play.</p>
+        </article>
+        <article>
+          <span class="feature-icon">3</span>
+          <h2>Friends built in</h2>
+          <p>See who is online, what they are playing, and jump into shared sessions from the launcher.</p>
+        </article>
+      </section>
+
+      <section class="downloads-panel" id="downloads">
+        <div class="section-heading">
+          <p class="eyebrow">Downloads</p>
+          <h2>Pick the right channel.</h2>
+        </div>
+        <div class="download-cards">
+          <article class="download-card recommended">
+            <span class="badge">Recommended</span>
+            <h3>Stable</h3>
+            <p>Rock solid and ready for normal play.</p>
+            <ul>
+              <li>Automatic launcher updates</li>
+              <li>Best for most players</li>
+              <li>Receives tested releases</li>
+            </ul>
+            <a class="primary-action" id="stable-card-download" href="https://github.com/dilllxd/theboyslauncher/releases/latest">
+              Download Stable
+            </a>
+          </article>
+          <article class="download-card">
+            <span class="badge dev">Beta</span>
+            <h3>Dev</h3>
+            <p>For testing fixes and new launcher features early.</p>
+            <ul>
+              <li>New changes first</li>
+              <li>Separate signed app install</li>
+              <li>May include unfinished work</li>
+            </ul>
+            <a class="secondary-action" id="dev-card-download" href="https://github.com/dilllxd/theboyslauncher/releases/tag/dev-latest">
+              Try Dev Build
+            </a>
+          </article>
+        </div>
+      </section>
+
+      <section class="status-panel" id="status">
+        <div>
+          <p class="eyebrow">Status</p>
+          <h2>Hosted launcher services</h2>
+          <p>Friend presence and social features are hosted for players. The desktop app only runs what it needs to play.</p>
+        </div>
+        <div class="status-list">
+          <div><span></span>Social backend <strong id="backend-status">Checking</strong></div>
+          <div><span></span>Stable updates <strong id="stable-version">Checking</strong></div>
+          <div><span></span>Dev updates <strong id="dev-version">Checking</strong></div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>TheBoysLauncher</span>
+      <a href="https://github.com/dilllxd/theboyslauncher">GitHub</a>
+    </footer>
+
+    <script>
+      const manifests = {
+        stable: "https://github.com/dilllxd/theboyslauncher/releases/latest/download/latest.json",
+        dev: "https://github.com/dilllxd/theboyslauncher/releases/download/dev-latest/latest-dev.json",
+      };
+
+      async function readManifest(channel) {
+        const response = await fetch(manifests[channel], { cache: "no-store" });
+        if (!response.ok) throw new Error(`${channel} manifest returned ${response.status}`);
+        const manifest = await response.json();
+        if (!manifest.url || !manifest.version) throw new Error(`${channel} manifest is incomplete`);
+        return manifest;
+      }
+
+      async function wireDownloads() {
+        const stableButtons = [document.querySelector("#stable-download"), document.querySelector("#stable-card-download")];
+        const devButtons = [document.querySelector("#dev-download"), document.querySelector("#dev-card-download")];
+        try {
+          const stable = await readManifest("stable");
+          stableButtons.forEach((button) => (button.href = stable.url));
+          document.querySelector("#stable-version").textContent = stable.version;
+        } catch {
+          document.querySelector("#stable-version").textContent = "Release page";
+        }
+        try {
+          const dev = await readManifest("dev");
+          devButtons.forEach((button) => (button.href = dev.url));
+          document.querySelector("#dev-version").textContent = dev.version;
+        } catch {
+          document.querySelector("#dev-version").textContent = "Release page";
+        }
+      }
+
+      async function checkBackend() {
+        try {
+          const response = await fetch("/health", { cache: "no-store" });
+          document.querySelector("#backend-status").textContent = response.ok ? "Online" : "Degraded";
+        } catch {
+          document.querySelector("#backend-status").textContent = "Offline";
+        }
+      }
+
+      void wireDownloads();
+      void checkBackend();
+    </script>
+  </body>
+</html>

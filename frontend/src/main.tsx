@@ -33,6 +33,16 @@ import "./styles.css";
 
 type ActivityMode = "overview" | "processes" | "events";
 
+const CURRENT_UPDATE_CHANNEL: LauncherUpdateChannel =
+  import.meta.env.VITE_THEBOYS_RELEASE_CHANNEL === "dev" ? "dev" : "stable";
+
+const UPDATE_MANIFEST_ENDPOINTS: Record<LauncherUpdateChannel, string> = {
+  stable: "https://github.com/dilllxd/theboyslauncher/releases/latest/download/latest.json",
+  dev: "https://github.com/dilllxd/theboyslauncher/releases/download/dev-latest/latest-dev.json",
+};
+
+const RELEASE_DOWNLOAD_PREFIX = "https://github.com/dilllxd/theboyslauncher/releases/download/";
+
 type LauncherSettings = {
   maxMemoryMb: number;
   minMemoryMb: number;
@@ -66,6 +76,16 @@ type LauncherUpdateState = {
   version?: string;
   downloadedBytes?: number;
   totalBytes?: number;
+};
+
+type LauncherUpdateChannel = "stable" | "dev";
+
+type LauncherUpdateManifest = {
+  version: string;
+  notes?: string;
+  pub_date?: string;
+  url: string;
+  signature?: string;
 };
 
 type ActionReceipt = {
@@ -1362,6 +1382,26 @@ function socialBackendAddress(status: SocialBackendStatus) {
   return status.endpointUrl || status.bindAddr;
 }
 
+function updateChannelLabel(channel: LauncherUpdateChannel) {
+  return channel === "dev" ? "Dev" : "Stable";
+}
+
+function updateChannelInstallLabel(channel: LauncherUpdateChannel) {
+  return channel === "dev" ? "Open Dev installer" : "Open Stable installer";
+}
+
+async function fetchUpdateManifest(channel: LauncherUpdateChannel) {
+  const response = await fetch(UPDATE_MANIFEST_ENDPOINTS[channel], { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Update manifest returned ${response.status}`);
+  }
+  const manifest = (await response.json()) as LauncherUpdateManifest;
+  if (!manifest.version || !manifest.url || !manifest.url.startsWith(RELEASE_DOWNLOAD_PREFIX)) {
+    throw new Error("Update manifest is missing a trusted installer URL");
+  }
+  return manifest;
+}
+
 function socialBackendAvailability(status: SocialBackendStatus) {
   if (status.running) return "Reachable";
   return status.endpointKind === "hosted" ? "Hosted offline" : "Offline";
@@ -1481,6 +1521,9 @@ function App() {
     message: "Updates are checked automatically.",
   });
   const [availableLauncherUpdate, setAvailableLauncherUpdate] = useState<Update | null>(null);
+  const [selectedUpdateChannel, setSelectedUpdateChannel] =
+    useState<LauncherUpdateChannel>(CURRENT_UPDATE_CHANNEL);
+  const [availableChannelManifest, setAvailableChannelManifest] = useState<LauncherUpdateManifest | null>(null);
   const [launcherEvents, setLauncherEvents] = useState<LauncherEvent[]>([]);
   const [managedProcesses, setManagedProcesses] = useState<ManagedProcessSummary[]>([]);
   const [lastProcessLogExport, setLastProcessLogExport] = useState<ProcessLogExport | null>(null);
@@ -3303,22 +3346,37 @@ function App() {
     }
   }
 
-  async function checkForLauncherUpdate(silent = false) {
+  async function checkForLauncherUpdate(silent = false, channel = selectedUpdateChannel) {
     if (!silent) {
       setActivity("Checking for launcher updates");
     }
-    setLauncherUpdateState({ status: "checking", message: "Checking for updates..." });
+    setSelectedUpdateChannel(channel);
+    setLauncherUpdateState({
+      status: "checking",
+      message: `Checking ${updateChannelLabel(channel)} updates...`,
+    });
     try {
+      if (channel !== CURRENT_UPDATE_CHANNEL) {
+        const manifest = await fetchUpdateManifest(channel);
+        setAvailableLauncherUpdate(null);
+        setAvailableChannelManifest(manifest);
+        const message = `${updateChannelLabel(channel)} build ${manifest.version} is ready. Installing will open the signed installer.`;
+        setLauncherUpdateState({ status: "available", message, version: manifest.version });
+        if (!silent) setActivity(message);
+        return null;
+      }
+
+      setAvailableChannelManifest(null);
       const update = await check();
       setAvailableLauncherUpdate(update);
       if (update) {
-        const message = `Version ${update.version} is ready to install.`;
+        const message = `${updateChannelLabel(channel)} version ${update.version} is ready to install.`;
         setLauncherUpdateState({ status: "available", message, version: update.version });
         if (!silent) setActivity(message);
         return update;
       }
-      setLauncherUpdateState({ status: "current", message: "The launcher is up to date." });
-      if (!silent) setActivity("The launcher is up to date");
+      setLauncherUpdateState({ status: "current", message: `${updateChannelLabel(channel)} is up to date.` });
+      if (!silent) setActivity(`${updateChannelLabel(channel)} is up to date`);
       return null;
     } catch (error) {
       const message = nativeFailureActivity(error, "Update check is unavailable right now");
@@ -3330,9 +3388,32 @@ function App() {
 
   async function installLauncherUpdate() {
     setActivity("Installing launcher update");
+    if (selectedUpdateChannel !== CURRENT_UPDATE_CHANNEL) {
+      try {
+        const manifest = availableChannelManifest ?? (await fetchUpdateManifest(selectedUpdateChannel));
+        setAvailableChannelManifest(manifest);
+        setLauncherUpdateState({
+          status: "ready",
+          message: `${updateChannelLabel(selectedUpdateChannel)} build ${manifest.version} installer is opening.`,
+          version: manifest.version,
+        });
+        if (isNative) {
+          await invoke("open_external_url", { url: manifest.url });
+        } else {
+          window.open(manifest.url, "_blank", "noopener,noreferrer");
+        }
+        setActivity(`${updateChannelLabel(selectedUpdateChannel)} installer opened`);
+      } catch (error) {
+        const message = nativeFailureActivity(error, `${updateChannelLabel(selectedUpdateChannel)} installer could not be opened`);
+        setLauncherUpdateState({ status: "error", message });
+        setActivity(message);
+      }
+      return;
+    }
+
     let update = availableLauncherUpdate;
     if (!update) {
-      update = await checkForLauncherUpdate(true);
+      update = await checkForLauncherUpdate(true, selectedUpdateChannel);
     }
     if (!update) {
       setActivity("No launcher update is available");
@@ -5536,6 +5617,32 @@ function App() {
                         ? "Check failed"
                         : "Launcher updates"}
                 </h3>
+                <div className="update-channel-row" aria-label="Launcher update channel">
+                  {(["stable", "dev"] as LauncherUpdateChannel[]).map((channel) => (
+                    <button
+                      key={channel}
+                      className={channel === selectedUpdateChannel ? "selected" : ""}
+                      disabled={launcherUpdateState.status === "checking" || launcherUpdateState.status === "downloading"}
+                      onClick={() => {
+                        setSelectedUpdateChannel(channel);
+                        setAvailableLauncherUpdate(null);
+                        setAvailableChannelManifest(null);
+                        setLauncherUpdateState({
+                          status: "idle",
+                          message:
+                            channel === CURRENT_UPDATE_CHANNEL
+                              ? `${updateChannelLabel(channel)} is the installed channel.`
+                              : `${updateChannelLabel(channel)} installs as a separate signed app.`,
+                        });
+                      }}
+                    >
+                      {updateChannelLabel(channel)}
+                    </button>
+                  ))}
+                </div>
+                <p className="settings-helper-text">
+                  Installed: {updateChannelLabel(CURRENT_UPDATE_CHANNEL)}. Selected: {updateChannelLabel(selectedUpdateChannel)}.
+                </p>
                 <p>{launcherUpdateState.message}</p>
                 {launcherUpdateState.status === "downloading" && launcherUpdateState.totalBytes && (
                   <div className="connection-progress" aria-label="Launcher update progress">
@@ -5550,7 +5657,7 @@ function App() {
                   <button
                     className="secondary-button"
                     disabled={launcherUpdateState.status === "checking" || launcherUpdateState.status === "downloading"}
-                    onClick={() => checkForLauncherUpdate()}
+                    onClick={() => checkForLauncherUpdate(false, selectedUpdateChannel)}
                   >
                     <RefreshCw size={18} />
                     Check
@@ -5558,7 +5665,7 @@ function App() {
                   {launcherUpdateState.status === "available" && (
                     <button className="primary-button" onClick={installLauncherUpdate}>
                       <Download size={18} />
-                      Install
+                      {selectedUpdateChannel === CURRENT_UPDATE_CHANNEL ? "Install" : updateChannelInstallLabel(selectedUpdateChannel)}
                     </button>
                   )}
                 </div>
