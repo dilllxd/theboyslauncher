@@ -1177,6 +1177,8 @@ Latest vanilla snapshot gap follow-up: the `415` worker passed `19w09a` through 
 
 Latest setup wording core cleanup: the launcher core now emits `Setup queued for ...` and `Setup is ready to start.` for `repair_profile` operation plans instead of sending new native logs through user-facing repair wording first. The renderer still sanitizes older cached `Repair queued`/`Repair plan` logs as a fallback, and its local-plan supersede logic now recognizes the new setup-ready message so failed native setup events replace stale synthetic `Setup is running` sidebar state. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "failed native repair surfaces|home repair action shows pending native repair state|terminal repair event"` and `npm run build`. A focused Rust unit rerun was deferred until the active live vanilla compatibility cargo processes release the Windows test binary.
 
+Latest verification refresh: while the remaining compatibility lanes continued, a broad Rust workspace check passed in an isolated target directory with `CARGO_TARGET_DIR=target/codex-workspace-check cargo check --workspace`, avoiding the live-smoke workers' Windows test-binary locks. Release packaging checks still pass: `npm run verify:tauri-security` and `npm run verify:tauri-bundles` both succeeded. The remaining active vanilla snapshot lanes at the time of this note were `350-414` and `555-614`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
