@@ -32,11 +32,11 @@ use shared::{
     ManagedProcessSummary, MicrosoftAuthCallback, MicrosoftAuthStart, MicrosoftOAuthTokens,
     MicrosoftTokenExchangePlan, MicrosoftTokenFormField, MinecraftEntitlementItem,
     MinecraftEntitlements, MinecraftProfile, MinecraftServicesToken, MinecraftSession,
-    MinecraftVersionSummary, MinecraftVersionType, ModLoader, ModpackCatalogEntry, OperationPlan,
-    PackStatus, PackSummary, ProcessCommandSpec, ProcessEnvVar, ProcessLogExport,
-    ProcessOutputLine, ProcessOutputStream, ProcessStartResult, ProfileResolution, ProfileSummary,
-    ServerLaunchTarget, StoredMinecraftAccountSummary, StoredMinecraftSession,
-    UpdateProfileRequest, XboxLiveAuthToken,
+    MinecraftVersionSummary, MinecraftVersionType, ModLoader, ModpackCatalogEntry,
+    ModrinthModpackArchiveResolution, ModrinthModpackSearchResult, OperationPlan, PackStatus,
+    PackSummary, ProcessCommandSpec, ProcessEnvVar, ProcessLogExport, ProcessOutputLine,
+    ProcessOutputStream, ProcessStartResult, ProfileResolution, ProfileSummary, ServerLaunchTarget,
+    StoredMinecraftAccountSummary, StoredMinecraftSession, UpdateProfileRequest, XboxLiveAuthToken,
 };
 use uuid::Uuid;
 
@@ -59,6 +59,9 @@ const MINECRAFT_LOGIN_WITH_XBOX_URL: &str =
 const MINECRAFT_ENTITLEMENTS_URL: &str = "https://api.minecraftservices.com/entitlements/mcstore";
 const MINECRAFT_PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
 const REMOTE_MODPACK_CATALOG_URL: &str = "https://modpacks.dylan.lol/modpacks.json";
+const MODRINTH_SEARCH_URL: &str = "https://api.modrinth.com/v2/search";
+const MODRINTH_PROJECT_API_URL: &str = "https://api.modrinth.com/v2/project";
+const THEBOYS_USER_AGENT: &str = "TheBoysLauncher/4.0.0-alpha.0";
 const JAVA_RUNTIME_MANIFEST_URL_ENV: &str = "THEBOYS_JAVA_RUNTIME_MANIFEST_URL";
 const PROCESS_OUTPUT_CAPACITY: usize = 1000;
 const JAVA_ARG_FILE_THRESHOLD_CHARS: usize = 24_000;
@@ -7966,6 +7969,135 @@ fn packwiz_metafile_download_hashes(
     }
 }
 
+pub async fn search_modrinth_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<ModrinthModpackSearchResult>> {
+    let query = query.as_ref().trim();
+    let limit = limit.clamp(1, 24).to_string();
+    let facets = serde_json::to_string(&vec![vec!["project_type:modpack"]])?;
+    let mut url = reqwest::Url::parse(MODRINTH_SEARCH_URL)?;
+    url.query_pairs_mut()
+        .append_pair("query", query)
+        .append_pair("limit", &limit)
+        .append_pair(
+            "index",
+            if query.is_empty() {
+                "downloads"
+            } else {
+                "relevance"
+            },
+        )
+        .append_pair("facets", &facets);
+
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Modrinth search request failed with HTTP {status}"
+    );
+    modrinth_search_results_from_json(&body)
+}
+
+pub async fn resolve_modrinth_modpack_archive(
+    project_id: impl AsRef<str>,
+) -> Result<ModrinthModpackArchiveResolution> {
+    let project_id = project_id.as_ref().trim();
+    ensure_modrinth_identifier(project_id, "Modrinth project id")?;
+    let url = format!("{MODRINTH_PROJECT_API_URL}/{project_id}/version");
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Modrinth project '{project_id}' versions request failed with HTTP {status}"
+    );
+    modrinth_archive_resolution_from_versions_json(project_id, &body)
+}
+
+fn modrinth_search_results_from_json(json_text: &str) -> Result<Vec<ModrinthModpackSearchResult>> {
+    let response = serde_json::from_str::<ModrinthSearchResponse>(json_text)?;
+    Ok(response
+        .hits
+        .into_iter()
+        .filter(|hit| hit.project_type.as_deref() == Some("modpack"))
+        .map(|hit| {
+            let mut loaders = hit
+                .categories
+                .into_iter()
+                .filter(|category| {
+                    matches!(category.as_str(), "fabric" | "forge" | "quilt" | "neoforge")
+                })
+                .collect::<Vec<_>>();
+            loaders.sort();
+            loaders.dedup();
+            ModrinthModpackSearchResult {
+                project_id: hit.project_id,
+                slug: hit.slug,
+                title: hit.title,
+                description: hit.description,
+                author: hit.author,
+                icon_url: hit.icon_url,
+                downloads: hit.downloads.unwrap_or_default(),
+                follows: hit.follows.unwrap_or_default(),
+                game_versions: hit.versions,
+                loaders,
+                latest_version_id: hit.latest_version,
+            }
+        })
+        .collect())
+}
+
+fn modrinth_archive_resolution_from_versions_json(
+    project_id: &str,
+    json_text: &str,
+) -> Result<ModrinthModpackArchiveResolution> {
+    let versions = serde_json::from_str::<Vec<ModrinthProjectVersionResponse>>(json_text)?;
+    for version in versions {
+        let selected = version
+            .files
+            .iter()
+            .find(|file| file.primary && file.filename.ends_with(".mrpack"))
+            .or_else(|| {
+                version
+                    .files
+                    .iter()
+                    .find(|file| file.filename.ends_with(".mrpack"))
+            });
+        if let Some(file) = selected {
+            ensure!(
+                file.url.starts_with("https://"),
+                "Modrinth archive URL must use HTTPS"
+            );
+            ensure_safe_path_segment(&file.filename, "Modrinth archive filename")?;
+            return Ok(ModrinthModpackArchiveResolution {
+                project_id: project_id.to_owned(),
+                version_id: version.id,
+                version_name: version.name,
+                file_name: file.filename.clone(),
+                url: file.url.clone(),
+                size: file.size,
+            });
+        }
+    }
+    Err(anyhow!(
+        "Modrinth project '{project_id}' has no downloadable .mrpack versions"
+    ))
+}
+
 async fn fetch_modrinth_packwiz_metafile_download_item(
     metafile_item: &DownloadItem,
     metafile: &PackwizMetafileToml,
@@ -11465,6 +11597,43 @@ struct PackwizMetafileModrinthUpdateToml {
     #[serde(default)]
     mod_id: Option<String>,
     version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ModrinthSearchResponse {
+    #[serde(default)]
+    hits: Vec<ModrinthSearchHit>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ModrinthSearchHit {
+    project_id: String,
+    #[serde(default)]
+    project_type: Option<String>,
+    slug: String,
+    title: String,
+    description: String,
+    author: String,
+    #[serde(default)]
+    icon_url: Option<String>,
+    #[serde(default)]
+    downloads: Option<u64>,
+    #[serde(default)]
+    follows: Option<u64>,
+    #[serde(default)]
+    versions: Vec<String>,
+    #[serde(default)]
+    categories: Vec<String>,
+    #[serde(default)]
+    latest_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ModrinthProjectVersionResponse {
+    id: String,
+    name: String,
+    #[serde(default)]
+    files: Vec<ModrinthVersionFile>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -16871,6 +17040,119 @@ hash = "1234"
 "#,
         );
         assert!(unsupported_hash.is_err());
+    }
+
+    #[test]
+    fn modrinth_search_results_keep_modpack_hits_and_loader_summary() {
+        let results = modrinth_search_results_from_json(
+            r#"{
+              "hits": [
+                {
+                  "project_id": "5FFgwNNP",
+                  "project_type": "modpack",
+                  "slug": "cobblemon-fabric",
+                  "author": "CobbledStudios",
+                  "title": "Cobblemon Official Modpack [Fabric]",
+                  "description": "The official modpack of the Cobblemon mod, for Fabric!",
+                  "categories": ["adventure", "fabric", "multiplayer", "fabric"],
+                  "versions": ["1.20.1", "1.21.1"],
+                  "downloads": 8260045,
+                  "follows": 2433,
+                  "icon_url": "https://cdn.modrinth.com/data/5FFgwNNP/icon.png",
+                  "latest_version": "Lydu1ZNo"
+                },
+                {
+                  "project_id": "sodium",
+                  "project_type": "mod",
+                  "slug": "sodium",
+                  "author": "JellySquid",
+                  "title": "Sodium",
+                  "description": "Not a modpack",
+                  "categories": ["fabric"],
+                  "versions": ["1.21.1"]
+                }
+              ],
+              "offset": 0,
+              "limit": 2,
+              "total_hits": 2
+            }"#,
+        )
+        .expect("search response should parse");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_id, "5FFgwNNP");
+        assert_eq!(results[0].title, "Cobblemon Official Modpack [Fabric]");
+        assert_eq!(results[0].loaders, vec!["fabric"]);
+        assert_eq!(results[0].game_versions, vec!["1.20.1", "1.21.1"]);
+        assert_eq!(results[0].latest_version_id.as_deref(), Some("Lydu1ZNo"));
+    }
+
+    #[test]
+    fn modrinth_archive_resolution_prefers_primary_mrpack_file() {
+        let resolution = modrinth_archive_resolution_from_versions_json(
+            "1KVo5zza",
+            r#"[
+              {
+                "id": "version-new",
+                "name": "New version",
+                "files": [
+                  {
+                    "url": "https://cdn.modrinth.com/data/1KVo5zza/versions/new/signature.zip",
+                    "filename": "signature.zip",
+                    "primary": true,
+                    "size": 100,
+                    "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+                  },
+                  {
+                    "url": "https://cdn.modrinth.com/data/1KVo5zza/versions/new/pack.mrpack",
+                    "filename": "pack.mrpack",
+                    "primary": false,
+                    "size": 2048,
+                    "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+                  }
+                ]
+              },
+              {
+                "id": "version-old",
+                "name": "Old version",
+                "files": [
+                  {
+                    "url": "https://cdn.modrinth.com/data/1KVo5zza/versions/old/old.mrpack",
+                    "filename": "old.mrpack",
+                    "primary": true,
+                    "size": 1024,
+                    "hashes": { "sha1": "cccccccccccccccccccccccccccccccccccccccc" }
+                  }
+                ]
+              }
+            ]"#,
+        )
+        .expect("version response should resolve an archive");
+
+        assert_eq!(resolution.project_id, "1KVo5zza");
+        assert_eq!(resolution.version_id, "version-new");
+        assert_eq!(resolution.file_name, "pack.mrpack");
+        assert_eq!(resolution.size, Some(2048));
+    }
+
+    #[test]
+    fn modrinth_archive_resolution_rejects_missing_archives() {
+        let error = modrinth_archive_resolution_from_versions_json(
+            "1KVo5zza",
+            r#"[{
+              "id": "version-new",
+              "name": "New version",
+              "files": [{
+                "url": "https://cdn.modrinth.com/data/1KVo5zza/versions/new/readme.txt",
+                "filename": "readme.txt",
+                "primary": true,
+                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+              }]
+            }]"#,
+        )
+        .expect_err("versions without .mrpack should fail");
+
+        assert!(error.to_string().contains("no downloadable .mrpack"));
     }
 
     #[test]

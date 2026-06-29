@@ -221,14 +221,29 @@ test("discover shows provider plan and archive install entry point", async ({ pa
   await expect(page.getByText("Browse providers, install packs, and keep setup automatic.")).toBeVisible();
   await expect(page.getByLabel("Discover providers")).toContainText("CurseForge");
   await expect(page.getByLabel("Discover providers")).toContainText("Modrinth");
-  await expect(page.getByText("Install Modrinth .mrpack archives now")).toBeVisible();
+  await expect(page.getByText("Search public Modrinth modpacks")).toBeVisible();
   await expect(page.getByLabel("Discover providers")).toContainText("ATLauncher");
   await expect(page.getByLabel("Discover providers")).toContainText("FTB Legacy");
   await expect(page.getByLabel("Pack name")).toHaveValue("Enigmatica 9 Expert");
   await expect(page.getByLabel("Archive URL")).toHaveValue(/Enigmatica9Expert-1\.27\.0\.zip/);
   await expect(page.getByText("CurseForge zip, Modrinth .mrpack")).toBeVisible();
 
-  await page.getByRole("button", { name: "Install", exact: true }).click();
+  await page.getByLabel("Discover providers").getByRole("button", { name: /Modrinth/ }).click();
+  await expect(page.getByLabel("Modrinth search")).toContainText("Live catalog");
+  await page.getByLabel("Modrinth search").getByRole("button", { name: "Search" }).click();
+  await expect(page.getByText("Showing preview Modrinth results.")).toBeVisible();
+  await expect(page.getByText("Fabulously Optimized")).toBeVisible();
+  await page
+    .getByLabel("Modrinth search")
+    .getByRole("button", { name: "Install" })
+    .first()
+    .click();
+  await expect(page.getByText("Modrinth installs require the desktop app")).toBeVisible();
+
+  await page
+    .locator(".discover-install-form")
+    .getByRole("button", { name: "Install", exact: true })
+    .click();
   await expect(page.getByText("Discover installs require the desktop app")).toBeVisible();
 });
 

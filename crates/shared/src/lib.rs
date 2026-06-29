@@ -751,6 +751,38 @@ pub struct InstallModpackArchiveRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ModrinthModpackSearchResult {
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub author: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+    pub downloads: u64,
+    pub follows: u64,
+    #[serde(default)]
+    pub game_versions: Vec<String>,
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModrinthModpackArchiveResolution {
+    pub project_id: String,
+    pub version_id: String,
+    pub version_name: String,
+    pub file_name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportPlan {
     pub profile_id: String,
     pub profile_name: String,

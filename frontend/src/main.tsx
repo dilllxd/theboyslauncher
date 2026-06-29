@@ -551,6 +551,29 @@ type DiscoverProvider = {
   summary: string;
 };
 
+type ModrinthModpackSearchResult = {
+  projectId: string;
+  slug: string;
+  title: string;
+  description: string;
+  author: string;
+  iconUrl?: string;
+  downloads: number;
+  follows: number;
+  gameVersions: string[];
+  loaders: string[];
+  latestVersionId?: string;
+};
+
+type ModrinthModpackArchiveResolution = {
+  projectId: string;
+  versionId: string;
+  versionName: string;
+  fileName: string;
+  url: string;
+  size?: number;
+};
+
 type AppSnapshot = {
   settings: LauncherSettings;
   directories: LauncherDirectories;
@@ -657,7 +680,7 @@ const discoverProviders: DiscoverProvider[] = [
     id: "modrinth",
     name: "Modrinth",
     status: "available",
-    summary: "Install Modrinth .mrpack archives now; searchable catalog support can follow.",
+    summary: "Search public Modrinth modpacks and install the latest .mrpack build.",
   },
   {
     id: "atlauncher",
@@ -1768,6 +1791,11 @@ function App() {
   );
   const [discoverArchiveName, setDiscoverArchiveName] = useState("Enigmatica 9 Expert");
   const [discoverInstallInProgress, setDiscoverInstallInProgress] = useState(false);
+  const [discoverSearchQuery, setDiscoverSearchQuery] = useState("optimization");
+  const [discoverSearchResults, setDiscoverSearchResults] = useState<ModrinthModpackSearchResult[]>([]);
+  const [discoverSearchStatus, setDiscoverSearchStatus] = useState("Search Modrinth for public modpacks.");
+  const [discoverSearchInProgress, setDiscoverSearchInProgress] = useState(false);
+  const [discoverInstallingProjectId, setDiscoverInstallingProjectId] = useState<string | null>(null);
   const [selectedPackDetailsId, setSelectedPackDetailsId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [activity, setActivity] = useState("Launcher ready");
@@ -3218,6 +3246,97 @@ function App() {
       }
       setImportInProgress(false);
     }
+  }
+
+  async function searchDiscoverModrinth(event?: React.FormEvent) {
+    event?.preventDefault();
+    if (discoverSearchInProgress) return;
+    setDiscoverProvider("modrinth");
+    setDiscoverSearchInProgress(true);
+    setDiscoverSearchStatus("Searching Modrinth...");
+    try {
+      const results = await invoke<ModrinthModpackSearchResult[]>("search_modrinth_modpacks", {
+        query: discoverSearchQuery.trim(),
+        limit: 12,
+      });
+      setDiscoverSearchResults(results);
+      setDiscoverSearchStatus(
+        results.length === 0 ? "No Modrinth modpacks found." : `Found ${results.length} Modrinth modpacks.`,
+      );
+    } catch (error) {
+      if (isNative) {
+        setDiscoverSearchStatus(nativeFailureActivity(error, "Modrinth search failed"));
+      } else {
+        const previewResults: ModrinthModpackSearchResult[] = [
+          {
+            projectId: "1KVo5zza",
+            slug: "fabulously-optimized",
+            title: "Fabulously Optimized",
+            description: "A fast client modpack focused on performance and smooth play.",
+            author: "robotkoer",
+            downloads: 12_000_000,
+            follows: 18_000,
+            gameVersions: ["1.21.8", "1.21.7", "1.21.6"],
+            loaders: ["fabric"],
+            latestVersionId: "preview",
+          },
+          {
+            projectId: "5FFgwNNP",
+            slug: "cobblemon-fabric",
+            title: "Cobblemon Official Modpack [Fabric]",
+            description: "The official Cobblemon modpack for Fabric.",
+            author: "CobbledStudios",
+            downloads: 8_000_000,
+            follows: 2_400,
+            gameVersions: ["1.21.1", "1.20.1"],
+            loaders: ["fabric"],
+            latestVersionId: "preview",
+          },
+        ];
+        setDiscoverSearchResults(previewResults);
+        setDiscoverSearchStatus("Showing preview Modrinth results.");
+      }
+    } finally {
+      setDiscoverSearchInProgress(false);
+    }
+  }
+
+  async function installModrinthSearchResult(result: ModrinthModpackSearchResult) {
+    if (discoverInstallInProgress || lifecycleActionInProgress) return;
+    setDiscoverProvider("modrinth");
+    setDiscoverInstallingProjectId(result.projectId);
+    setDiscoverInstallInProgress(true);
+    setActivity(`Preparing ${result.title}`);
+    if (isNative) {
+      try {
+        const resolution = await invoke<ModrinthModpackArchiveResolution>("resolve_modrinth_modpack_archive", {
+          projectId: result.projectId,
+        });
+        const receipt = await invoke<ActionReceipt>("install_modpack_archive", {
+          request: {
+            url: resolution.url,
+            name: result.title,
+          },
+        });
+        setActivity(receipt.message);
+        await Promise.all([loadBootstrapSnapshot(), loadLauncherEvents(true)]);
+        setActiveView("library");
+      } catch (error) {
+        setActivity(nativeFailureActivity(error, "Modrinth install failed"));
+        await loadLauncherEvents(true);
+        setActiveView("activity");
+        setActivityMode("events");
+      } finally {
+        setDiscoverInstallingProjectId(null);
+        setDiscoverInstallInProgress(false);
+      }
+      return;
+    }
+    window.setTimeout(() => {
+      setActivity("Modrinth installs require the desktop app");
+      setDiscoverInstallingProjectId(null);
+      setDiscoverInstallInProgress(false);
+    }, 350);
   }
 
   async function installDiscoveredArchive(event?: React.FormEvent) {
@@ -4943,17 +5062,77 @@ function App() {
                     </button>
                   ))}
                 </div>
+                {discoverProvider === "modrinth" && (
+                  <div className="discover-search-panel" aria-label="Modrinth search">
+                    <div className="discover-search-heading">
+                      <div>
+                        <span className="section-kicker">Modrinth</span>
+                        <h3>Search public modpacks</h3>
+                      </div>
+                      <span className="status-pill ready">Live catalog</span>
+                    </div>
+                    <form className="discover-search-form" onSubmit={searchDiscoverModrinth}>
+                      <label>
+                        <span>Search</span>
+                        <input
+                          value={discoverSearchQuery}
+                          onChange={(event) => setDiscoverSearchQuery(event.target.value)}
+                          placeholder="Optimization, Cobblemon, SkyFactory..."
+                        />
+                      </label>
+                      <button className="secondary-button" type="submit" disabled={discoverSearchInProgress}>
+                        <Search size={17} />
+                        {discoverSearchInProgress ? "Searching..." : "Search"}
+                      </button>
+                    </form>
+                    <span className="discover-search-status">{discoverSearchStatus}</span>
+                    <div className="discover-result-list">
+                      {discoverSearchResults.map((result) => {
+                        const installing = discoverInstallingProjectId === result.projectId;
+                        const versions = result.gameVersions.slice(0, 3).join(", ");
+                        const loaders = result.loaders.length > 0 ? result.loaders.join(", ") : "Modpack";
+                        return (
+                          <article className="discover-result-row" key={result.projectId}>
+                            <div className="discover-result-icon" aria-hidden="true">
+                              {result.iconUrl ? <img src={result.iconUrl} alt="" /> : result.title[0]}
+                            </div>
+                            <div>
+                              <strong>{result.title}</strong>
+                              <span>
+                                by {result.author} - {loaders}
+                                {versions ? ` - ${versions}` : ""}
+                              </span>
+                              <p>{result.description}</p>
+                              <span className="muted-line">
+                                {result.downloads.toLocaleString()} downloads - {result.follows.toLocaleString()} follows
+                              </span>
+                            </div>
+                            <button
+                              className="primary-button compact"
+                              disabled={discoverInstallInProgress || lifecycleActionInProgress}
+                              onClick={() => installModrinthSearchResult(result)}
+                              type="button"
+                            >
+                              <Download size={16} />
+                              {installing ? "Installing..." : "Install"}
+                            </button>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </section>
               <aside className="discover-side">
                 <span className="section-kicker">Provider plan</span>
                 <h3>{discoverProviders.find((provider) => provider.id === discoverProvider)?.name}</h3>
                 <p>
-                  Discover will grow into searchable tabs for ATLauncher, CurseForge, FTB, FTB Legacy,
-                  Modrinth, and Technic. Profile imports should later move into a first-run suggestion flow.
+                  Modrinth search can install public .mrpack builds now. CurseForge archives can be
+                  pasted above, and ATLauncher, FTB, FTB Legacy, and Technic browsing can follow.
                 </p>
                 <div className="settings-mini-grid">
                   <Setting label="Archive imports" value="CurseForge zip, Modrinth .mrpack" />
-                  <Setting label="Search catalogs" value="Next slice" />
+                  <Setting label="Search catalogs" value="Modrinth live" />
                   <Setting label="Mod downloads" value="Parallel" />
                   <Setting label="Java" value="Automatic" />
                 </div>

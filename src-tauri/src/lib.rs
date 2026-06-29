@@ -74,8 +74,10 @@ use launcher_core::{
     refresh_saved_minecraft_session as core_refresh_saved_minecraft_session,
     remove_minecraft_account as core_remove_minecraft_account,
     resolve_minecraft_version as core_resolve_minecraft_version,
+    resolve_modrinth_modpack_archive as core_resolve_modrinth_modpack_archive,
     save_minecraft_session as core_save_minecraft_session, save_settings as core_save_settings,
-    scan_imports as core_scan_imports, select_minecraft_account as core_select_minecraft_account,
+    scan_imports as core_scan_imports, search_modrinth_modpacks as core_search_modrinth_modpacks,
+    select_minecraft_account as core_select_minecraft_account,
     start_microsoft_auth_flow as core_start_microsoft_auth_flow,
     start_microsoft_login as core_start_microsoft_login, update_profile as core_update_profile,
     LauncherEventLog, ProcessRegistry,
@@ -89,8 +91,9 @@ use shared::{
     LauncherEvent, LauncherEventKind, LauncherOperation, LauncherSettings, ManagedProcessSummary,
     MicrosoftAuthCallback, MicrosoftAuthStart, MicrosoftOAuthTokens, MicrosoftTokenExchangePlan,
     MinecraftEntitlements, MinecraftProfile, MinecraftServicesToken, MinecraftSession,
-    MinecraftVersionSummary, OperationPlan, ProcessCommandSpec, ProcessLogExport, ProfileSummary,
-    ServerLaunchTarget, SocialBackendStatus, StoredMinecraftAccountSummary, StoredMinecraftSession,
+    MinecraftVersionSummary, ModrinthModpackArchiveResolution, ModrinthModpackSearchResult,
+    OperationPlan, ProcessCommandSpec, ProcessLogExport, ProfileSummary, ServerLaunchTarget,
+    SocialBackendStatus, StoredMinecraftAccountSummary, StoredMinecraftSession,
     UpdateProfileRequest, XboxLiveAuthToken,
 };
 use tauri::{Emitter, Manager, State};
@@ -2448,6 +2451,25 @@ async fn install_modpack_archive(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+async fn search_modrinth_modpacks(
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<ModrinthModpackSearchResult>, String> {
+    core_search_modrinth_modpacks(query, limit.unwrap_or(12))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn resolve_modrinth_modpack_archive(
+    project_id: String,
+) -> Result<ModrinthModpackArchiveResolution, String> {
+    core_resolve_modrinth_modpack_archive(project_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
 async fn install_pack(
     pack_id: String,
     registry: State<'_, ProcessRegistry>,
@@ -3066,6 +3088,8 @@ pub fn run() {
             export_managed_process_log,
             reveal_exported_process_log,
             install_modpack_archive,
+            search_modrinth_modpacks,
+            resolve_modrinth_modpack_archive,
             install_pack,
             plan_install_pack,
             repair_profile,
