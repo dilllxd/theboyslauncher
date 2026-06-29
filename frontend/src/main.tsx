@@ -1870,7 +1870,7 @@ function App() {
     listen<LauncherEvent>("launcher-event", (event) => {
       setLauncherEvents((current) => mergeLauncherEvents(current, [event.payload]));
       reconcileCompletedLifecycleEvent(event.payload);
-      setActivity(event.payload.message);
+      setActivity(sidebarStatusMessage(event.payload, event.payload.message));
     }).then((cleanup) => {
       unlistenLauncherEvent = cleanup;
     });

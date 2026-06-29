@@ -1237,6 +1237,8 @@ Latest sidebar download-progress polish: the bottom-left live install/download s
 
 Latest Activity file-progress summary polish: Activity Overview's compact `Latest file progress` line now uses friendly file categories such as `pack files` instead of exposing the current raw pack/mod/asset filename. The collapsed `View details` section still contains exact download event names and percentages for troubleshooting. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity screen loads event log fallback|live file download events surface|pending native install polls launcher events"` and `npm run build`.
 
+Latest native event-push status polish: native `launcher-event` pushes now route their fallback bottom-left activity text through the same user-facing formatter used by the sidebar instead of writing raw event messages directly. This keeps pushed setup/download/process events consistent with the newer friendly status wording while Activity details still retain exact event rows. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "live file download events surface|terminal repair event clears stuck native repair busy state|stopping a native process keeps playing presence"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
