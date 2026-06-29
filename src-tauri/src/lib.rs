@@ -2421,6 +2421,29 @@ async fn repair_profile(
     }
 }
 
+#[tauri::command(rename_all = "camelCase")]
+async fn prepare_profile(
+    profile_id: String,
+    registry: State<'_, ProcessRegistry>,
+    event_log: State<'_, LauncherEventLog>,
+    lifecycle_gate: State<'_, LifecycleOperationGate>,
+) -> Result<ActionReceipt, String> {
+    let _lifecycle_guard = lifecycle_gate.acquire(format!("preparing profile '{profile_id}'"))?;
+    if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
+        return Err(profile_repair_active_process_error(&profile_id, &process));
+    }
+    repair_profile_inner(profile_id.clone(), &event_log)
+        .await
+        .map(|_| {
+            completed_action_receipt(
+                LauncherAction::RepairProfile,
+                profile_id,
+                "Profile setup completed.",
+            )
+        })
+        .map_err(|error| native_operation_failure_message("Profile setup failed", &error.message))
+}
+
 async fn repair_profile_inner(
     profile_id: String,
     event_log: &LauncherEventLog,
@@ -2868,6 +2891,7 @@ pub fn run() {
             install_pack,
             plan_install_pack,
             repair_profile,
+            prepare_profile,
             plan_repair_profile,
             list_launcher_events,
             create_profile,

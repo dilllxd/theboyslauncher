@@ -3573,7 +3573,29 @@ function App() {
       const profile = await invoke<ProfileSummary>("create_profile", { request });
       await loadBootstrapSnapshot();
       setProfileCreatorOpen(false);
-      setActivity(`${profile.name} created`);
+      setActivity(`${profile.name} created. Setting up files...`);
+      if (isNative) {
+        setRepairInProgressProfileId(profile.id);
+        setLifecycleActionInProgressKey(`repair:${profile.id}`);
+        lifecycleActionInProgressRef.current = `repair:${profile.id}`;
+        try {
+          await invoke<ActionReceipt>("prepare_profile", { profileId: profile.id });
+          await loadBootstrapSnapshot();
+          await loadLauncherEvents(true).catch(() => undefined);
+          setActivity(`${profile.name} created and ready`);
+        } catch (setupError) {
+          await loadLauncherEvents(true).catch(() => undefined);
+          setActivity(nativeFailureActivity(setupError, `${profile.name} created; setup will retry on Play`));
+        } finally {
+          setRepairInProgressProfileId((current) => (current === profile.id ? null : current));
+          if (lifecycleActionInProgressRef.current === `repair:${profile.id}`) {
+            lifecycleActionInProgressRef.current = null;
+            setLifecycleActionInProgressKey(null);
+          }
+        }
+      } else {
+        setActivity(`${profile.name} created`);
+      }
     } catch (error) {
       if (isNative) {
         setActivity(nativeFailureActivity(error, "Creating profile failed"));

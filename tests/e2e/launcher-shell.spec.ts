@@ -2251,6 +2251,7 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
       gameVersion: string;
       memoryMb: number;
     } | null = null;
+    const invoked: string[] = [];
     let callbackId = 1;
     const callbacks = new Map<number, (...args: unknown[]) => unknown>();
     const snapshot = () => ({
@@ -2286,6 +2287,7 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       value: {
         invoke: async (cmd: string, args?: { request?: typeof createdProfile }) => {
+          invoked.push(cmd);
           if (cmd === "bootstrap_snapshot") return snapshot();
           if (cmd === "list_minecraft_versions") {
             return [
@@ -2320,6 +2322,16 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
               jvmArgs: [],
             };
           }
+          if (cmd === "prepare_profile") {
+            return {
+              id: "receipt-prepare-native-created",
+              action: "repair_profile",
+              subjectId: "native-created",
+              status: "completed",
+              message: "Profile setup completed.",
+            };
+          }
+          if (cmd === "list_launcher_events") return [];
           if (cmd === "social_backend_status") {
             return {
               bindAddr: "127.0.0.1:4074",
@@ -2344,6 +2356,10 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
       },
       configurable: true,
     });
+    Object.defineProperty(window, "__nativeCreateProfileInvokes", {
+      value: invoked,
+      configurable: true,
+    });
     Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
       value: {
         unregisterListener: () => undefined,
@@ -2364,11 +2380,14 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
   await page.getByLabel("New profile memory").fill("8192");
   await page.getByRole("button", { name: "Create" }).click();
 
-  await expect(page.getByText("Native Fabric created")).toBeVisible();
+  await expect(page.getByText("Native Fabric created and ready")).toBeVisible();
   const createdProfile = page.locator(".profile-row").filter({ hasText: "Native Fabric" });
   await expect(createdProfile.getByLabel("Native Fabric profile summary")).toContainText("26w01a");
   await expect(createdProfile.getByLabel("Native Fabric profile summary")).toContainText("fabric");
   await expect(createdProfile.getByLabel("Native Fabric profile summary")).toContainText("8 GB RAM");
+  const invoked = await page.evaluate(() => (window as typeof window & { __nativeCreateProfileInvokes: string[] }).__nativeCreateProfileInvokes);
+  expect(invoked.indexOf("create_profile")).toBeLessThan(invoked.indexOf("prepare_profile"));
+  expect(invoked.indexOf("bootstrap_snapshot", invoked.indexOf("prepare_profile"))).toBeGreaterThan(invoked.indexOf("prepare_profile"));
 });
 
 test("home screen replaces preview friends with social backend presence", async ({ page }) => {
