@@ -1443,11 +1443,8 @@ function userFacingLauncherEventMessage(message: string) {
     .replace(/^Repair plan is ready to execute\./i, "Setup is ready to start.")
     .replace(/^Profile repair completed\./i, "Files are ready.")
     .replace(/^Profile setup completed\./i, "Files are ready.")
-    .replace(/^(?:Error:\s*)?Profile repair failed:/i, "Setup failed:");
-}
-
-function userFacingNativeErrorMessage(message: string) {
-  return userFacingLauncherEventMessage(message)
+    .replace(/^(?:Error:\s*)?Profile repair failed:/i, "Setup failed:")
+    .replace(/^(?:Error:\s*)?Profile setup failed:/i, "Setup failed:")
     .replace(/^Automatic profile repair before launch failed:/i, "Automatic profile setup before launch failed:")
     .replace(/^launch artifact is missing:\s*asset index is missing\..*$/i, "Game files are missing. The launcher will set them up automatically.")
     .replace(/^launch artifact is missing:\s*natives directory is missing\..*$/i, "Game files are missing. The launcher will set them up automatically.")
@@ -1456,6 +1453,10 @@ function userFacingNativeErrorMessage(message: string) {
     .replace(/^natives directory is missing:.*$/i, "Game files are missing. The launcher will set them up automatically.")
     .replace(/\s*Install or repair the profile before launching\./i, " The launcher will set up missing files automatically.")
     .replace(/\brepair the profile\b/i, "set up the profile files");
+}
+
+function userFacingNativeErrorMessage(message: string) {
+  return userFacingLauncherEventMessage(message);
 }
 
 function summarizeArtifactOperation(events: LauncherEvent[]): ArtifactOperationSummary | undefined {

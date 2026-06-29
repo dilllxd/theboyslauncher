@@ -1247,6 +1247,8 @@ Latest fast Modrinth Discover smoke: added `npm run smoke:live:modrinth:discover
 
 Latest packaged executable refresh after Discover work: reran release-side verification after the Modrinth Discover/search additions. `npm run verify:tauri-security`, `npm run verify:package-resources`, `npm run verify:tauri-bundles`, `npm run build`, and `$env:CARGO_TARGET_DIR='target/codex-goal-check'; cargo check --workspace` all passed. Rebuilt the local release executable with `npx tauri build --no-bundle`; the current `target/release/theboyslauncher.exe` is `21,535,232` bytes and was modified `2026-06-29T18:39:48-04:00`. No `theboyslauncher`, `social-backend`, `java`, or `javaw` processes were left running afterward.
 
+Latest Activity cached setup-failure polish: the common launcher-event formatter now sanitizes cached/native launch-artifact setup failures, `Automatic profile repair before launch failed`, and `Profile setup failed` messages instead of leaving that cleanup only in direct native-error handling. This prevents Activity Overview/Events rows from showing raw `launch artifact is missing... Install or repair the profile before launching.` text after loading older event-log entries; they now show the same friendly `Game files are missing. The launcher will set them up automatically.` wording as the sidebar. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity event log sanitizes cached launch setup failures|failed native repair surfaces"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

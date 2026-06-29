@@ -9066,6 +9066,98 @@ test("native event log refresh failure preserves real activity state", async ({ 
   await expect(page.locator(".event-row").filter({ hasText: "Event log is mocked in web preview" })).toHaveCount(0);
 });
 
+test("activity event log sanitizes cached launch setup failures", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string) => {
+          if (cmd === "bootstrap_snapshot") {
+            return {
+              settings: {
+                maxMemoryMb: 6144,
+                minMemoryMb: 2048,
+                offlineUsername: "Player",
+                telemetryEnabled: false,
+              },
+              directories: {
+                dataDir: "C:/TheBoysLauncher/data",
+                configDir: "C:/TheBoysLauncher/config",
+                cacheDir: "C:/TheBoysLauncher/cache",
+                logDir: "C:/TheBoysLauncher/logs",
+              },
+              friends: [],
+              packs: [],
+              profiles: [
+                {
+                  id: "winterpack",
+                  name: "WinterPack",
+                  loader: "forge",
+                  gameVersion: "1.20.1",
+                  memoryMb: 6144,
+                  jvmArgs: [],
+                },
+              ],
+              imports: [],
+            };
+          }
+          if (cmd === "list_launcher_events") {
+            return [
+              {
+                id: "cached-launch-setup-failure",
+                operationId: "cached-launch-setup",
+                operation: "launch_profile",
+                subjectId: "winterpack",
+                kind: "failed",
+                message:
+                  "launch artifact is missing: asset index is missing. Install or repair the profile before launching.",
+                progressPercent: 100,
+                occurredAtUnixSeconds: 1_710_000_000,
+              },
+            ];
+          }
+          if (cmd === "list_managed_processes") return [];
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Social backend is not reachable; packaged binary can be started from Settings.",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Activity" }).click();
+
+  await expect(page.getByLabel("Launcher operations")).toContainText(
+    "Game files are missing. The launcher will set them up automatically.",
+  );
+  await expect(page.getByText("Install or repair")).toHaveCount(0);
+  await expect(page.getByText("launch artifact is missing")).toHaveCount(0);
+
+  await page.getByLabel("Activity views").getByRole("button", { name: "Events", exact: true }).click();
+  const cachedFailure = page.locator(".event-row").filter({ hasText: "Game files are missing" });
+  await expect(cachedFailure).toBeVisible();
+  await expect(cachedFailure).toContainText("Launch profile - winterpack");
+  await expect(cachedFailure.getByRole("button", { name: "Try play again" })).toBeVisible();
+});
+
 test("activity overview sorts operations by latest event update", async ({ page }) => {
   await page.addInitScript(() => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
