@@ -1910,6 +1910,7 @@ function App() {
   }, [query, snapshot.profiles]);
 
   const primaryPack = snapshot.packs[0];
+  const hasProfiles = snapshot.profiles.length > 0;
   const primaryPackNeedsInstall =
     primaryPack?.status === "not_installed" ||
     primaryPack?.status === "update_available" ||
@@ -1976,9 +1977,9 @@ function App() {
     return lifecycleActionLabel;
   };
   const primaryPackLifecycleBlocked = Boolean(primaryPack && profileLifecycleInProgress(primaryPack.id));
-  const PrimaryPackActionIcon = primaryPackCanPlay ? Play : Download;
+  const PrimaryPackActionIcon = primaryPack ? (primaryPackCanPlay ? Play : Download) : Gamepad2;
   const PrimaryPackSecondaryIcon = Search;
-  const primaryPackSecondaryLabel = "Details";
+  const primaryPackSecondaryLabel = primaryPack ? "Details" : "Discover packs";
   const selectedPackDetails = selectedPackDetailsId
     ? snapshot.packs.find((pack) => pack.id === selectedPackDetailsId)
     : undefined;
@@ -1992,7 +1993,7 @@ function App() {
             ? "Updating..."
             : "Installing..."
           : statusLabel(primaryPack.status)
-    : "Choose";
+    : "Create profile";
   const latestLauncherEvent = launcherOperationSummaries[0]?.latestEvent;
   const sidebarDownloadEvent = latestActiveDownloadEvent(launcherEvents);
   const sidebarActiveOperationEvent = launcherOperationSummaries.find(
@@ -3762,6 +3763,11 @@ function App() {
     setProfileCreatorOpen(true);
   }
 
+  function startFirstProfileSetup() {
+    setActiveView("library");
+    void openProfileCreator();
+  }
+
   function selectNewProfileVersionType(versionType: MinecraftVersionType) {
     const options = minecraftVersionsLoadFailed ? [] : minecraftVersionsForType(minecraftVersions, versionType);
     setNewProfileVersionType(versionType);
@@ -4638,13 +4644,16 @@ function App() {
                 <div className="hero-copy">
                   <div>
                     <span className="eyebrow">{heroEyebrow}</span>
-                    <h1>{primaryPack?.name ?? "Choose a pack"}</h1>
-                    <p>{primaryPack?.tagline ?? "Install a profile and jump in with everyone."}</p>
+                    <h1>{primaryPack?.name ?? "Set up Minecraft"}</h1>
+                    <p>
+                      {primaryPack?.tagline ??
+                        "Create a vanilla profile or discover a pack. The launcher will set up the files automatically."}
+                    </p>
                   </div>
                   <div className="hero-status" aria-label="Primary pack status">
-                    <span>{primaryPack ? statusLabel(primaryPack.status) : "Choose"}</span>
-                    <strong>{primaryPack?.defaultServer ?? "No server"}</strong>
-                    <span>{primaryPack?.version ?? "No version"}</span>
+                    <span>{primaryPack ? statusLabel(primaryPack.status) : "Ready"}</span>
+                    <strong>{primaryPack?.defaultServer ?? "No profiles yet"}</strong>
+                    <span>{primaryPack?.version ?? "Start here"}</span>
                   </div>
                   <div className="hero-stats" aria-label="Launcher overview">
                     <span>
@@ -4665,20 +4674,23 @@ function App() {
                   <button
                     className="primary-button"
                     disabled={
-                      !primaryPack ||
-                      primaryPackIsInstalling ||
-                      primaryPackIsRepairing ||
-                      primaryPackHasActiveProcess ||
-                      primaryPackLifecycleBlocked
+                      primaryPack
+                        ? primaryPackIsInstalling ||
+                          primaryPackIsRepairing ||
+                          primaryPackHasActiveProcess ||
+                          primaryPackLifecycleBlocked
+                        : false
                     }
                     onClick={() =>
-                      primaryPackNeedsRepair
-                        ? launchProfile(primaryPack?.id, primaryPack?.name)
-                        : primaryPack?.status === "installed"
-                          ? launchProfile(primaryPack?.id, primaryPack?.name)
-                          : primaryPackNeedsInstall && primaryPack
-                            ? installPack(primaryPack.id)
-                            : undefined
+                      primaryPack
+                        ? primaryPackNeedsRepair
+                          ? launchProfile(primaryPack.id, primaryPack.name)
+                          : primaryPack.status === "installed"
+                            ? launchProfile(primaryPack.id, primaryPack.name)
+                            : primaryPackNeedsInstall
+                              ? installPack(primaryPack.id)
+                              : undefined
+                        : startFirstProfileSetup()
                     }
                   >
                     <PrimaryPackActionIcon size={20} />
@@ -4686,13 +4698,11 @@ function App() {
                   </button>
                   <button
                     className="secondary-button"
-                    disabled={
-                      !primaryPack
-                    }
+                    disabled={false}
                     onClick={() =>
                       primaryPack
                         ? loadBackendPackDetails(primaryPack.id)
-                        : undefined
+                        : setActiveView("discover")
                     }
                   >
                     <PrimaryPackSecondaryIcon size={18} />
@@ -5092,7 +5102,18 @@ function App() {
                   deleteInProgress={deleteInProgressProfileId === profile.id}
                 />
               ))}
-              {filteredProfiles.length === 0 && (
+              {filteredProfiles.length === 0 && !hasProfiles && (
+                <div className="social-empty compact-empty">
+                  <Gamepad2 size={36} />
+                  <h3>No profiles yet</h3>
+                  <p>Create one and the launcher will set up the right Minecraft files automatically.</p>
+                  <button className="primary-button compact" onClick={startFirstProfileSetup}>
+                    <Gamepad2 size={16} />
+                    Create and set up profile
+                  </button>
+                </div>
+              )}
+              {filteredProfiles.length === 0 && hasProfiles && (
                 <div className="social-empty compact-empty">
                   <Search size={36} />
                   <h3>No profiles found</h3>

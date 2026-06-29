@@ -1213,6 +1213,8 @@ Latest Activity process polish: Activity > Processes no longer shows the full Ja
 
 Latest profile-creation setup clarity: the Library new-profile primary action now says `Create and set up` instead of plain `Create`, matching the native flow that immediately calls `prepare_profile` after profile creation. The action shows `Setting up...` while that new profile is in setup and remains disabled during setup, and the native/web-preview/profile-version-failure Playwright coverage now targets the clearer label. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "creating a profile refreshes|profile creator blocks|library new profile action"` and `npm run build`.
 
+Latest first-run empty-state polish: Home no longer shows disabled `Choose`/`Details` actions when the launcher has no packs or profiles. The empty Home hero now offers `Create profile` and `Discover packs`, and Library distinguishes a truly empty launcher (`No profiles yet`) from a filtered search miss (`No profiles found`) with a direct `Create and set up profile` action. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --grep "empty launcher guides"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

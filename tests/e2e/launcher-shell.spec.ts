@@ -1,7 +1,68 @@
-import { expect, test, type Locator } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 async function openProfileCustomize(profile: Locator) {
   await profile.getByRole("button", { name: "Customize" }).click();
+}
+
+async function installEmptyLauncherStub(page: Page) {
+  await page.addInitScript(() => {
+    const snapshot = {
+      settings: {
+        maxMemoryMb: 6144,
+        minMemoryMb: 2048,
+        offlineUsername: "Player",
+        telemetryEnabled: false,
+      },
+      directories: {
+        dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+        configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+        cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+        logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+      },
+      friends: [],
+      packs: [],
+      profiles: [],
+      imports: [],
+    };
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string) => {
+          if (cmd === "bootstrap_snapshot") return snapshot;
+          if (cmd === "list_minecraft_accounts") return [];
+          if (cmd === "list_launcher_events") return [];
+          if (cmd === "list_managed_processes") return [];
+          if (cmd === "list_minecraft_versions") {
+            return [
+              { id: "1.21.8", type: "release", url: "https://example.invalid/1.21.8.json" },
+              { id: "25w26a", type: "snapshot", url: "https://example.invalid/25w26a.json" },
+            ];
+          }
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        listen: async () => () => undefined,
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
 }
 
 test("home screen renders the social launcher shell", async ({ page }) => {
@@ -35,6 +96,24 @@ test("home screen fits the configured desktop minimum width", async ({ page }) =
   }));
 
   expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.viewportWidth);
+});
+
+test("empty launcher guides first profile setup from home and library", async ({ page }) => {
+  await installEmptyLauncherStub(page);
+  await page.goto("/");
+
+  await expect(page.getByRole("heading", { level: 1, name: "Set up Minecraft" })).toBeVisible();
+  await expect(page.getByLabel("Primary pack status")).toContainText("No profiles yet");
+  await expect(page.getByLabel("Primary pack actions").getByRole("button", { name: "Create profile" })).toBeEnabled();
+  await expect(page.getByLabel("Primary pack actions").getByRole("button", { name: "Discover packs" })).toBeEnabled();
+
+  await page.getByLabel("Primary pack actions").getByRole("button", { name: "Discover packs" }).click();
+  await expect(page.getByRole("heading", { name: "Discover Modpacks" })).toBeVisible();
+
+  await page.getByRole("navigation").getByRole("button", { name: "Library" }).click();
+  await expect(page.getByRole("heading", { name: "No profiles yet" })).toBeVisible();
+  await page.getByRole("button", { name: "Create and set up profile" }).click();
+  await expect(page.getByRole("button", { name: "Create and set up", exact: true })).toBeVisible();
 });
 
 test("settings exposes stable and dev launcher update channels", async ({ page }) => {
