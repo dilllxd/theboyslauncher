@@ -2018,7 +2018,7 @@ test("live file download events surface in the sidebar status card", async ({ pa
   );
 
   await expect(page.getByLabel("Launcher status", { exact: true })).toContainText("Downloading files");
-  await expect(page.getByLabel("Launcher status message")).toContainText("winterpack - File pending: forge-bootstrap");
+  await expect(page.getByLabel("Launcher status message")).toContainText("winterpack - Waiting to download mod loader files");
   await expect(page.getByLabel("Launcher status progress")).toBeVisible();
   await expect(page.getByLabel("Launcher status progress")).toHaveAttribute("aria-valuenow", "0");
 
@@ -2027,9 +2027,7 @@ test("live file download events surface in the sidebar status card", async ({ pa
   );
 
   await expect(page.getByLabel("Launcher status", { exact: true })).toContainText("Downloading files");
-  await expect(page.getByLabel("Launcher status message")).toContainText(
-    "winterpack - Downloading file: forge-bootstrap",
-  );
+  await expect(page.getByLabel("Launcher status message")).toContainText("winterpack - Downloading mod loader files");
   await expect(page.getByLabel("Launcher status progress")).toBeVisible();
   await expect(page.getByLabel("Launcher status progress")).toHaveAttribute("aria-valuenow", "42");
 
@@ -2047,9 +2045,7 @@ test("live file download events surface in the sidebar status card", async ({ pa
   );
 
   await expect(page.getByLabel("Launcher status", { exact: true })).toContainText("Downloading files");
-  await expect(page.getByLabel("Launcher status message")).toContainText(
-    "1.20.1 - Verified modloader installer processor 6/6 outputs.",
-  );
+  await expect(page.getByLabel("Launcher status message")).toContainText("1.20.1 - Verifying mod loader setup");
 
   await page.evaluate(() =>
     (window as typeof window & { __emitPackInstallCompletedEvent: () => void }).__emitPackInstallCompletedEvent(),
@@ -2339,9 +2335,7 @@ test("pending native install polls launcher events into the sidebar without refr
   await expect(page.getByLabel("Launcher status", { exact: true })).toContainText("Downloading files", {
     timeout: 5000,
   });
-  await expect(page.getByLabel("Launcher status message")).toContainText(
-    "winterpack - Downloading file: asset-object-minecraft/sounds/random/click.ogg",
-  );
+  await expect(page.getByLabel("Launcher status message")).toContainText("winterpack - Downloading Minecraft assets");
   await expect(page.getByLabel("Launcher status progress")).toBeVisible();
   const invoked = await page.evaluate(
     () => (window as typeof window & { __pendingInstallPollInvokes: string[] }).__pendingInstallPollInvokes,

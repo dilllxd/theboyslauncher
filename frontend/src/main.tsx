@@ -1352,6 +1352,43 @@ function fileEventMessageKind(message: string) {
   return undefined;
 }
 
+function downloadArtifactCategory(label: string, subjectId?: string) {
+  const normalized = label.toLowerCase();
+  if (normalized.startsWith("asset-object-minecraft/") || normalized.includes("(asset object")) return "Minecraft assets";
+  if (normalized.includes("(client jar")) return "Minecraft client";
+  if (normalized.includes("(native")) return "Minecraft native files";
+  if (subjectId?.includes("modloader") || /\b(forge|neoforge|fabric|quilt|bootstrap)\b/i.test(label)) {
+    return "mod loader files";
+  }
+  if (normalized.includes("(library")) return "Minecraft libraries";
+  if (normalized.includes("(pack file") || normalized.includes("(preserved pack file") || normalized.includes("(mod")) {
+    return "pack files";
+  }
+  return "game files";
+}
+
+function sidebarDownloadStatusMessage(event: LauncherEvent) {
+  const artifact = artifactLabelFromEventMessage(event.message);
+  if (!artifact) {
+    if (/processor/i.test(event.message)) return "Verifying mod loader setup";
+    return userFacingLauncherEventMessage(event.message);
+  }
+
+  const category = downloadArtifactCategory(artifact, event.subjectId);
+  switch (fileEventMessageKind(event.message)) {
+    case "pending":
+      return `Waiting to download ${category}`;
+    case "started":
+      return `Downloading ${category}`;
+    case "finished":
+      return `${category} ready`;
+    case "failed":
+      return `${category} failed`;
+    default:
+      return userFacingLauncherEventMessage(event.message);
+  }
+}
+
 function isVerboseDownloadFileEvent(event: LauncherEvent) {
   if (event.operation !== "download_artifacts") return false;
   const kind = fileEventMessageKind(event.message);
@@ -1481,7 +1518,7 @@ function sidebarStatusTitle(isNative: boolean, event?: LauncherEvent) {
 function sidebarStatusMessage(event: LauncherEvent | undefined, fallback: string) {
   if (!event) return fallback;
   if (event.operation === "download_artifacts" && event.subjectId) {
-    return `${friendlyOperationSubject(event.subjectId)} - ${userFacingLauncherEventMessage(event.message)}`;
+    return `${friendlyOperationSubject(event.subjectId)} - ${sidebarDownloadStatusMessage(event)}`;
   }
   return userFacingLauncherEventMessage(event.message);
 }
