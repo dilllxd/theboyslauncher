@@ -1612,15 +1612,15 @@ test("terminal repair event clears stuck native repair busy state", async ({ pag
   const card = page.locator(".pack-card").filter({ hasText: "WinterPack" });
   await card.getByRole("button", { name: "Details" }).click();
   await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Check files" }).click();
+  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
-  await expect(page.getByLabel("Launcher quick status")).toContainText("Check files - active");
+  await expect(page.getByLabel("Launcher quick status")).toContainText("Setting up...");
 
   await page.evaluate(() =>
     (window as typeof window & { __emitRepairCompletedEvent: () => void }).__emitRepairCompletedEvent(),
   );
 
-  await expect(page.getByLabel("Launcher quick status")).toContainText("Check files - completed");
+  await expect(page.getByLabel("Launcher quick status")).toContainText("Set up files - completed");
   await page.getByRole("button", { name: "Library" }).click();
   const profile = page.locator(".profile-row").filter({ hasText: "WinterPack" });
   await expect(profile.getByRole("button", { name: "Play" })).toBeEnabled();
@@ -5332,7 +5332,7 @@ test("home details action falls back to web preview mock", async ({ page }) => {
   await expect(page.getByText("Pack details are using preview data")).toBeVisible();
   await expect(page.getByLabel("WinterPack pack details")).toBeVisible();
   await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await expect(page.getByRole("menu", { name: "WinterPack more menu" })).toContainText("Check files");
+  await expect(page.getByRole("menu", { name: "WinterPack more menu" })).toContainText("Verify files");
   await expect(page.getByRole("menu", { name: "WinterPack more menu" })).toContainText("Close details");
   await page.getByRole("button", { name: "Close WinterPack details" }).click();
   await expect(page.getByLabel("WinterPack pack details")).toHaveCount(0);
@@ -5475,7 +5475,7 @@ test("pack detail file check refreshes native bootstrap snapshot status", async 
   await expect(card.getByRole("button", { name: "Repair" })).toHaveCount(0);
   await card.getByRole("button", { name: "Details" }).click();
   await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Check files" }).click();
+  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
@@ -5722,7 +5722,7 @@ test("failed native repair surfaces the failed launcher event", async ({ page })
   const card = page.locator(".pack-card").filter({ hasText: "WinterPack" });
   await card.getByRole("button", { name: "Details" }).click();
   await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Check files" }).click();
+  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
 
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
@@ -5932,7 +5932,7 @@ test("home repair action shows pending native repair state", async ({ page }) =>
   const card = page.locator(".pack-card").filter({ hasText: "WinterPack" });
   await card.getByRole("button", { name: "Details" }).click();
   await page.getByRole("button", { name: "WinterPack more actions" }).click();
-  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Check files" }).click();
+  await page.getByRole("menu", { name: "WinterPack more menu" }).getByRole("menuitem", { name: "Verify files" }).click();
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
   const pendingRepairPlanEvent = page.locator(".event-row").filter({ hasText: "Setup is ready to start." });
@@ -8113,7 +8113,7 @@ test("activity screen loads event log fallback", async ({ page }) => {
   await expect(operationRows.filter({ hasText: "Download files - winterpack" })).toContainText(
     "File already present: user-options",
   );
-  await expect(operationRows.filter({ hasText: "Check files - winterpack" })).toContainText(
+  await expect(operationRows.filter({ hasText: "Set up files - winterpack" })).toContainText(
     "Event log is mocked in web preview",
   );
   await expect(operationRows.filter({ hasText: "Managed process - preview process" })).toContainText(
@@ -8186,7 +8186,7 @@ test("activity screen loads event log fallback", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Events", exact: true })).toHaveClass(/active/);
   await expect(page.locator(".event-row").filter({ hasText: "Event log is mocked in web preview" })).toBeVisible();
   await expect(page.locator(".event-row").filter({ hasText: "Event log is mocked in web preview" })).toContainText(
-    "Check files - winterpack",
+    "Set up files - winterpack",
   );
   await expect(page.locator(".event-row").filter({ hasText: "Downloaded file: client-1.20.1" })).toContainText(
     "Download files - winterpack",

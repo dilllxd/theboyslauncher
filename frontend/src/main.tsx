@@ -1214,7 +1214,7 @@ function operationLabel(operation?: LauncherOperation) {
     case "install_pack":
       return "Install pack";
     case "repair_profile":
-      return "Check files";
+      return "Set up files";
     case "import_profile":
       return "Import profile";
     case "delete_profile":
@@ -3740,7 +3740,7 @@ function App() {
     lifecycleActionInProgressRef.current = operationKey;
     setLifecycleActionInProgressKey(operationKey);
     setRepairInProgressProfileId(profileId);
-    setActivity("Planning file check");
+    setActivity("Planning setup");
     try {
       const plan = await invoke<OperationPlan>("plan_repair_profile", { profileId });
       const finalEvent = plan.events[plan.events.length - 1];
@@ -5527,7 +5527,7 @@ function App() {
               <div className="social-empty compact-empty">
                 <Activity size={42} />
                 <h3>No launcher events yet</h3>
-                <p>Installs, file checks, launches, and errors will show progress here.</p>
+                <p>Installs, setup, launches, and errors will show progress here.</p>
               </div>
             ) : null}
           </section>
@@ -6223,7 +6223,7 @@ function PackDetailsPanel({
                 }}
               >
                 <Wrench size={16} />
-                Check files
+                Verify files
               </button>
               <button
                 type="button"
