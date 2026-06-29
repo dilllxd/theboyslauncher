@@ -1183,6 +1183,8 @@ Latest vanilla compatibility parallelization: the runner now recovers exact stal
 
 Latest profile-creator hardening: native profile creation now treats a failed Mojang version-manifest load as a blocking state instead of silently falling back to preview release versions. The New profile form clears the selected version, disables the version dropdown/Create action, and shows `Minecraft versions could not load. Check your connection and try again.` while preserving preview fallback behavior for the web mock. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "creating a profile refreshes|profile creator blocks"` and `npm run build`. Packaging/update checks were also refreshed with `npm run verify:tauri-security`, `npm run verify:tauri-bundles`, and `npm run verify:package-resources`.
 
+Latest vanilla family compatibility results: the delegated `old_alpha` lane passed all 35 Mojang old-alpha versions with `npm run smoke:live:vanilla:compat -- --all --type old_alpha --jobs 2 --quiet`. The delegated `old_beta` lane passed 25 of 26 versions and failed `b1.2_02` only because C: ran out of disk while writing the managed Java 8 download; after removing exact old generated proof roots under `target/live-smoke` (`neoforge`, `fabric`, `ui-clean-install-proof`, `ui-proof`, `winterpack`, `vanilla`, `delete-proof`) C: free space rose to about 14.4 GB and `npm run smoke:live:vanilla:compat -- --version b1.2_02 --quiet` passed. Treat old beta coverage as all 26 passed after exact retry. The release lane and two remaining snapshot lanes are still active.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
