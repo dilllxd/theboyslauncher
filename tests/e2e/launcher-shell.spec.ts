@@ -10097,9 +10097,11 @@ test("stopping a native process keeps playing presence while stop is pending", a
   await page.getByLabel("Activity views").getByRole("button", { name: "Processes", exact: true }).click();
   await page.locator(".process-row").filter({ hasText: "WinterPack is running" }).getByRole("button", { name: "Stop" }).click();
 
-  await expect(page.getByText("javaw.exe stop requested")).toBeVisible();
+  await expect(page.getByLabel("Launcher status message")).toContainText("Stop requested");
+  await expect(page.getByLabel("Launcher status message")).not.toContainText("javaw.exe");
   await page.getByLabel("Activity views").getByRole("button", { name: "Overview", exact: true }).click();
-  await expect(page.getByLabel("Launcher operations")).toContainText("Stop requested for pid 4242 (javaw.exe)");
+  await expect(page.getByLabel("Launcher operations")).toContainText("Stop requested");
+  await expect(page.getByLabel("Launcher operations")).not.toContainText("javaw.exe");
   await page.getByLabel("Activity views").getByRole("button", { name: "Processes", exact: true }).click();
   const stoppingProcess = page.locator(".process-row").filter({ hasText: "Stopping WinterPack" });
   await expect(stoppingProcess).toContainText("Stop requested");
@@ -10289,7 +10291,8 @@ test("stopping a native process clears local playing presence after exit", async
   await page.getByLabel("Activity views").getByRole("button", { name: "Processes" }).click();
   await page.locator(".process-row").filter({ hasText: "WinterPack is running" }).getByRole("button", { name: "Stop" }).click();
 
-  await expect(page.getByText("javaw.exe stopped")).toBeVisible();
+  await expect(page.getByLabel("Launcher status message")).toContainText("WinterPack stopped");
+  await expect(page.getByLabel("Launcher status message")).not.toContainText("javaw.exe");
   expect(presenceAuthorization).toBe(`Bearer ${accessToken}`);
   expect(JSON.parse(presenceBody)).toEqual({ state: "online" });
   await page.locator("nav").getByRole("button", { name: "Play" }).click();

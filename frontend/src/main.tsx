@@ -1360,6 +1360,7 @@ function isVerboseDownloadFileEvent(event: LauncherEvent) {
 
 function userFacingLauncherEventMessage(message: string) {
   return message
+    .replace(/^Stop requested for pid \d+ \(.+\)\.?$/i, "Stop requested")
     .replace(
       /Minecraft requires Java (\d+) or newer,.*?Install a managed Java runtime from Settings before launching\./i,
       "Preparing Java $1 automatically for this Minecraft version.",
@@ -4330,11 +4331,8 @@ function App() {
       setManagedProcesses((current) => upsertManagedProcessSummary(current, process));
       await loadLauncherEvents(true).catch(() => undefined);
       await clearPlayingPresenceForExitedProcess(process);
-      setActivity(
-        process.state === "exited"
-          ? `${process.command.executable} stopped`
-          : `${process.command.executable} stop requested`,
-      );
+      const displayName = managedProcessDisplayName(process, snapshot.profiles);
+      setActivity(process.state === "exited" ? `${displayName} stopped` : `Stopping ${displayName}`);
     } catch (error) {
       if (isNative) {
         setActivity(nativeFailureActivity(error, "Process stop failed"));

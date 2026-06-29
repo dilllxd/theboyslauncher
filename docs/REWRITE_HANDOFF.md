@@ -1225,6 +1225,8 @@ Latest packaged-app verification refresh: current release-mode `target/release/t
 
 Latest Activity file-progress polish: the Activity overview file summary now chooses the current file from the latest per-file state, so a file that has already emitted a later finished/already-present event is not kept as `Current`. The summary wording now says `downloading` instead of `started`, and the preview regression expects the pending mod to become current after the previous client download finished. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity screen loads event log fallback"` and `npm run build`.
 
+Latest process-stop status polish: rechecked the documented vanilla compatibility campaign and Mojang manifest totals still show zero remaining offsets to delegate (`736` snapshots, `102` releases, `26` old beta, `35` old alpha all covered after retries). Instead of spawning duplicate version workers, this slice removed another normal-flow process leak: stopping a native game now reports friendly profile text such as `WinterPack stopped`, and pending stop operation events are sanitized to `Stop requested` instead of showing pid/executable details like `javaw.exe` in the bottom-left status or Activity overview. Raw process output remains under Activity > Processes details. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "stopping a native process"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
