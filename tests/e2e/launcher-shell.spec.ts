@@ -6754,6 +6754,11 @@ test("library new profile action falls back to web preview mock", async ({ page 
   await page.getByLabel("New profile name").fill("");
   await expect(page.getByRole("button", { name: "Create" })).toBeDisabled();
   await page.getByLabel("New profile name").fill("Preview NeoForge");
+  await page.getByLabel("New profile version type").selectOption("snapshot");
+  await expect(page.getByText("No versions are available for Snapshots right now. Try Releases or refresh later.")).toBeVisible();
+  await expect(page.getByLabel("New profile game version")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Create" })).toBeDisabled();
+  await page.getByLabel("New profile version type").selectOption("release");
   await page.getByLabel("New profile game version").selectOption("1.21.1");
   await expect(page.getByLabel("New profile advanced settings")).toHaveCount(0);
   await page.getByRole("button", { name: "Advanced" }).click();

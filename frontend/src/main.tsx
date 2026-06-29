@@ -978,6 +978,10 @@ function minecraftVersionTypeLabel(versionType: MinecraftVersionType) {
   }
 }
 
+function minecraftVersionUnavailableMessage(versionType: MinecraftVersionType) {
+  return `No versions are available for ${minecraftVersionTypeLabel(versionType)} right now. Try Releases or refresh later.`;
+}
+
 function minecraftVersionsForType(versions: MinecraftVersionSummary[], versionType: MinecraftVersionType) {
   const matches = versions.filter((version) => version.versionType === versionType);
   if (matches.length > 0) return matches;
@@ -1568,6 +1572,10 @@ function App() {
   const [minecraftVersions, setMinecraftVersions] = useState<MinecraftVersionSummary[]>(fallbackMinecraftVersions);
   const [minecraftVersionsLoading, setMinecraftVersionsLoading] = useState(false);
   const newProfileVersionOptions = minecraftVersionsForType(minecraftVersions, newProfileVersionType);
+  const newProfileVersionUnavailableMessage =
+    !minecraftVersionsLoading && newProfileVersionOptions.length === 0
+      ? minecraftVersionUnavailableMessage(newProfileVersionType)
+      : null;
   const newProfileDraft: CreateProfileRequest = {
     name: newProfileName.trim(),
     loader: newProfileLoader,
@@ -4848,6 +4856,9 @@ function App() {
                           </option>
                         ))}
                       </select>
+                      {newProfileVersionUnavailableMessage && (
+                        <span className="field-hint">{newProfileVersionUnavailableMessage}</span>
+                      )}
                     </label>
                     <div className="profile-advanced-toggle">
                       <button
@@ -6630,6 +6641,8 @@ function ProfileEditor({
     minecraftVersionsForType(versionCatalog, gameVersionType),
     gameVersionType === "release",
   );
+  const versionUnavailableMessage =
+    versionOptions.length === 0 ? minecraftVersionUnavailableMessage(gameVersionType) : null;
   const selectGameVersionType = (versionType: MinecraftVersionType) => {
     const options = minecraftVersionsForType(versionCatalog, versionType);
     setGameVersionType(versionType);
@@ -6755,6 +6768,7 @@ function ProfileEditor({
                   </option>
                 ))}
               </select>
+              {versionUnavailableMessage && <span className="field-hint">{versionUnavailableMessage}</span>}
             </label>
             <label>
               <span>Loader</span>

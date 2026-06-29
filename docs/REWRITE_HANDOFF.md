@@ -1145,6 +1145,8 @@ Latest hosted-deploy verification 2: the hosted backend WSL/Docker path was reva
 
 Latest setup-friction polish: the frontend now sanitizes native launch/setup errors before showing them in the desktop shell, so raw guidance like `Install or repair the profile before launching.` is replaced with friendlier automatic setup wording. Failed setup recovery buttons now say `Set up again` instead of a generic retry/repair-style action, while the existing native `repair_profile` command remains an internal implementation detail. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "pack play setup|library profile launch actions hide manual repair"`, `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "failed native repair surfaces"`, and `npm run build`. The five delegated vanilla snapshot compatibility lanes are still running in parallel over the remaining assigned offsets; do not duplicate those lanes unless a worker finishes or fails.
 
+Latest profile-picker polish: the new-profile and customize profile version dropdowns now show an inline friendly empty-state hint when a selected category such as Snapshots, Old beta, or Old alpha has no manifest entries available, instead of leaving a disabled version dropdown unexplained. This keeps raw manual version entry out of the normal flow while making manifest/fallback limits understandable. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "library new profile action|library profile editor saves preview changes|library profile editor can choose snapshot"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
