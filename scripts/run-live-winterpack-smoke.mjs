@@ -14,6 +14,7 @@ const smokeTests = {
   fabricPlan: "live_public_fabric_packwiz_install_planning_uses_standard_pack_metadata",
   fabricInstall: "live_public_fabric_packwiz_install_artifacts_pass_launch_preflight",
   fabricLaunch: "live_public_fabric_packwiz_launch_process_survives_startup_and_can_stop",
+  modrinthArchiveInstall: "live_public_modrinth_mrpack_install_artifacts_pass_launch_preflight",
   vanillaLaunch: "live_vanilla_launch_process_survives_startup_and_can_stop",
   neoforgeInstaller: "live_neoforge_installer_extracts_launch_metadata_and_dependencies",
   neoforgeProcessors: "live_neoforge_installer_processors_resolve_command_specs_from_real_jars",

@@ -13336,6 +13336,105 @@ mod tests {
         Ok(profile)
     }
 
+    #[tokio::test]
+    #[ignore = "downloads a live public Modrinth .mrpack, Fabric loader, pack files, and vanilla artifacts before launch preflight"]
+    async fn live_public_modrinth_mrpack_install_artifacts_pass_launch_preflight() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile =
+            install_live_public_modrinth_mrpack_artifacts_for_preflight(&settings, &directories)
+                .await
+                .expect("live Modrinth .mrpack artifacts should install");
+
+        let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+            .expect("installed Modrinth .mrpack launch plan should build");
+        let command = build_process_command_spec(&launch_plan)
+            .expect("installed Modrinth .mrpack artifacts should preflight");
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "net.fabricmc.loader.impl.launch.knot.KnotClient"));
+        assert!(PathBuf::from(&directories.data_dir)
+            .join(format!(
+                "profiles/{}/.theboys/modrinth/modrinth.index.json",
+                profile.id
+            ))
+            .is_file());
+    }
+
+    async fn install_live_public_modrinth_mrpack_artifacts_for_preflight(
+        settings: &LauncherSettings,
+        directories: &LauncherDirectories,
+    ) -> Result<ProfileSummary> {
+        let archive_path = PathBuf::from(&directories.cache_dir)
+            .join("live-smoke")
+            .join("haste.mrpack");
+        let archive_plan = DownloadPlan {
+            version_id: "live-public-modrinth-mrpack-archive".to_owned(),
+            items: vec![DownloadItem {
+                id: "live-public-modrinth-mrpack-archive".to_owned(),
+                kind: DownloadKind::PackFile,
+                url: public_modrinth_mrpack_smoke_url().to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive_path),
+            }],
+        };
+        execute_download_plan(&archive_plan).await?;
+        ensure!(
+            modpack_archive_contains_modrinth_index(&archive_path)?,
+            "live Modrinth smoke archive should contain modrinth.index.json"
+        );
+
+        let install_plan =
+            build_modrinth_modpack_archive_install_plan(&archive_path, None, directories)?;
+        let profile = install_plan.profile.clone();
+        ensure!(profile.id == "fabric-haste-1-21-1", "unexpected profile id");
+        ensure!(
+            profile.loader == ModLoader::Fabric,
+            "profile should use Fabric"
+        );
+        ensure!(
+            profile.game_version == "1.21.1",
+            "profile should target Minecraft 1.21.1"
+        );
+        extract_modrinth_modpack_archive(&archive_path, &install_plan, directories)?;
+        persist_installed_pack_profile(profile.clone())?;
+
+        let vanilla_plan =
+            build_vanilla_download_plan(Some(&profile.game_version), directories).await?;
+        execute_download_plan(&vanilla_plan).await?;
+        extract_native_libraries_from_download_plan(&vanilla_plan)?;
+        ensure_live_managed_java_for_profile(&profile, directories).await?;
+
+        let mut auxiliary_plan = install_plan.file_download_plan.clone();
+        let modloader_plan = build_modloader_download_plan_for_profile_with_loader_version(
+            &profile,
+            install_plan.loader_version.as_deref(),
+            directories,
+        )?;
+        auxiliary_plan.items.extend(modloader_plan.items);
+        execute_live_winterpack_auxiliary_artifacts(
+            &profile,
+            settings,
+            directories,
+            &auxiliary_plan,
+        )
+        .await?;
+
+        Ok(profile)
+    }
+
+    fn public_modrinth_mrpack_smoke_url() -> &'static str {
+        "https://cdn.modrinth.com/data/L9xxumt0/versions/iQyGNliq/%5BFabric%5DHaste-1.21.1%201.21.1.mrpack"
+    }
+
     fn public_fabric_smoke_catalog_entry() -> ModpackCatalogEntry {
         ModpackCatalogEntry {
             id: "more-mod-variants".to_owned(),
