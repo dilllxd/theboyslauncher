@@ -2680,7 +2680,7 @@ function App() {
         shouldAutoInstallJavaAndLaunch
           ? "Installing the right Java for this Minecraft version"
           : shouldAutoRepairAndLaunch
-            ? "Installing missing files before launch"
+            ? "Setting up missing files before launch"
             : message,
       );
       launchStarted = !isNative;
@@ -2815,7 +2815,7 @@ function App() {
         setActiveView("activity");
         setActivityMode("overview");
       }
-      setActivity(shouldAutoRepairAndJoin ? "Installing missing files before joining" : message);
+      setActivity(shouldAutoRepairAndJoin ? "Setting up missing files before joining" : message);
       launchStarted = !isNative;
     } finally {
       endProfileLaunch(profileId);

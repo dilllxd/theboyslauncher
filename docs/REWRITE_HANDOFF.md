@@ -1161,6 +1161,8 @@ Latest native setup wording polish: the Tauri bridge no longer tells users to st
 
 Latest automatic-launch setup wording polish: automatic missing-artifact setup failures in the Tauri launch path now say `Automatic profile setup before launch failed` instead of `Automatic profile repair before launch failed`. A focused regression test locks that wording. Verified with `cargo test -p theboyslauncher automatic -- --test-threads=1` and `cargo fmt --all --check`.
 
+Latest automatic-setup status polish: the frontend now says `Setting up missing files before launch/joining` instead of `Installing missing files` for automatic missing-artifact recovery paths, keeping pack installation separate from profile setup in user-visible status. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "pack play setup refreshes|friend join surfaces native launch preflight"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
