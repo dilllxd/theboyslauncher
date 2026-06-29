@@ -60,6 +60,20 @@ Current v4 release-readiness evidence from `codex/fresh-foundation-rewrite`:
 - Manual package validation run `28343968252` succeeded with `package_windows=true`, `publish_release=false`, and `release_tag=v4.0.0`.
 - The package run uploaded artifact `TheBoysLauncher-windows-9cff831ea6ed57886ca5736f73622e1b5bbf2bdb` containing the MSI, NSIS setup exe, both `.sig` files, and `latest.json`.
 
+Final v4.0.0 release evidence from 2026-06-29:
+
+- `main`, `codex/fresh-foundation-rewrite`, and tag `v4.0.0` point at `f594466be1b8e82e0e132d3b9958f37d57ae70e8`.
+- `backup/main-v3-2026-06-29` preserves old v3 `main` at `022b8e3c81c0132140cff279387e10110b03d893`.
+- V4 Foundation tag run `28345109064` succeeded, including verification, signed Windows packaging, bundle verification, artifact upload, and release publishing.
+- Social Backend Image tag run `28345109081` succeeded and published `ghcr.io/dilllxd/theboyslauncher/social-backend:v4.0.0` plus `latest`.
+- GitHub Release `v4.0.0` is published, not draft, not prerelease, targeting `main`.
+- Release assets are present: MSI, setup exe, both `.sig` files, and `latest.json`.
+- `https://github.com/dilllxd/theboyslauncher/releases/latest/download/latest.json` returns updater metadata for version `4.0.0`.
+- The setup exe URL in `latest.json` returns HTTP 200.
+- The GHCR backend image was pulled and started through `npm run social:up`; `http://127.0.0.1:4074/health` returned `{"ok":true,"service":"social-backend"}`.
+
+Remaining operations note: `https://launcher.dylan.lol/health` did not resolve on 2026-06-29. The backend container is verified locally through WSL/Docker, but production DNS/reverse proxy still needs to point `launcher.dylan.lol` at the hosted backend.
+
 After reviewing and committing the v4 rewrite branch, replace `main` only with explicit approval:
 
 ```powershell

@@ -1,5 +1,20 @@
 # TheBoysLauncher v4 Rewrite Handoff
 
+## Current Release Status
+
+As of 2026-06-29, v4 has been promoted to `main` and tagged as `v4.0.0`.
+The old v3 `main` is preserved at `backup/main-v3-2026-06-29`.
+
+Verified release evidence:
+
+- V4 Foundation tag run `28345109064` succeeded and published the Windows release assets.
+- Social Backend Image tag run `28345109081` succeeded and published the GHCR backend image.
+- GitHub Release `v4.0.0` is published with MSI, NSIS setup exe, signatures, and `latest.json`.
+- The updater endpoint resolves through `https://github.com/dilllxd/theboyslauncher/releases/latest/download/latest.json`.
+- The released backend image `ghcr.io/dilllxd/theboyslauncher/social-backend:v4.0.0` runs locally through WSL/Docker and returns healthy on `http://127.0.0.1:4074/health`.
+
+Known operational gap: `https://launcher.dylan.lol/health` did not resolve during release verification, so DNS/reverse proxy still needs to be pointed at the hosted backend before remote clients can use the production social endpoint.
+
 ## Context
 
 This repository originally contained a Go/Fyne Minecraft launcher that used Prism Launcher as its backend. The desired direction changed: the new launcher should be a fresh foundation, not a Prism wrapper, not a `cmd-launcher` fork, and not constrained by the old Go app.
