@@ -5784,7 +5784,7 @@ function App() {
                 {latestArtifactSummary && (
                   <div className="artifact-breakdown" aria-label="Latest file progress">
                     <span>
-                      Current: <strong>{latestArtifactSummary.currentArtifact}</strong>
+                      Current: <strong>{downloadArtifactCategory(latestArtifactSummary.currentArtifact ?? "game files")}</strong>
                     </span>
                     <span>{latestArtifactSummary.pending} pending</span>
                     <span>{latestArtifactSummary.downloading} downloading</span>

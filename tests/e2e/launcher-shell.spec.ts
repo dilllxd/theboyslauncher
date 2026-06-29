@@ -8879,7 +8879,7 @@ test("activity screen loads event log fallback", async ({ page }) => {
   await expect(page.getByLabel("Latest operation breakdown")).toContainText("0 completed");
   await expect(page.getByLabel("Latest operation breakdown")).toContainText("5 active");
   await expect(page.getByLabel("Latest operation breakdown")).toContainText("1 pending");
-  await expect(page.getByLabel("Latest file progress")).toContainText("Current: cabin-mod");
+  await expect(page.getByLabel("Latest file progress")).toContainText("Current: pack files");
   await expect(page.getByLabel("Latest file progress")).toContainText("1 pending");
   await expect(page.getByLabel("Latest file progress")).toContainText("2 downloading");
   await expect(page.getByLabel("Latest file progress")).toContainText("2 finished");
@@ -8896,7 +8896,7 @@ test("activity screen loads event log fallback", async ({ page }) => {
   await expect(page.getByLabel("Activity tools")).toContainText("Clear exited");
   await expect(page.getByLabel("Activity tools")).toContainText("Live");
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
-  await expect(page.getByLabel("Launcher status message")).toContainText("user-options");
+  await expect(page.getByLabel("Launcher status message")).toContainText("pack files ready");
   await expect(page.getByRole("button", { name: "Overview" })).toHaveClass(/active/);
   await expect(page.locator(".process-row")).toHaveCount(0);
   await page.getByLabel("Activity views").getByRole("button", { name: "Processes", exact: true }).click();

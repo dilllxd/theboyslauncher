@@ -1235,6 +1235,8 @@ Latest launch-preflight wording polish: native launch/Launch details failures ca
 
 Latest sidebar download-progress polish: the bottom-left live install/download status now summarizes file work by friendly category (`Downloading Minecraft assets`, `Downloading mod loader files`, `Waiting to download pack files`, etc.) instead of showing raw per-file labels like `asset-object-minecraft/sounds/...` or `File pending: forge-bootstrap`. Activity details and file-progress rows still keep the exact file/event text for troubleshooting. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "live file download events surface|pending native install polls launcher events"` and `npm run build`.
 
+Latest Activity file-progress summary polish: Activity Overview's compact `Latest file progress` line now uses friendly file categories such as `pack files` instead of exposing the current raw pack/mod/asset filename. The collapsed `View details` section still contains exact download event names and percentages for troubleshooting. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity screen loads event log fallback|live file download events surface|pending native install polls launcher events"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
