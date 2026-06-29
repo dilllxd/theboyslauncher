@@ -1176,7 +1176,7 @@ function supersededLocalPlanOperationIds(current: LauncherEvent[], incoming: Lau
     if (!metadataEvent?.operation || !metadataEvent.subjectId) continue;
     if (!incomingSubjects.has(`${metadataEvent.operation}:${metadataEvent.subjectId}`)) continue;
     if (incoming.some((event) => event.operationId === operationId)) continue;
-    if (events.some((event) => /plan is ready to execute/i.test(event.message))) {
+    if (events.some((event) => /(?:plan is ready to execute|setup is ready to start)/i.test(event.message))) {
       superseded.add(operationId);
     }
   }

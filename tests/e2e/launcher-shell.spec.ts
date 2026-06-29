@@ -1669,8 +1669,8 @@ test("terminal repair event clears stuck native repair busy state", async ({ pag
               operation: "repair_profile",
               subjectId: "winterpack",
               events: [
-                { kind: "queued", message: "Repair queued for WinterPack", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }
@@ -4690,8 +4690,8 @@ test("library play action surfaces native launch preflight errors", async ({ pag
               operation: "repair_profile",
               subjectId: "winterpack",
               events: [
-                { kind: "queued", message: "Repair queued for WinterPack", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }
@@ -5322,8 +5322,8 @@ test("launch command preflight failure offers setup recovery", async ({ page }) 
               operation: "repair_profile",
               subjectId: "winterpack",
               events: [
-                { kind: "queued", message: "Repair queued for WinterPack", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }
@@ -5816,8 +5816,8 @@ test("pack play setup refreshes native bootstrap snapshot status", async ({ page
               operation: "repair_profile",
               subjectId: "winterpack",
               events: [
-                { kind: "queued", message: "Repair queued for WinterPack", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }
@@ -5966,8 +5966,8 @@ test("library profile launch actions hide manual repair", async ({ page }) => {
               operation: "repair_profile",
               subjectId: "manual-forge",
               events: [
-                { kind: "queued", message: "Repair queued for Manual Forge", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for Manual Forge", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }
@@ -6093,8 +6093,8 @@ test("failed native repair surfaces the failed launcher event", async ({ page })
               operation: "repair_profile",
               subjectId: "winterpack",
               events: [
-                { kind: "queued", message: "Repair queued for WinterPack", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }
@@ -6270,8 +6270,8 @@ test("home repair action shows pending native repair state", async ({ page }) =>
               operation: "repair_profile",
               subjectId: "winterpack",
               events: [
-                { kind: "queued", message: "Repair queued for WinterPack", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }
@@ -6898,8 +6898,8 @@ test("friend join surfaces native launch preflight repair recovery", async ({ pa
               operation: "repair_profile",
               subjectId: "winterpack",
               events: [
-                { kind: "queued", message: "Repair queued for WinterPack", progressPercent: 0 },
-                { kind: "completed", message: "Repair plan is ready to execute.", progressPercent: 100 },
+                { kind: "queued", message: "Setup queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Setup is ready to start.", progressPercent: 100 },
               ],
             };
           }

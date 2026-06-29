@@ -2202,7 +2202,7 @@ fn build_repair_operation_plan_for_profile(profile_id: &str, profile_name: &str)
     events.push(operation_event(
         operation_id,
         LauncherEventKind::Queued,
-        format!("Repair queued for {profile_name}"),
+        format!("Setup queued for {profile_name}"),
         Some(0),
     ));
     events.push(operation_event(
@@ -2226,7 +2226,7 @@ fn build_repair_operation_plan_for_profile(profile_id: &str, profile_name: &str)
     events.push(operation_event(
         operation_id,
         LauncherEventKind::Completed,
-        "Repair plan is ready to execute.",
+        "Setup is ready to start.",
         Some(100),
     ));
 
@@ -19780,12 +19780,20 @@ version = "safeVersion"
 
         assert_eq!(plan.operation, LauncherOperation::RepairProfile);
         assert_eq!(plan.subject_id, "modern-vanilla");
-        assert!(plan
-            .events
-            .first()
-            .expect("repair plan should contain events")
-            .message
-            .contains("Modern Vanilla"));
+        assert_eq!(
+            plan.events
+                .first()
+                .expect("setup plan should contain events")
+                .message,
+            "Setup queued for Modern Vanilla"
+        );
+        assert_eq!(
+            plan.events
+                .last()
+                .expect("setup plan should contain events")
+                .message,
+            "Setup is ready to start."
+        );
     }
 
     #[test]
