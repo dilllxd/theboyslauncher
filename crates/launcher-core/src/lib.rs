@@ -1,0 +1,23445 @@
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    env, fs,
+    io::{BufRead, BufReader, Cursor, Read},
+    path::{Component, Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex, OnceLock,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use directories::ProjectDirs;
+use md5::Md5;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha1::{Digest, Sha1};
+use sha2::{Sha256, Sha512};
+use shared::{
+    bundled_modpack_catalog, bundled_pack_summaries, pack_summary_from_catalog_entry,
+    parse_modpack_catalog_json, ActionReceipt, ActionStatus, AppSnapshot, ArchiveProfileRequest,
+    CreateProfileRequest, DeleteProfileRequest, DownloadItem, DownloadKind, DownloadPlan,
+    ImportCandidate, ImportConflictResolution, ImportKind, ImportPlan, ImportPlanItem,
+    ImportPlanItemKind, ImportPlanRequest, JavaRuntimeDownloadRequest, JavaRuntimeManifestEntry,
+    JavaRuntimeSource, JavaRuntimeSummary, LaunchPlan, LauncherAction, LauncherDirectories,
+    LauncherEvent, LauncherEventKind, LauncherOperation, LauncherSettings, ManagedProcessState,
+    ManagedProcessSummary, MicrosoftAuthCallback, MicrosoftAuthStart, MicrosoftOAuthTokens,
+    MicrosoftTokenExchangePlan, MicrosoftTokenFormField, MinecraftEntitlementItem,
+    MinecraftEntitlements, MinecraftProfile, MinecraftServicesToken, MinecraftSession,
+    MinecraftVersionSummary, MinecraftVersionType, ModLoader, ModpackCatalogEntry, OperationPlan,
+    PackStatus, PackSummary, ProcessCommandSpec, ProcessEnvVar, ProcessLogExport,
+    ProcessOutputLine, ProcessOutputStream, ProcessStartResult, ProfileResolution, ProfileSummary,
+    ServerLaunchTarget, StoredMinecraftAccountSummary, StoredMinecraftSession,
+    UpdateProfileRequest, XboxLiveAuthToken,
+};
+use uuid::Uuid;
+
+const VERSION_MANIFEST_URL: &str =
+    "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+const MICROSOFT_AUTHORIZE_URL: &str = "https://login.live.com/oauth20_authorize.srf";
+const MICROSOFT_TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
+const MICROSOFT_REDIRECT_URI: &str = "http://localhost:53682/";
+const MICROSOFT_AUTH_SCOPES: &[&str] = &["XboxLive.signin", "offline_access"];
+const XBOX_LIVE_AUTH_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
+const XBOX_XSTS_AUTH_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
+const MINECRAFT_LOGIN_WITH_XBOX_URL: &str =
+    "https://api.minecraftservices.com/authentication/login_with_xbox";
+const MINECRAFT_ENTITLEMENTS_URL: &str = "https://api.minecraftservices.com/entitlements/mcstore";
+const MINECRAFT_PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
+const REMOTE_MODPACK_CATALOG_URL: &str = "https://modpacks.dylan.lol/modpacks.json";
+const JAVA_RUNTIME_MANIFEST_URL_ENV: &str = "THEBOYS_JAVA_RUNTIME_MANIFEST_URL";
+const PROCESS_OUTPUT_CAPACITY: usize = 1000;
+const JAVA_ARG_FILE_THRESHOLD_CHARS: usize = 24_000;
+#[cfg(windows)]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
+const DOWNLOAD_MAX_ATTEMPTS: usize = 3;
+const DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(250);
+const DOWNLOAD_CONCURRENCY_ENV: &str = "THEBOYS_DOWNLOAD_CONCURRENCY";
+const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 8;
+const MAX_DOWNLOAD_CONCURRENCY: usize = 32;
+const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const METADATA_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+static DOWNLOAD_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static AUTH_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static METADATA_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn download_http_client() -> &'static reqwest::Client {
+    DOWNLOAD_HTTP_CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn auth_http_client() -> &'static reqwest::Client {
+    AUTH_HTTP_CLIENT.get_or_init(|| {
+        auth_http_client_with_timeout(AUTH_HTTP_TIMEOUT)
+            .expect("auth HTTP client configuration should be valid")
+    })
+}
+
+fn auth_http_client_with_timeout(timeout: Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().timeout(timeout).build()?)
+}
+
+fn metadata_http_client() -> &'static reqwest::Client {
+    METADATA_HTTP_CLIENT.get_or_init(|| {
+        metadata_http_client_with_timeout(METADATA_HTTP_TIMEOUT)
+            .expect("metadata HTTP client configuration should be valid")
+    })
+}
+
+fn metadata_http_client_with_timeout(timeout: Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().timeout(timeout).build()?)
+}
+
+const IMPORTABLE_PROFILE_PATHS: &[(ImportPlanItemKind, &str)] = &[
+    (ImportPlanItemKind::Saves, "saves"),
+    (ImportPlanItemKind::Options, "options.txt"),
+    (ImportPlanItemKind::ResourcePacks, "resourcepacks"),
+    (ImportPlanItemKind::ShaderPacks, "shaderpacks"),
+    (ImportPlanItemKind::Screenshots, "screenshots"),
+    (ImportPlanItemKind::Config, "config"),
+    (ImportPlanItemKind::Mods, "mods"),
+];
+
+pub fn bootstrap_snapshot() -> Result<AppSnapshot> {
+    let directories = prepare_launcher_directories()?;
+    let settings = load_settings()?;
+    let profiles = load_profiles()?;
+    let minecraft_session = load_minecraft_session()?;
+    snapshot_from_parts(
+        settings,
+        directories,
+        minecraft_session,
+        demo_packs(),
+        profiles,
+        scan_imports()?,
+    )
+}
+
+pub async fn bootstrap_snapshot_with_remote_catalog() -> Result<AppSnapshot> {
+    let catalog = fetch_modpack_catalog_with_fallback().await;
+    let packs = pack_summaries_from_catalog_with_packwiz_versions(catalog).await;
+    bootstrap_snapshot_with_packs(packs)
+}
+
+pub fn bootstrap_snapshot_with_catalog(catalog: Vec<ModpackCatalogEntry>) -> Result<AppSnapshot> {
+    bootstrap_snapshot_with_packs(pack_summaries_from_catalog(catalog))
+}
+
+fn bootstrap_snapshot_with_packs(packs: Vec<PackSummary>) -> Result<AppSnapshot> {
+    let directories = prepare_launcher_directories()?;
+    let settings = load_settings()?;
+    let profiles = load_profiles()?;
+    let minecraft_session = load_minecraft_session()?;
+    snapshot_from_parts(
+        settings,
+        directories,
+        minecraft_session,
+        packs,
+        profiles,
+        scan_imports()?,
+    )
+}
+
+fn snapshot_from_parts(
+    settings: LauncherSettings,
+    directories: LauncherDirectories,
+    minecraft_session: Option<StoredMinecraftSession>,
+    packs: Vec<PackSummary>,
+    profiles: Vec<ProfileSummary>,
+    imports: Vec<ImportCandidate>,
+) -> Result<AppSnapshot> {
+    let packs = pack_summaries_with_profile_status(packs, &profiles);
+    Ok(AppSnapshot {
+        settings,
+        directories,
+        minecraft_session,
+        friends: Vec::new(),
+        packs,
+        profiles,
+        imports,
+    })
+}
+
+pub fn start_microsoft_login() -> Result<ActionReceipt> {
+    Ok(receipt(
+        LauncherAction::MicrosoftLogin,
+        None,
+        "Microsoft login flow will open in the native shell.",
+    ))
+}
+
+pub fn start_microsoft_auth_flow(client_id: &str) -> Result<MicrosoftAuthStart> {
+    let client_id = client_id.trim();
+    ensure!(
+        !client_id.is_empty(),
+        "Microsoft OAuth client id is required"
+    );
+    ensure!(
+        client_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+        "Microsoft OAuth client id contains unsupported characters"
+    );
+    let state = Uuid::new_v4().simple().to_string();
+    let code_verifier = new_pkce_code_verifier();
+    Ok(build_microsoft_auth_start(
+        client_id,
+        MICROSOFT_REDIRECT_URI,
+        MICROSOFT_AUTH_SCOPES,
+        &state,
+        &code_verifier,
+    ))
+}
+
+fn build_microsoft_auth_start(
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &[&str],
+    state: &str,
+    code_verifier: &str,
+) -> MicrosoftAuthStart {
+    let scope = scopes.join(" ");
+    let code_challenge = pkce_code_challenge(code_verifier);
+    let auth_url = format!(
+        "{MICROSOFT_AUTHORIZE_URL}?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        percent_encode_query_component(client_id),
+        percent_encode_query_component(redirect_uri),
+        percent_encode_query_component(&scope),
+        percent_encode_query_component(state),
+        percent_encode_query_component(&code_challenge),
+    );
+    MicrosoftAuthStart {
+        auth_url,
+        state: state.to_owned(),
+        code_verifier: code_verifier.to_owned(),
+        code_challenge,
+        client_id: client_id.to_owned(),
+        redirect_uri: redirect_uri.to_owned(),
+        scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+    }
+}
+
+pub fn plan_microsoft_token_exchange(
+    callback: MicrosoftAuthCallback,
+) -> Result<MicrosoftTokenExchangePlan> {
+    let expected_state = callback.expected_state.trim();
+    let client_id = callback.client_id.trim();
+    let code_verifier = callback.code_verifier.trim();
+    ensure!(
+        !expected_state.is_empty(),
+        "expected OAuth state is required"
+    );
+    ensure!(
+        !callback.callback_url.trim().is_empty(),
+        "Microsoft OAuth callback URL is required"
+    );
+    ensure!(
+        !client_id.is_empty(),
+        "Microsoft OAuth client id is required"
+    );
+    ensure_pkce_code_verifier(code_verifier)?;
+    ensure!(
+        client_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+        "Microsoft OAuth client id contains unsupported characters"
+    );
+    ensure_microsoft_callback_redirect_uri(&callback.callback_url)?;
+    let params = parse_query_params(&callback.callback_url)?;
+    if let Some(error) = query_param_unique(&params, "error")? {
+        let description = query_param_unique(&params, "error_description")?
+            .map(percent_decode_query_component)
+            .transpose()?
+            .unwrap_or_default();
+        let error = percent_decode_query_component(error)?;
+        if description.is_empty() {
+            return Err(anyhow!("Microsoft OAuth failed: {error}"));
+        }
+        return Err(anyhow!("Microsoft OAuth failed: {error}: {description}"));
+    }
+    let state = query_param_unique(&params, "state")?
+        .ok_or_else(|| anyhow!("Microsoft OAuth callback is missing state"))?;
+    let state = percent_decode_query_component(state)?;
+    ensure!(state == expected_state, "Microsoft OAuth state mismatch");
+    let code = query_param_unique(&params, "code")?
+        .ok_or_else(|| anyhow!("Microsoft OAuth callback is missing code"))?;
+    let code = percent_decode_query_component(code)?;
+    ensure!(!code.trim().is_empty(), "Microsoft OAuth code is required");
+    ensure!(code.len() <= 4096, "Microsoft OAuth code is too large");
+    ensure!(
+        !code.chars().any(char::is_control),
+        "Microsoft OAuth code cannot contain control characters"
+    );
+    let scopes = MICROSOFT_AUTH_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect::<Vec<_>>();
+    let form_fields = vec![
+        MicrosoftTokenFormField {
+            key: "client_id".to_owned(),
+            value: client_id.to_owned(),
+        },
+        MicrosoftTokenFormField {
+            key: "code".to_owned(),
+            value: code.clone(),
+        },
+        MicrosoftTokenFormField {
+            key: "grant_type".to_owned(),
+            value: "authorization_code".to_owned(),
+        },
+        MicrosoftTokenFormField {
+            key: "redirect_uri".to_owned(),
+            value: MICROSOFT_REDIRECT_URI.to_owned(),
+        },
+        MicrosoftTokenFormField {
+            key: "code_verifier".to_owned(),
+            value: code_verifier.to_owned(),
+        },
+        MicrosoftTokenFormField {
+            key: "scope".to_owned(),
+            value: MICROSOFT_AUTH_SCOPES.join(" "),
+        },
+    ];
+
+    Ok(MicrosoftTokenExchangePlan {
+        token_url: MICROSOFT_TOKEN_URL.to_owned(),
+        method: "POST".to_owned(),
+        client_id: client_id.to_owned(),
+        redirect_uri: MICROSOFT_REDIRECT_URI.to_owned(),
+        code,
+        code_verifier: code_verifier.to_owned(),
+        scopes,
+        form_fields,
+        next_step: "Exchange the Microsoft authorization code for a Microsoft access token."
+            .to_owned(),
+    })
+}
+
+pub async fn exchange_microsoft_authorization_code(
+    plan: MicrosoftTokenExchangePlan,
+) -> Result<MicrosoftOAuthTokens> {
+    validate_microsoft_token_exchange_plan(&plan)?;
+    let form = microsoft_token_exchange_form(&plan);
+    let response = auth_http_client()
+        .post(plan.token_url.trim())
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    let mut tokens = parse_microsoft_token_response(status, &body)?;
+    tokens.client_id = Some(plan.client_id.trim().to_owned());
+    Ok(tokens)
+}
+
+fn validate_microsoft_token_exchange_plan(plan: &MicrosoftTokenExchangePlan) -> Result<()> {
+    ensure!(
+        plan.method == "POST",
+        "Microsoft token exchange must use POST"
+    );
+    ensure!(
+        plan.token_url.trim() == MICROSOFT_TOKEN_URL,
+        "Microsoft token exchange URL is not supported"
+    );
+    validate_http_download_url(&plan.token_url)?;
+    ensure!(
+        !plan.client_id.trim().is_empty(),
+        "Microsoft OAuth client id is required"
+    );
+    ensure!(
+        plan.client_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+        "Microsoft OAuth client id contains unsupported characters"
+    );
+    ensure!(
+        !plan.code.trim().is_empty(),
+        "Microsoft OAuth code is required"
+    );
+    ensure!(plan.code.len() <= 4096, "Microsoft OAuth code is too large");
+    ensure!(
+        !plan.code.chars().any(char::is_control),
+        "Microsoft OAuth code cannot contain control characters"
+    );
+    ensure_pkce_code_verifier(plan.code_verifier.trim())?;
+    ensure!(
+        plan.redirect_uri == MICROSOFT_REDIRECT_URI,
+        "Microsoft OAuth redirect URI is not supported"
+    );
+    let expected_scopes = MICROSOFT_AUTH_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect::<Vec<_>>();
+    ensure!(
+        plan.scopes == expected_scopes,
+        "Microsoft OAuth scopes are not supported"
+    );
+    for field in &plan.form_fields {
+        ensure!(
+            [
+                "client_id",
+                "code",
+                "grant_type",
+                "redirect_uri",
+                "code_verifier",
+                "scope",
+            ]
+            .contains(&field.key.as_str()),
+            "Microsoft token exchange form contains unsupported {} field",
+            field.key
+        );
+    }
+    for required_key in [
+        "client_id",
+        "code",
+        "grant_type",
+        "redirect_uri",
+        "code_verifier",
+        "scope",
+    ] {
+        let _ = microsoft_token_exchange_form_field(plan, required_key)?;
+    }
+    ensure!(
+        microsoft_token_exchange_form_field(plan, "client_id")? == plan.client_id,
+        "Microsoft token exchange form client_id does not match the planned client id"
+    );
+    ensure!(
+        microsoft_token_exchange_form_field(plan, "code")? == plan.code,
+        "Microsoft token exchange form code does not match the planned code"
+    );
+    ensure!(
+        microsoft_token_exchange_form_field(plan, "grant_type")? == "authorization_code",
+        "Microsoft token exchange form grant_type is not supported"
+    );
+    ensure!(
+        microsoft_token_exchange_form_field(plan, "redirect_uri")? == MICROSOFT_REDIRECT_URI,
+        "Microsoft token exchange form redirect_uri is not supported"
+    );
+    ensure!(
+        microsoft_token_exchange_form_field(plan, "code_verifier")? == plan.code_verifier,
+        "Microsoft token exchange form code_verifier does not match the planned verifier"
+    );
+    ensure!(
+        microsoft_token_exchange_form_field(plan, "scope")? == MICROSOFT_AUTH_SCOPES.join(" "),
+        "Microsoft token exchange form scope is not supported"
+    );
+    Ok(())
+}
+
+fn microsoft_token_exchange_form_field<'a>(
+    plan: &'a MicrosoftTokenExchangePlan,
+    key: &str,
+) -> Result<&'a str> {
+    let mut matches = plan
+        .form_fields
+        .iter()
+        .filter(|field| field.key == key)
+        .map(|field| field.value.as_str());
+    let value = matches
+        .next()
+        .ok_or_else(|| anyhow!("Microsoft token exchange form is missing {key}"))?;
+    ensure!(
+        matches.next().is_none(),
+        "Microsoft token exchange form contains duplicate {key} fields"
+    );
+    Ok(value)
+}
+
+fn microsoft_token_exchange_form(plan: &MicrosoftTokenExchangePlan) -> Vec<(String, String)> {
+    plan.form_fields
+        .iter()
+        .map(|field| (field.key.clone(), field.value.clone()))
+        .collect()
+}
+
+fn parse_microsoft_token_response(status: u16, body: &str) -> Result<MicrosoftOAuthTokens> {
+    if !(200..300).contains(&status) {
+        let error = serde_json::from_str::<MicrosoftOAuthErrorResponse>(body).ok();
+        if let Some(error) = error {
+            if let Some(description) = error.error_description.filter(|value| !value.is_empty()) {
+                return Err(anyhow!(
+                    "Microsoft token exchange failed: {}: {}",
+                    error.error,
+                    description
+                ));
+            }
+            return Err(anyhow!("Microsoft token exchange failed: {}", error.error));
+        }
+        return Err(anyhow!(
+            "Microsoft token exchange failed with HTTP status {status}"
+        ));
+    }
+
+    let response = serde_json::from_str::<MicrosoftOAuthTokenResponse>(body)?;
+    ensure!(
+        response.token_type.eq_ignore_ascii_case("bearer"),
+        "Microsoft token response token type is unsupported"
+    );
+    ensure!(
+        !response.access_token.trim().is_empty(),
+        "Microsoft token response is missing an access token"
+    );
+    ensure!(
+        response.expires_in > 0,
+        "Microsoft token response expiration is invalid"
+    );
+
+    Ok(MicrosoftOAuthTokens {
+        token_type: response.token_type,
+        expires_in: response.expires_in,
+        scope: response.scope,
+        access_token: response.access_token,
+        refresh_token: response.refresh_token,
+        client_id: None,
+        user_id: response.user_id,
+    })
+}
+
+pub async fn refresh_microsoft_oauth_tokens(
+    client_id: &str,
+    refresh_token: &str,
+    scopes: Option<&str>,
+) -> Result<MicrosoftOAuthTokens> {
+    let form = microsoft_refresh_token_form(client_id, refresh_token, scopes)?;
+    let response = auth_http_client()
+        .post(MICROSOFT_TOKEN_URL)
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    let mut tokens = parse_microsoft_token_response(status, &body)?;
+    tokens.client_id = Some(client_id.trim().to_owned());
+    if tokens.refresh_token.is_none() {
+        tokens.refresh_token = Some(refresh_token.trim().to_owned());
+    }
+    Ok(tokens)
+}
+
+fn microsoft_refresh_token_form(
+    client_id: &str,
+    refresh_token: &str,
+    scopes: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let client_id = client_id.trim();
+    let refresh_token = refresh_token.trim();
+    ensure!(
+        !client_id.is_empty(),
+        "Microsoft OAuth client id is required"
+    );
+    ensure!(
+        client_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+        "Microsoft OAuth client id contains unsupported characters"
+    );
+    ensure!(
+        !refresh_token.is_empty(),
+        "Microsoft refresh token is required"
+    );
+    ensure!(
+        !refresh_token.chars().any(char::is_whitespace),
+        "Microsoft refresh token cannot contain whitespace"
+    );
+
+    let mut form = vec![
+        ("client_id".to_owned(), client_id.to_owned()),
+        ("grant_type".to_owned(), "refresh_token".to_owned()),
+        ("refresh_token".to_owned(), refresh_token.to_owned()),
+        ("redirect_uri".to_owned(), MICROSOFT_REDIRECT_URI.to_owned()),
+    ];
+    if let Some(scope) = scopes.map(str::trim).filter(|scope| !scope.is_empty()) {
+        let scope = canonical_microsoft_auth_scope_text(scope)?;
+        form.push(("scope".to_owned(), scope));
+    }
+    Ok(form)
+}
+
+fn canonical_microsoft_auth_scope_text(scope: &str) -> Result<String> {
+    let requested = scope.split_whitespace().collect::<Vec<_>>();
+    ensure!(!requested.is_empty(), "Microsoft OAuth scopes are required");
+    let requested_set = requested.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        requested.len() == requested_set.len(),
+        "Microsoft OAuth scopes contain duplicates"
+    );
+    let supported = MICROSOFT_AUTH_SCOPES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        requested_set == supported,
+        "Microsoft OAuth scopes are not supported"
+    );
+    Ok(MICROSOFT_AUTH_SCOPES.join(" "))
+}
+
+#[derive(Debug, Deserialize)]
+struct MicrosoftOAuthTokenResponse {
+    token_type: String,
+    expires_in: u64,
+    #[serde(default)]
+    scope: Option<String>,
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MicrosoftOAuthErrorResponse {
+    error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+pub async fn authenticate_with_xbox_live(
+    tokens: &MicrosoftOAuthTokens,
+) -> Result<XboxLiveAuthToken> {
+    ensure!(
+        !tokens.access_token.trim().is_empty(),
+        "Microsoft access token is required"
+    );
+    let payload = xbox_live_auth_payload(&tokens.access_token);
+    let response = auth_http_client()
+        .post(XBOX_LIVE_AUTH_URL)
+        .header("accept", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    parse_xbox_live_token_response(status, &body)
+}
+
+pub async fn authorize_xsts_for_minecraft(
+    xbox_token: &XboxLiveAuthToken,
+) -> Result<XboxLiveAuthToken> {
+    validate_xbox_live_token(xbox_token)?;
+    let payload = xsts_authorize_payload(&xbox_token.token);
+    let response = auth_http_client()
+        .post(XBOX_XSTS_AUTH_URL)
+        .header("accept", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    parse_xbox_live_token_response(status, &body)
+}
+
+pub async fn login_minecraft_with_xbox(
+    xsts_token: &XboxLiveAuthToken,
+) -> Result<MinecraftServicesToken> {
+    validate_xbox_live_token(xsts_token)?;
+    let payload = minecraft_login_with_xbox_payload(xsts_token);
+    let response = auth_http_client()
+        .post(MINECRAFT_LOGIN_WITH_XBOX_URL)
+        .header("accept", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    parse_minecraft_services_token_response(status, &body)
+}
+
+pub async fn fetch_minecraft_entitlements(
+    token: &MinecraftServicesToken,
+) -> Result<MinecraftEntitlements> {
+    validate_minecraft_services_token(token)?;
+    let response = auth_http_client()
+        .get(MINECRAFT_ENTITLEMENTS_URL)
+        .bearer_auth(token.access_token.trim())
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    parse_minecraft_entitlements_response(status, &body)
+}
+
+pub async fn fetch_minecraft_profile(token: &MinecraftServicesToken) -> Result<MinecraftProfile> {
+    validate_minecraft_services_token(token)?;
+    let response = auth_http_client()
+        .get(MINECRAFT_PROFILE_URL)
+        .bearer_auth(token.access_token.trim())
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    parse_minecraft_profile_response(status, &body)
+}
+
+pub async fn authenticate_minecraft_session(
+    tokens: &MicrosoftOAuthTokens,
+) -> Result<StoredMinecraftSession> {
+    let xbox_token = authenticate_with_xbox_live(tokens).await?;
+    let xsts_token = authorize_xsts_for_minecraft(&xbox_token).await?;
+    let minecraft_token = login_minecraft_with_xbox(&xsts_token).await?;
+    let entitlements = fetch_minecraft_entitlements(&minecraft_token).await?;
+    let profile = fetch_minecraft_profile(&minecraft_token).await?;
+    build_stored_minecraft_session_from_auth(
+        &minecraft_token,
+        &entitlements,
+        &profile,
+        current_unix_seconds(),
+    )
+    .map(|session| stored_session_with_microsoft_refresh_metadata(session, tokens))
+}
+
+pub async fn authenticate_and_save_minecraft_session(
+    tokens: &MicrosoftOAuthTokens,
+) -> Result<StoredMinecraftSession> {
+    let session = authenticate_minecraft_session(tokens).await?;
+    save_minecraft_session(session)
+}
+
+pub async fn refresh_saved_minecraft_session() -> Result<StoredMinecraftSession> {
+    let stored = load_minecraft_session()?
+        .ok_or_else(|| anyhow!("no stored Minecraft session is available to refresh"))?;
+    let refresh_token = stored
+        .microsoft_refresh_token
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!("stored Minecraft session does not include a Microsoft refresh token")
+        })?
+        .to_owned();
+    let client_id = stored
+        .microsoft_client_id
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!("stored Minecraft session does not include a Microsoft OAuth client id")
+        })?
+        .to_owned();
+    let tokens = refresh_microsoft_oauth_tokens(
+        &client_id,
+        &refresh_token,
+        stored.microsoft_scopes.as_deref(),
+    )
+    .await?;
+    let mut refreshed = stored_session_with_microsoft_refresh_metadata(
+        authenticate_minecraft_session(&tokens).await?,
+        &tokens,
+    );
+    if refreshed.microsoft_user_id.is_none() {
+        refreshed.microsoft_user_id = stored.microsoft_user_id;
+    }
+    if refreshed.microsoft_scopes.is_none() {
+        refreshed.microsoft_scopes = stored.microsoft_scopes;
+    }
+    save_minecraft_session(refreshed)
+}
+
+fn build_stored_minecraft_session_from_auth(
+    token: &MinecraftServicesToken,
+    entitlements: &MinecraftEntitlements,
+    profile: &MinecraftProfile,
+    stored_at_unix_seconds: u64,
+) -> Result<StoredMinecraftSession> {
+    validate_minecraft_services_token(token)?;
+    ensure!(
+        entitlements.owns_minecraft,
+        "Minecraft account does not own Minecraft Java Edition"
+    );
+    ensure!(
+        stored_at_unix_seconds > 0,
+        "Minecraft session stored timestamp is required"
+    );
+    let session = StoredMinecraftSession {
+        session: MinecraftSession {
+            username: profile.name.clone(),
+            uuid: profile.id,
+            access_token: token.access_token.trim().to_owned(),
+        },
+        account_id: token.username.clone(),
+        expires_at_unix_seconds: Some(stored_at_unix_seconds.saturating_add(token.expires_in)),
+        microsoft_refresh_token: None,
+        microsoft_client_id: None,
+        microsoft_user_id: None,
+        microsoft_scopes: None,
+        stored_at_unix_seconds,
+    };
+    validate_stored_minecraft_session(&session)?;
+    Ok(session)
+}
+
+fn stored_session_with_microsoft_refresh_metadata(
+    mut session: StoredMinecraftSession,
+    tokens: &MicrosoftOAuthTokens,
+) -> StoredMinecraftSession {
+    if let Some(refresh_token) = trimmed_optional(tokens.refresh_token.clone()) {
+        session.microsoft_refresh_token = Some(refresh_token);
+    }
+    if let Some(client_id) = trimmed_optional(tokens.client_id.clone()) {
+        session.microsoft_client_id = Some(client_id);
+    }
+    if let Some(user_id) = trimmed_optional(tokens.user_id.clone()) {
+        session.microsoft_user_id = Some(user_id);
+    }
+    if let Some(scopes) = trimmed_optional(tokens.scope.clone()) {
+        session.microsoft_scopes = Some(scopes);
+    }
+    session
+}
+
+#[cfg(test)]
+fn save_authenticated_minecraft_session_to_path(
+    path: &Path,
+    token: &MinecraftServicesToken,
+    entitlements: &MinecraftEntitlements,
+    profile: &MinecraftProfile,
+    stored_at_unix_seconds: u64,
+) -> Result<StoredMinecraftSession> {
+    let session = build_stored_minecraft_session_from_auth(
+        token,
+        entitlements,
+        profile,
+        stored_at_unix_seconds,
+    )?;
+    save_minecraft_session_to_path(path, session)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XboxLiveAuthRequest<'a> {
+    properties: XboxLiveAuthProperties<'a>,
+    relying_party: &'a str,
+    token_type: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XboxLiveAuthProperties<'a> {
+    auth_method: &'a str,
+    site_name: &'a str,
+    rps_ticket: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XstsAuthorizeRequest<'a> {
+    properties: XstsAuthorizeProperties<'a>,
+    relying_party: &'a str,
+    token_type: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XstsAuthorizeProperties<'a> {
+    sandbox_id: &'a str,
+    user_tokens: Vec<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftLoginWithXboxRequest {
+    identity_token: String,
+}
+
+fn xbox_live_auth_payload(access_token: &str) -> XboxLiveAuthRequest<'_> {
+    XboxLiveAuthRequest {
+        properties: XboxLiveAuthProperties {
+            auth_method: "RPS",
+            site_name: "user.auth.xboxlive.com",
+            rps_ticket: format!("d={}", access_token.trim()),
+        },
+        relying_party: "http://auth.xboxlive.com",
+        token_type: "JWT",
+    }
+}
+
+fn xsts_authorize_payload(xbox_token: &str) -> XstsAuthorizeRequest<'_> {
+    XstsAuthorizeRequest {
+        properties: XstsAuthorizeProperties {
+            sandbox_id: "RETAIL",
+            user_tokens: vec![xbox_token.trim()],
+        },
+        relying_party: "rp://api.minecraftservices.com/",
+        token_type: "JWT",
+    }
+}
+
+fn minecraft_login_with_xbox_payload(
+    xsts_token: &XboxLiveAuthToken,
+) -> MinecraftLoginWithXboxRequest {
+    MinecraftLoginWithXboxRequest {
+        identity_token: format!(
+            "XBL3.0 x={};{}",
+            xsts_token.user_hash.trim(),
+            xsts_token.token.trim()
+        ),
+    }
+}
+
+fn parse_xbox_live_token_response(status: u16, body: &str) -> Result<XboxLiveAuthToken> {
+    if !(200..300).contains(&status) {
+        return Err(xbox_or_minecraft_error(
+            "Xbox Live authentication",
+            status,
+            body,
+        ));
+    }
+    let response = serde_json::from_str::<XboxLiveTokenResponse>(body)?;
+    let user_hash = response
+        .display_claims
+        .xui
+        .first()
+        .map(|claim| claim.uhs.trim())
+        .filter(|user_hash| !user_hash.is_empty())
+        .ok_or_else(|| anyhow!("Xbox Live token response is missing user hash"))?;
+    let token = XboxLiveAuthToken {
+        token: response.token.trim().to_owned(),
+        user_hash: user_hash.to_owned(),
+        expires_at: response.not_after,
+    };
+    validate_xbox_live_token(&token)?;
+    Ok(token)
+}
+
+fn parse_minecraft_services_token_response(
+    status: u16,
+    body: &str,
+) -> Result<MinecraftServicesToken> {
+    if !(200..300).contains(&status) {
+        return Err(xbox_or_minecraft_error(
+            "Minecraft Services login",
+            status,
+            body,
+        ));
+    }
+    let response = serde_json::from_str::<MinecraftServicesTokenResponse>(body)?;
+    let token = MinecraftServicesToken {
+        token_type: response.token_type,
+        expires_in: response.expires_in,
+        access_token: response.access_token,
+        username: response.username,
+    };
+    validate_minecraft_services_token(&token)?;
+    Ok(token)
+}
+
+fn parse_minecraft_entitlements_response(status: u16, body: &str) -> Result<MinecraftEntitlements> {
+    if !(200..300).contains(&status) {
+        return Err(xbox_or_minecraft_error(
+            "Minecraft entitlements",
+            status,
+            body,
+        ));
+    }
+    let response = serde_json::from_str::<MinecraftEntitlementsResponse>(body)?;
+    let items = response
+        .items
+        .into_iter()
+        .map(|item| MinecraftEntitlementItem {
+            name: item.name,
+            signature: item.signature,
+        })
+        .collect::<Vec<_>>();
+    let owns_minecraft = items
+        .iter()
+        .any(|item| matches!(item.name.as_str(), "game_minecraft" | "product_minecraft"));
+    Ok(MinecraftEntitlements {
+        owns_minecraft,
+        items,
+    })
+}
+
+fn parse_minecraft_profile_response(status: u16, body: &str) -> Result<MinecraftProfile> {
+    if !(200..300).contains(&status) {
+        return Err(xbox_or_minecraft_error("Minecraft profile", status, body));
+    }
+    let response = serde_json::from_str::<MinecraftProfileResponse>(body)?;
+    ensure!(
+        !response.name.trim().is_empty(),
+        "Minecraft profile response is missing profile name"
+    );
+    ensure!(
+        response.name.len() <= 16
+            && response
+                .name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "Minecraft profile response profile name is invalid"
+    );
+    let id = Uuid::parse_str(&response.id)
+        .map_err(|error| anyhow!("Minecraft profile response has invalid UUID: {error}"))?;
+    Ok(MinecraftProfile {
+        id,
+        name: response.name,
+    })
+}
+
+fn validate_xbox_live_token(token: &XboxLiveAuthToken) -> Result<()> {
+    ensure!(!token.token.trim().is_empty(), "Xbox token is required");
+    ensure!(
+        !token.user_hash.trim().is_empty(),
+        "Xbox user hash is required"
+    );
+    ensure!(
+        !token.user_hash.chars().any(char::is_whitespace),
+        "Xbox user hash cannot contain whitespace"
+    );
+    Ok(())
+}
+
+fn validate_minecraft_services_token(token: &MinecraftServicesToken) -> Result<()> {
+    ensure!(
+        token.token_type.eq_ignore_ascii_case("bearer"),
+        "Minecraft Services token type is unsupported"
+    );
+    ensure!(
+        !token.access_token.trim().is_empty(),
+        "Minecraft Services access token is required"
+    );
+    ensure!(
+        token.expires_in > 0,
+        "Minecraft Services token expiration is invalid"
+    );
+    Ok(())
+}
+
+fn xbox_or_minecraft_error(context: &str, status: u16, body: &str) -> anyhow::Error {
+    if let Ok(error) = serde_json::from_str::<GenericServiceErrorResponse>(body) {
+        if let Some(message) = error
+            .error_description
+            .or(error.error_message)
+            .filter(|value| !value.is_empty())
+        {
+            return anyhow!("{context} failed: {}: {}", error.error, message);
+        }
+        if !error.error.is_empty() {
+            return anyhow!("{context} failed: {}", error.error);
+        }
+    }
+    anyhow!("{context} failed with HTTP status {status}")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct XboxLiveTokenResponse {
+    token: String,
+    #[serde(default)]
+    not_after: Option<String>,
+    display_claims: XboxLiveDisplayClaims,
+}
+
+#[derive(Debug, Deserialize)]
+struct XboxLiveDisplayClaims {
+    xui: Vec<XboxLiveUserClaim>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XboxLiveUserClaim {
+    uhs: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftServicesTokenResponse {
+    #[serde(default)]
+    username: Option<String>,
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftEntitlementsResponse {
+    #[serde(default)]
+    items: Vec<MinecraftEntitlementResponseItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftEntitlementResponseItem {
+    name: String,
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftProfileResponse {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenericServiceErrorResponse {
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+    #[serde(default)]
+    error_message: Option<String>,
+}
+
+fn new_pkce_code_verifier() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn ensure_pkce_code_verifier(code_verifier: &str) -> Result<()> {
+    ensure!(
+        (43..=128).contains(&code_verifier.len()),
+        "Microsoft OAuth PKCE code verifier must be 43-128 characters"
+    );
+    ensure!(
+        code_verifier
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '~')),
+        "Microsoft OAuth PKCE code verifier contains unsupported characters"
+    );
+    Ok(())
+}
+
+fn pkce_code_challenge(code_verifier: &str) -> String {
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn ensure_microsoft_callback_redirect_uri(callback_url: &str) -> Result<()> {
+    let callback_url = callback_url.trim();
+    let Some(query_start) = callback_url.find('?') else {
+        return Err(anyhow!(
+            "Microsoft OAuth callback URL is missing query parameters"
+        ));
+    };
+    let origin_path = &callback_url[..query_start];
+    ensure!(
+        origin_path == MICROSOFT_REDIRECT_URI,
+        "Microsoft OAuth callback URL does not match the configured redirect URI"
+    );
+    Ok(())
+}
+
+fn parse_query_params(url: &str) -> Result<Vec<(String, String)>> {
+    let query_start = url
+        .find('?')
+        .ok_or_else(|| anyhow!("Microsoft OAuth callback URL is missing query parameters"))?;
+    let query = &url[query_start + 1..];
+    let query = query.split('#').next().unwrap_or(query);
+    ensure!(
+        !query.trim().is_empty(),
+        "Microsoft OAuth callback URL is missing query parameters"
+    );
+    Ok(query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key.to_owned(), value.to_owned())
+        })
+        .collect())
+}
+
+fn query_param_unique<'a>(params: &'a [(String, String)], key: &str) -> Result<Option<&'a str>> {
+    let mut matches = params
+        .iter()
+        .filter(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.as_str());
+    let first = matches.next();
+    ensure!(
+        matches.next().is_none(),
+        "Microsoft OAuth callback contains duplicate {key} parameters"
+    );
+    Ok(first)
+}
+
+fn percent_decode_query_component(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                ensure!(
+                    index + 2 < bytes.len(),
+                    "OAuth callback contains invalid percent encoding"
+                );
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                    .map_err(|_| anyhow!("OAuth callback contains invalid percent encoding"))?;
+                let byte = u8::from_str_radix(hex, 16)
+                    .map_err(|_| anyhow!("OAuth callback contains invalid percent encoding"))?;
+                decoded.push(byte);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| anyhow!("OAuth callback contains invalid UTF-8"))
+}
+
+pub fn launch_profile(profile_id: &str) -> Result<ActionReceipt> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    let directories = prepare_launcher_directories()?;
+    let settings = load_settings()?;
+    let _plan = build_offline_launch_plan(profile_id, &settings, &directories)?;
+
+    Ok(receipt(
+        LauncherAction::LaunchProfile,
+        Some(profile_id.to_owned()),
+        "Offline launch plan prepared and queued.",
+    ))
+}
+
+pub fn install_pack(pack_id: &str) -> Result<ActionReceipt> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let _plan = plan_install_pack(pack_id)?;
+    Ok(receipt(
+        LauncherAction::InstallPack,
+        Some(pack_id.to_owned()),
+        "Pack install planned and queued.",
+    ))
+}
+
+pub async fn install_pack_with_remote_catalog(pack_id: &str) -> Result<ActionReceipt> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let _plan = plan_install_pack_with_remote_catalog(pack_id).await?;
+    Ok(receipt(
+        LauncherAction::InstallPack,
+        Some(pack_id.to_owned()),
+        "Pack install planned and queued.",
+    ))
+}
+
+pub fn repair_profile(profile_id: &str) -> Result<ActionReceipt> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    let _plan = plan_repair_profile(profile_id)?;
+    Ok(receipt(
+        LauncherAction::RepairProfile,
+        Some(profile_id.to_owned()),
+        "Profile repair planned and queued.",
+    ))
+}
+
+pub fn create_profile(request: CreateProfileRequest) -> Result<ProfileSummary> {
+    create_profile_at_path(&profiles_path()?, request)
+}
+
+pub fn update_profile(request: UpdateProfileRequest) -> Result<ProfileSummary> {
+    update_profile_at_path(&profiles_path()?, request)
+}
+
+pub fn mark_profile_launched(profile_id: &str) -> Result<ProfileSummary> {
+    mark_profile_launched_at_path(&profiles_path()?, profile_id, &launch_last_played_marker())
+}
+
+fn launch_last_played_marker() -> String {
+    format!("unix:{}", current_unix_seconds())
+}
+
+pub fn archive_profile(request: ArchiveProfileRequest) -> Result<ProfileSummary> {
+    archive_profile_at_path(&profiles_path()?, request)
+}
+
+pub fn delete_profile(request: DeleteProfileRequest) -> Result<ProfileSummary> {
+    let directories = prepare_launcher_directories()?;
+    delete_profile_at_path(&profiles_path()?, request, &directories)
+}
+
+pub fn persist_installed_pack_profile(profile: ProfileSummary) -> Result<ProfileSummary> {
+    persist_installed_pack_profile_at_path(&profiles_path()?, profile)
+}
+
+pub fn scan_imports() -> Result<Vec<ImportCandidate>> {
+    scan_imports_in_roots(default_import_roots())
+}
+
+pub fn scan_imports_in_roots(
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<Vec<ImportCandidate>> {
+    let mut candidates = BTreeMap::new();
+
+    for root in roots {
+        scan_prism_like_instances(
+            &root.join("PrismLauncher").join("instances"),
+            ImportKind::Prism,
+            "Prism Launcher",
+            &mut candidates,
+        )?;
+        scan_prism_like_instances(
+            &root.join("MultiMC").join("instances"),
+            ImportKind::Multimc,
+            "MultiMC",
+            &mut candidates,
+        )?;
+        scan_prism_like_instances(
+            &root.join("GDLauncher_next").join("instances"),
+            ImportKind::Gdlauncher,
+            "GDLauncher",
+            &mut candidates,
+        )?;
+        scan_prism_like_instances(
+            &root.join("ATLauncher").join("instances"),
+            ImportKind::Atlauncher,
+            "ATLauncher",
+            &mut candidates,
+        )?;
+        scan_official_minecraft(&root.join(".minecraft"), &mut candidates)?;
+    }
+
+    Ok(candidates.into_values().collect())
+}
+
+pub fn plan_profile_import(request: ImportPlanRequest) -> Result<ImportPlan> {
+    let directories = prepare_launcher_directories()?;
+    build_import_plan(request, &directories)
+}
+
+pub fn build_import_plan(
+    request: ImportPlanRequest,
+    directories: &LauncherDirectories,
+) -> Result<ImportPlan> {
+    let source_path = PathBuf::from(request.source_path.trim());
+    ensure!(!request.name.trim().is_empty(), "import name is required");
+    ensure!(
+        !request.source_path.trim().is_empty(),
+        "import source path is required"
+    );
+    ensure!(
+        source_path.is_dir(),
+        "import source path must be a directory"
+    );
+
+    let profile_id = profile_id_from_name(&request.name);
+    let destination_path = PathBuf::from(&directories.data_dir)
+        .join("profiles")
+        .join(&profile_id);
+    let mut items = Vec::new();
+
+    for (kind, relative_path) in IMPORTABLE_PROFILE_PATHS {
+        let source = source_path.join(relative_path);
+        let destination = destination_path.join(relative_path);
+        let source_stats = collect_path_stats(&source);
+        items.push(ImportPlanItem {
+            kind: kind.clone(),
+            source: display_path(&source),
+            destination: display_path(&destination),
+            exists: source.exists(),
+            destination_exists: destination.exists(),
+            resolution: None,
+            file_count: Some(source_stats.file_count),
+            total_bytes: Some(source_stats.total_bytes),
+        });
+    }
+
+    Ok(ImportPlan {
+        profile_id,
+        profile_name: request.name,
+        source_path: display_path(&source_path),
+        destination_path: display_path(&destination_path),
+        detected_loader: detect_import_loader(&source_path),
+        detected_game_version: detect_import_game_version(&source_path),
+        items,
+    })
+}
+
+pub fn execute_import_plan(plan: &ImportPlan) -> Result<OperationPlan> {
+    ensure!(!plan.profile_id.trim().is_empty(), "profile_id is required");
+    ensure!(
+        !plan.destination_path.trim().is_empty(),
+        "import destination path is required"
+    );
+    let source_root = PathBuf::from(&plan.source_path);
+    let destination_root = PathBuf::from(&plan.destination_path);
+    ensure!(
+        source_root.is_dir(),
+        "import source path must be a directory"
+    );
+
+    let operation_id = Uuid::new_v4();
+    let mut events = vec![
+        operation_event(
+            operation_id,
+            LauncherEventKind::Queued,
+            format!("Import queued for {}", plan.profile_name),
+            Some(0),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Planning,
+            "Validated import plan boundaries.",
+            Some(20),
+        ),
+    ];
+
+    let copyable_items = plan
+        .items
+        .iter()
+        .filter(|item| item.exists)
+        .collect::<Vec<_>>();
+    let total = copyable_items.len().max(1);
+    for (index, item) in copyable_items.iter().enumerate() {
+        let source = PathBuf::from(&item.source);
+        let mut destination = PathBuf::from(&item.destination);
+        ensure!(
+            path_starts_with(&source, &source_root),
+            "import item source is outside the source profile"
+        );
+        ensure!(
+            path_starts_with(&destination, &destination_root),
+            "import item destination is outside the target profile"
+        );
+        let destination_conflicts = item.destination_exists || destination.exists();
+        let mut skipped = false;
+        if destination_conflicts {
+            match item.resolution.as_ref() {
+                Some(ImportConflictResolution::Skip) => {
+                    skipped = true;
+                }
+                Some(ImportConflictResolution::Overwrite) => {
+                    remove_existing_path(&destination)?;
+                }
+                Some(ImportConflictResolution::Rename) => {
+                    destination = next_available_import_destination(&destination)?;
+                    ensure!(
+                        path_starts_with(&destination, &destination_root),
+                        "renamed import destination is outside the target profile"
+                    );
+                }
+                Some(ImportConflictResolution::Abort) | None => {
+                    return Err(anyhow!(
+                        "import item destination already exists: {}",
+                        item.destination
+                    ));
+                }
+            }
+        }
+        if source.exists() {
+            if !skipped {
+                copy_path_recursively(&source, &destination)?;
+            }
+        }
+        let progress = 25 + (((index + 1) * 60) / total) as u8;
+        let message = if skipped {
+            format!("Skipped existing {}.", import_plan_item_label(&item.kind))
+        } else if destination_conflicts
+            && matches!(
+                item.resolution.as_ref(),
+                Some(ImportConflictResolution::Rename)
+            )
+        {
+            format!(
+                "Copied {} to renamed destination.",
+                import_plan_item_label(&item.kind)
+            )
+        } else {
+            format!("Copied {}.", import_plan_item_label(&item.kind))
+        };
+        events.push(operation_event(
+            operation_id,
+            LauncherEventKind::Downloading,
+            message,
+            Some(progress.min(85)),
+        ));
+    }
+
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Verifying,
+        "Verified imported profile files are staged in the new launcher directory.",
+        Some(90),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Completed,
+        "Import completed without modifying the source profile.",
+        Some(100),
+    ));
+
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::ImportProfile,
+        subject_id: plan.profile_id.clone(),
+        events,
+    })
+}
+
+pub fn execute_import_plan_and_persist_profile(plan: &ImportPlan) -> Result<OperationPlan> {
+    let operation = execute_import_plan(plan)?;
+    persist_imported_profile_at_path(&profiles_path()?, plan)?;
+    Ok(operation)
+}
+
+pub fn load_settings() -> Result<LauncherSettings> {
+    load_settings_from_path(&settings_path()?)
+}
+
+pub fn save_settings(settings: &LauncherSettings) -> Result<LauncherSettings> {
+    save_settings_to_path(&settings_path()?, settings)
+}
+
+pub fn load_minecraft_session() -> Result<Option<StoredMinecraftSession>> {
+    load_active_minecraft_session_from_paths(
+        &minecraft_session_path()?,
+        &minecraft_accounts_path()?,
+    )
+}
+
+pub fn save_minecraft_session(session: StoredMinecraftSession) -> Result<StoredMinecraftSession> {
+    save_minecraft_session_to_paths(
+        &minecraft_session_path()?,
+        &minecraft_accounts_path()?,
+        session,
+    )
+}
+
+pub fn clear_minecraft_session() -> Result<()> {
+    clear_active_minecraft_session_at_paths(&minecraft_session_path()?, &minecraft_accounts_path()?)
+}
+
+pub fn list_minecraft_accounts() -> Result<Vec<StoredMinecraftAccountSummary>> {
+    list_minecraft_accounts_from_paths(&minecraft_session_path()?, &minecraft_accounts_path()?)
+}
+
+pub fn select_minecraft_account(account_id: &str) -> Result<StoredMinecraftSession> {
+    select_minecraft_account_at_paths(
+        &minecraft_session_path()?,
+        &minecraft_accounts_path()?,
+        account_id,
+    )
+}
+
+pub fn remove_minecraft_account(account_id: &str) -> Result<Option<StoredMinecraftSession>> {
+    remove_minecraft_account_at_paths(
+        &minecraft_session_path()?,
+        &minecraft_accounts_path()?,
+        account_id,
+    )
+}
+
+pub fn load_profiles() -> Result<Vec<ProfileSummary>> {
+    load_profiles_from_path(&profiles_path()?)
+}
+
+pub fn plan_install_pack(pack_id: &str) -> Result<OperationPlan> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let pack = bundled_pack_summaries()
+        .into_iter()
+        .find(|pack| pack.id == pack_id)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    let pack = pack_summaries_with_profile_status(vec![pack], &demo_profiles())
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    Ok(build_install_operation_plan(&pack))
+}
+
+pub fn plan_install_pack_from_catalog(
+    pack_id: &str,
+    catalog: &[ModpackCatalogEntry],
+) -> Result<OperationPlan> {
+    plan_install_pack_from_catalog_with_profiles(pack_id, catalog, &[])
+}
+
+pub fn plan_install_pack_from_catalog_with_profiles(
+    pack_id: &str,
+    catalog: &[ModpackCatalogEntry],
+    profiles: &[ProfileSummary],
+) -> Result<OperationPlan> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let pack = catalog
+        .iter()
+        .find(|pack| pack.id == pack_id)
+        .cloned()
+        .map(pack_summary_from_catalog_entry)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    let pack = pack_summaries_with_profile_status(vec![pack], profiles)
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    Ok(build_install_operation_plan(&pack))
+}
+
+pub async fn plan_install_pack_with_remote_catalog(pack_id: &str) -> Result<OperationPlan> {
+    let catalog = fetch_modpack_catalog_with_fallback().await;
+    let profiles = load_profiles()?;
+    let packs = pack_summaries_from_catalog_with_packwiz_versions(catalog).await;
+    let pack = packs
+        .into_iter()
+        .find(|pack| pack.id == pack_id)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    let pack = pack_summaries_with_profile_status(vec![pack], &profiles)
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    Ok(build_install_operation_plan(&pack))
+}
+
+pub fn pack_install_game_version(pack_id: &str) -> Result<String> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    pack_install_game_version_from_catalog(pack_id, &demo_packs(), &demo_profiles())
+}
+
+pub fn profile_repair_game_version(profile_id: &str) -> Result<String> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    profile_game_version_from_profiles(profile_id, &load_profiles()?)
+}
+
+pub fn build_install_auxiliary_download_plan(
+    pack_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let packs = demo_packs();
+    let profiles = demo_profiles();
+    build_install_auxiliary_download_plan_from_catalog(pack_id, &packs, &profiles, directories)
+}
+
+pub fn build_install_auxiliary_download_plan_for_pack_profile(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure!(!profile.id.trim().is_empty(), "profile id is required");
+    let mut plan = build_curated_pack_file_download_plan(&profile.id, directories)?;
+    if profile.loader != ModLoader::Vanilla {
+        append_modloader_items_for_profile(&mut plan, profile, directories)?;
+    }
+    Ok(plan)
+}
+
+pub fn build_repair_auxiliary_download_plan(
+    profile_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    let profile = load_profiles()?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))?;
+    build_repair_auxiliary_download_plan_for_profile(&profile, directories)
+}
+
+pub fn pack_install_game_version_from_catalog(
+    pack_id: &str,
+    packs: &[PackSummary],
+    profiles: &[ProfileSummary],
+) -> Result<String> {
+    let pack = packs
+        .iter()
+        .find(|pack| pack.id == pack_id)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    if let Some(profile) = profiles.iter().find(|profile| profile.id == pack.id) {
+        return Ok(profile.game_version.clone());
+    }
+    ensure!(
+        looks_like_minecraft_version(&pack.version),
+        "pack '{}' does not declare a Minecraft game version yet",
+        pack.id
+    );
+    Ok(pack.version.clone())
+}
+
+pub fn build_install_auxiliary_download_plan_from_catalog(
+    pack_id: &str,
+    packs: &[PackSummary],
+    profiles: &[ProfileSummary],
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let pack = packs
+        .iter()
+        .find(|pack| pack.id == pack_id)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    let profile = profiles.iter().find(|profile| profile.id == pack.id);
+    let mut plan = build_curated_pack_file_download_plan(&pack.id, directories)?;
+    if let Some(profile) = profile {
+        append_modloader_items_for_profile(&mut plan, profile, directories)?;
+    }
+    Ok(plan)
+}
+
+pub async fn fetch_pack_install_profile(pack_id: &str) -> Result<ProfileSummary> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let catalog_entry = modpack_catalog_entry(pack_id)?;
+    fetch_pack_install_profile_from_catalog_entry(&catalog_entry).await
+}
+
+pub async fn fetch_pack_install_profile_with_remote_catalog(
+    pack_id: &str,
+) -> Result<ProfileSummary> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let catalog = fetch_modpack_catalog_with_fallback().await;
+    let catalog_entry = catalog
+        .iter()
+        .find(|pack| pack.id == pack_id)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    fetch_pack_install_profile_from_catalog_entry(catalog_entry).await
+}
+
+pub async fn fetch_pack_install_profile_from_catalog_entry(
+    catalog_entry: &ModpackCatalogEntry,
+) -> Result<ProfileSummary> {
+    let pack_info = fetch_packwiz_pack_info(&catalog_entry.pack_url).await?;
+    pack_profile_from_catalog_entry_and_pack_info(&catalog_entry, &pack_info)
+}
+
+fn build_repair_auxiliary_download_plan_for_profile(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let mut plan = DownloadPlan {
+        version_id: format!("{}-auxiliary", profile.id),
+        items: Vec::new(),
+    };
+    append_modloader_items_for_profile(&mut plan, profile, directories)?;
+    Ok(plan)
+}
+
+fn append_modloader_items_for_profile(
+    plan: &mut DownloadPlan,
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<()> {
+    if profile.loader == ModLoader::Vanilla {
+        return Ok(());
+    }
+    let mut modloader_plan = build_modloader_download_plan_for_profile(profile, directories)?;
+    plan.items.append(&mut modloader_plan.items);
+    Ok(())
+}
+
+fn append_modloader_items_for_pack_info(
+    plan: &mut DownloadPlan,
+    profile: &ProfileSummary,
+    pack_info: &PackwizPackInfo,
+    directories: &LauncherDirectories,
+) -> Result<()> {
+    if pack_info.loader == ModLoader::Vanilla {
+        return Ok(());
+    }
+    let mut pack_profile = profile.clone();
+    pack_profile.loader = pack_info.loader.clone();
+    pack_profile.game_version = pack_info.minecraft_version.clone();
+    let mut modloader_plan = build_modloader_download_plan_for_profile_and_version(
+        &pack_profile,
+        pack_info.loader_version.as_deref(),
+        directories,
+    )?;
+    plan.items.append(&mut modloader_plan.items);
+    Ok(())
+}
+
+pub fn profile_game_version_from_profiles(
+    profile_id: &str,
+    profiles: &[ProfileSummary],
+) -> Result<String> {
+    profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| profile.game_version.clone())
+        .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))
+}
+
+pub fn build_install_operation_plan(pack: &PackSummary) -> OperationPlan {
+    let operation_id = Uuid::new_v4();
+    let mut events = Vec::new();
+    let action = pack_install_action_label(pack.status.clone());
+
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Queued,
+        format!("{action} queued for {}", pack.name),
+        Some(0),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Planning,
+        format!(
+            "Resolved curated pack metadata for {action_lower} profile defaults.",
+            action_lower = action.to_lowercase()
+        ),
+        Some(20),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Downloading,
+        format!(
+            "File downloader is ready for {action_lower} pack files and vanilla dependencies.",
+            action_lower = action.to_lowercase()
+        ),
+        Some(50),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Verifying,
+        format!("{action} will verify files before marking the pack ready."),
+        Some(80),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Completed,
+        format!("{action} plan is ready to execute."),
+        Some(100),
+    ));
+
+    OperationPlan {
+        operation_id,
+        operation: LauncherOperation::InstallPack,
+        subject_id: pack.id.clone(),
+        events,
+    }
+}
+
+fn pack_install_action_label(status: PackStatus) -> &'static str {
+    match status {
+        PackStatus::UpdateAvailable => "Update",
+        PackStatus::Installed => "Reinstall",
+        PackStatus::RepairNeeded => "Repair",
+        PackStatus::NotInstalled => "Install",
+    }
+}
+
+pub fn plan_repair_profile(profile_id: &str) -> Result<OperationPlan> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    let profile = load_profiles()?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))?;
+    validate_profiles(std::slice::from_ref(&profile))?;
+    Ok(build_repair_operation_plan_for_profile(
+        profile_id,
+        &profile.name,
+    ))
+}
+
+pub fn build_repair_operation_plan(profile_id: &str, launch_plan: &LaunchPlan) -> OperationPlan {
+    build_repair_operation_plan_for_profile(profile_id, &launch_plan.profile_name)
+}
+
+fn build_repair_operation_plan_for_profile(profile_id: &str, profile_name: &str) -> OperationPlan {
+    let operation_id = Uuid::new_v4();
+    let mut events = Vec::new();
+
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Queued,
+        format!("Repair queued for {profile_name}"),
+        Some(0),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Planning,
+        "Validated profile settings and launch plan.",
+        Some(20),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Downloading,
+        "Download planner is ready for vanilla artifacts.",
+        Some(45),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Verifying,
+        "Checksum verification will run before replacing files.",
+        Some(75),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Completed,
+        "Repair plan is ready to execute.",
+        Some(100),
+    ));
+
+    OperationPlan {
+        operation_id,
+        operation: LauncherOperation::RepairProfile,
+        subject_id: profile_id.to_owned(),
+        events,
+    }
+}
+
+pub fn build_launch_operation_plan(launch_plan: &LaunchPlan, process_id: u32) -> OperationPlan {
+    let operation_id = Uuid::new_v4();
+    let events = vec![
+        operation_event(
+            operation_id,
+            LauncherEventKind::Queued,
+            format!("Launch queued for {}", launch_plan.profile_name),
+            Some(0),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Planning,
+            "Validated launch profile, Java runtime, and arguments.",
+            Some(35),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Completed,
+            format!(
+                "Launch process started with pid {process_id} using {}.",
+                launch_plan.java_executable
+            ),
+            Some(100),
+        ),
+    ];
+
+    OperationPlan {
+        operation_id,
+        operation: LauncherOperation::LaunchProfile,
+        subject_id: launch_plan.profile_id.clone(),
+        events,
+    }
+}
+
+pub fn build_launch_failed_operation_plan(
+    launch_plan: &LaunchPlan,
+    error: impl Into<String>,
+) -> OperationPlan {
+    let operation_id = Uuid::new_v4();
+    let error = error.into();
+    let events = vec![
+        operation_event(
+            operation_id,
+            LauncherEventKind::Queued,
+            format!("Launch queued for {}", launch_plan.profile_name),
+            Some(0),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Planning,
+            "Validated launch profile, Java runtime, and arguments.",
+            Some(35),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Failed,
+            format!(
+                "Launch process failed to start using {}: {error}",
+                launch_plan.java_executable
+            ),
+            Some(100),
+        ),
+    ];
+
+    OperationPlan {
+        operation_id,
+        operation: LauncherOperation::LaunchProfile,
+        subject_id: launch_plan.profile_id.clone(),
+        events,
+    }
+}
+
+pub fn build_launch_planning_failed_operation_plan(
+    profile_id: &str,
+    profile_name: Option<&str>,
+    error: impl Into<String>,
+) -> OperationPlan {
+    let operation_id = Uuid::new_v4();
+    let error = error.into();
+    let display_name = profile_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(profile_id);
+    let events = vec![
+        operation_event(
+            operation_id,
+            LauncherEventKind::Queued,
+            format!("Launch queued for {display_name}"),
+            Some(0),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Planning,
+            "Validating launch profile, Java runtime, and arguments.",
+            Some(35),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Failed,
+            format!("Launch planning failed: {error}"),
+            Some(100),
+        ),
+    ];
+
+    OperationPlan {
+        operation_id,
+        operation: LauncherOperation::LaunchProfile,
+        subject_id: profile_id.to_owned(),
+        events,
+    }
+}
+
+pub fn managed_process_lifecycle_event(summary: &ManagedProcessSummary) -> Option<LauncherEvent> {
+    let (kind, progress_percent, message) = match summary.state {
+        ManagedProcessState::Running => return None,
+        ManagedProcessState::StopRequested => (
+            LauncherEventKind::Verifying,
+            Some(75),
+            format!(
+                "Stop requested for pid {} ({})",
+                summary.process_id, summary.command.executable
+            ),
+        ),
+        ManagedProcessState::Exited => {
+            if summary.stop_requested {
+                return Some(LauncherEvent {
+                    id: Uuid::new_v4(),
+                    operation_id: summary.id,
+                    operation: Some(LauncherOperation::ManagedProcess),
+                    subject_id: Some(summary.id.to_string()),
+                    kind: LauncherEventKind::Completed,
+                    message: format!(
+                        "Process pid {} stopped after {}s",
+                        summary.process_id, summary.runtime_seconds
+                    ),
+                    progress_percent: Some(100),
+                    occurred_at_unix_seconds: current_unix_seconds(),
+                });
+            }
+            let exit_detail = summary
+                .exit_code
+                .map(|code| format!(" with exit code {code}"))
+                .unwrap_or_default();
+            let kind = if summary.exit_code == Some(0) || summary.exit_code.is_none() {
+                LauncherEventKind::Completed
+            } else {
+                LauncherEventKind::Failed
+            };
+            (
+                kind,
+                Some(100),
+                format!(
+                    "Process pid {} exited{} after {}s",
+                    summary.process_id, exit_detail, summary.runtime_seconds
+                ),
+            )
+        }
+    };
+
+    Some(LauncherEvent {
+        id: Uuid::new_v4(),
+        operation_id: summary.id,
+        operation: Some(LauncherOperation::ManagedProcess),
+        subject_id: Some(summary.id.to_string()),
+        kind,
+        message,
+        progress_percent,
+        occurred_at_unix_seconds: current_unix_seconds(),
+    })
+}
+
+pub fn build_offline_launch_plan(
+    profile_id: &str,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+) -> Result<LaunchPlan> {
+    build_offline_launch_plan_with_server(profile_id, settings, directories, None)
+}
+
+pub fn build_offline_launch_plan_with_server(
+    profile_id: &str,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+    server: Option<&ServerLaunchTarget>,
+) -> Result<LaunchPlan> {
+    build_launch_plan(profile_id, settings, directories, None, server)
+}
+
+pub fn build_authenticated_launch_plan(
+    profile_id: &str,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+    session: &MinecraftSession,
+    server: Option<&ServerLaunchTarget>,
+) -> Result<LaunchPlan> {
+    validate_minecraft_session(session)?;
+    build_launch_plan(profile_id, settings, directories, Some(session), server)
+}
+
+pub fn build_stored_authenticated_launch_plan(
+    profile_id: &str,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+    stored_session: &StoredMinecraftSession,
+    server: Option<&ServerLaunchTarget>,
+) -> Result<LaunchPlan> {
+    validate_usable_stored_minecraft_session(stored_session, current_unix_seconds())?;
+    build_authenticated_launch_plan(
+        profile_id,
+        settings,
+        directories,
+        &stored_session.session,
+        server,
+    )
+}
+
+fn build_launch_plan(
+    profile_id: &str,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+    session: Option<&MinecraftSession>,
+    server: Option<&ServerLaunchTarget>,
+) -> Result<LaunchPlan> {
+    validate_settings(settings)?;
+    let profile = load_profiles()?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))?;
+    build_launch_plan_for_profile(&profile, settings, directories, session, server)
+}
+
+fn build_launch_plan_for_profile(
+    profile: &ProfileSummary,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+    session: Option<&MinecraftSession>,
+    server: Option<&ServerLaunchTarget>,
+) -> Result<LaunchPlan> {
+    let cached_version_details =
+        load_cached_minecraft_version_details(&profile.game_version, directories)?;
+    build_launch_plan_for_profile_with_version_details(
+        profile,
+        settings,
+        directories,
+        session,
+        server,
+        cached_version_details.as_ref(),
+    )
+}
+
+fn build_launch_plan_for_profile_with_version_details(
+    profile: &ProfileSummary,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+    session: Option<&MinecraftSession>,
+    server: Option<&ServerLaunchTarget>,
+    version_details: Option<&MinecraftVersionDetails>,
+) -> Result<LaunchPlan> {
+    validate_profiles(std::slice::from_ref(profile))?;
+    ensure_safe_path_segment(&profile.game_version, "Minecraft version id")?;
+    let memory_mb = profile
+        .memory_mb
+        .min(settings.max_memory_mb)
+        .max(settings.min_memory_mb);
+    let working_dir = format!("{}/profiles/{}", directories.data_dir, profile.id);
+    let assets_dir = format!("{}/assets", directories.cache_dir);
+    let libraries_dir = format!("{}/libraries", directories.cache_dir);
+    let client_jar = format!(
+        "{}/versions/{}/client.jar",
+        directories.cache_dir, profile.game_version
+    );
+    let modloader_metadata = load_cached_modloader_launch_metadata(profile, directories)?;
+    let classpath_separator = if cfg!(windows) { ";" } else { ":" };
+    let classpath = version_details
+        .map(|details| minecraft_classpath(details, directories, modloader_metadata.as_ref()))
+        .transpose()?
+        .unwrap_or_else(|| format!("{client_jar}{classpath_separator}{libraries_dir}/*"));
+    let required_java =
+        required_java_major_for_profile_version(&profile.game_version, version_details);
+    let java_executable =
+        select_java_executable_for_profile_launch(profile, settings, required_java)?;
+    let (username, uuid, access_token) = match session {
+        Some(session) => (
+            session.username.trim().to_owned(),
+            session.uuid.simple().to_string(),
+            session.access_token.trim().to_owned(),
+        ),
+        None => (
+            settings.offline_username.clone(),
+            offline_uuid_seed(&settings.offline_username),
+            "0".to_owned(),
+        ),
+    };
+    let mut launch_context = MinecraftLaunchContext {
+        profile,
+        settings,
+        memory_mb,
+        working_dir: &working_dir,
+        assets_dir: &assets_dir,
+        asset_index_id: profile.game_version.clone(),
+        version_type: "release".to_owned(),
+        cache_dir: &directories.cache_dir,
+        classpath: &classpath,
+        modloader_metadata: modloader_metadata.as_ref(),
+        username: &username,
+        uuid: &uuid,
+        access_token: &access_token,
+    };
+    let mut arguments = match version_details {
+        Some(details) => minecraft_launch_arguments_from_details(details, &mut launch_context)?,
+        None => fallback_minecraft_launch_arguments(&mut launch_context)?,
+    };
+    let uses_version_arguments = version_details
+        .and_then(|details| details.arguments.as_ref())
+        .is_some();
+    if !uses_version_arguments {
+        if let Some(resolution) = profile.resolution.as_ref() {
+            arguments.extend([
+                "--width".to_owned(),
+                resolution.width.to_string(),
+                "--height".to_owned(),
+                resolution.height.to_string(),
+            ]);
+        }
+    }
+    if let Some(server) = server.or(profile.default_server.as_ref()) {
+        arguments.extend(server_launch_arguments(server)?);
+    }
+
+    Ok(LaunchPlan {
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        java_executable,
+        working_dir: working_dir.clone(),
+        arguments,
+        memory_mb,
+        offline_username: username,
+    })
+}
+
+struct MinecraftLaunchContext<'a> {
+    profile: &'a ProfileSummary,
+    settings: &'a LauncherSettings,
+    memory_mb: u32,
+    working_dir: &'a str,
+    assets_dir: &'a str,
+    asset_index_id: String,
+    version_type: String,
+    cache_dir: &'a str,
+    classpath: &'a str,
+    modloader_metadata: Option<&'a ModloaderLaunchMetadata>,
+    username: &'a str,
+    uuid: &'a str,
+    access_token: &'a str,
+}
+
+fn fallback_minecraft_launch_arguments(
+    context: &mut MinecraftLaunchContext<'_>,
+) -> Result<Vec<String>> {
+    let main_class = context
+        .modloader_metadata
+        .map(|metadata| metadata.main_class.as_str())
+        .unwrap_or("net.minecraft.client.main.Main");
+    let mut arguments = base_jvm_arguments(context);
+    if let Some(metadata) = context.modloader_metadata {
+        arguments.extend(expand_minecraft_arguments(
+            &metadata.jvm_arguments,
+            context,
+        )?);
+    }
+    arguments.extend([
+        "-cp".to_owned(),
+        context.classpath.to_owned(),
+        main_class.to_owned(),
+        "--username".to_owned(),
+        context.username.to_owned(),
+        "--version".to_owned(),
+        context.profile.game_version.clone(),
+        "--gameDir".to_owned(),
+        context.working_dir.to_owned(),
+        "--assetsDir".to_owned(),
+        context.assets_dir.to_owned(),
+        "--uuid".to_owned(),
+        context.uuid.to_owned(),
+        "--accessToken".to_owned(),
+        context.access_token.to_owned(),
+    ]);
+    if let Some(metadata) = context.modloader_metadata {
+        arguments.extend(expand_minecraft_arguments(
+            &metadata.game_arguments,
+            context,
+        )?);
+    }
+    Ok(arguments)
+}
+
+fn minecraft_launch_arguments_from_details(
+    details: &MinecraftVersionDetails,
+    context: &mut MinecraftLaunchContext<'_>,
+) -> Result<Vec<String>> {
+    ensure!(
+        details.id == context.profile.game_version,
+        "version details '{}' do not match profile game version '{}'",
+        details.id,
+        context.profile.game_version
+    );
+    let main_class = context
+        .modloader_metadata
+        .map(|metadata| metadata.main_class.as_str())
+        .or_else(|| {
+            details
+                .main_class
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("net.minecraft.client.main.Main");
+    context.asset_index_id = details.asset_index.id.clone();
+    context.version_type =
+        trimmed_optional(details.version_type.clone()).unwrap_or_else(|| "release".to_owned());
+    let mut arguments = base_jvm_arguments(context);
+
+    if let Some(version_arguments) = details.arguments.as_ref() {
+        arguments.extend(expand_minecraft_arguments(&version_arguments.jvm, context)?);
+        if let Some(metadata) = context.modloader_metadata {
+            arguments.extend(expand_minecraft_arguments(
+                &metadata.jvm_arguments,
+                context,
+            )?);
+        }
+        arguments.push(main_class.to_owned());
+        arguments.extend(expand_minecraft_arguments(
+            &version_arguments.game,
+            context,
+        )?);
+        if let Some(metadata) = context.modloader_metadata {
+            arguments.extend(expand_minecraft_arguments(
+                &metadata.game_arguments,
+                context,
+            )?);
+        }
+    } else if let Some(minecraft_arguments) = details
+        .minecraft_arguments
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        arguments.push(legacy_native_library_path_argument(context));
+        if let Some(metadata) = context.modloader_metadata {
+            arguments.extend(expand_minecraft_arguments(
+                &metadata.jvm_arguments,
+                context,
+            )?);
+        }
+        arguments.extend([
+            "-cp".to_owned(),
+            context.classpath.to_owned(),
+            main_class.to_owned(),
+        ]);
+        arguments.extend(expand_minecraft_argument_string(
+            minecraft_arguments,
+            context,
+        )?);
+        if let Some(metadata) = context.modloader_metadata {
+            arguments.extend(expand_minecraft_arguments(
+                &metadata.game_arguments,
+                context,
+            )?);
+        }
+    } else {
+        if let Some(metadata) = context.modloader_metadata {
+            arguments.extend(expand_minecraft_arguments(
+                &metadata.jvm_arguments,
+                context,
+            )?);
+        }
+        arguments.extend([
+            "-cp".to_owned(),
+            context.classpath.to_owned(),
+            main_class.to_owned(),
+            "--username".to_owned(),
+            context.username.to_owned(),
+            "--version".to_owned(),
+            context.profile.game_version.clone(),
+            "--gameDir".to_owned(),
+            context.working_dir.to_owned(),
+            "--assetsDir".to_owned(),
+            context.assets_dir.to_owned(),
+            "--uuid".to_owned(),
+            context.uuid.to_owned(),
+            "--accessToken".to_owned(),
+            context.access_token.to_owned(),
+        ]);
+        if let Some(metadata) = context.modloader_metadata {
+            arguments.extend(expand_minecraft_arguments(
+                &metadata.game_arguments,
+                context,
+            )?);
+        }
+    }
+
+    Ok(arguments)
+}
+
+fn legacy_native_library_path_argument(context: &MinecraftLaunchContext<'_>) -> String {
+    format!(
+        "-Djava.library.path={}/natives/{}",
+        context.cache_dir, context.profile.game_version
+    )
+}
+
+fn expand_minecraft_argument_string(
+    arguments: &str,
+    context: &MinecraftLaunchContext<'_>,
+) -> Result<Vec<String>> {
+    split_minecraft_argument_string(arguments)?
+        .into_iter()
+        .map(|argument| substitute_minecraft_argument(&argument, context))
+        .collect()
+}
+
+fn split_minecraft_argument_string(arguments: &str) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in arguments.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    ensure!(
+        quote.is_none(),
+        "Minecraft argument string has an unclosed quote"
+    );
+    ensure!(!escaped, "Minecraft argument string has a trailing escape");
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    Ok(parts)
+}
+
+fn base_jvm_arguments(context: &MinecraftLaunchContext<'_>) -> Vec<String> {
+    let mut arguments = vec![
+        format!("-Xms{}M", context.settings.min_memory_mb),
+        format!("-Xmx{}M", context.memory_mb),
+    ];
+    arguments.extend(
+        context
+            .profile
+            .jvm_args
+            .iter()
+            .map(|argument| argument.trim().to_owned()),
+    );
+    arguments.push(format!("-Dtheboyslauncher.profile={}", context.profile.id));
+    arguments
+}
+
+fn minecraft_classpath(
+    details: &MinecraftVersionDetails,
+    directories: &LauncherDirectories,
+    modloader_metadata: Option<&ModloaderLaunchMetadata>,
+) -> Result<String> {
+    ensure_safe_path_segment(&details.id, "Minecraft version id")?;
+    let mut entries = Vec::new();
+    if let Some(metadata) = modloader_metadata {
+        entries.extend(metadata.classpath_entries.clone());
+    }
+    for library in &details.libraries {
+        if !library_allowed_on_current_os(library) {
+            continue;
+        }
+        if let Some(artifact) = library.downloads.artifact.as_ref() {
+            if native_library_coordinate_classifier_for_current_os(library).is_some() {
+                continue;
+            }
+            ensure_safe_relative_path(&artifact.path, "library artifact path")?;
+            entries.push(format!(
+                "{}/libraries/{}",
+                directories.cache_dir, artifact.path
+            ));
+        }
+    }
+    if !modloader_metadata_replaces_client_jar(modloader_metadata) {
+        entries.push(format!(
+            "{}/versions/{}/client.jar",
+            directories.cache_dir, details.id
+        ));
+    }
+    deduplicate_classpath_entries(&mut entries);
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    Ok(entries.join(separator))
+}
+
+fn deduplicate_classpath_entries(entries: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    let mut duplicate_artifacts = BTreeSet::new();
+    for entry in entries.iter().rev() {
+        if let Some(key) = maven_layout_artifact_key(entry) {
+            duplicate_artifacts.insert(key);
+        }
+    }
+    entries.reverse();
+    entries.retain(|entry| {
+        if let Some(key) = maven_layout_artifact_key(entry) {
+            return duplicate_artifacts.remove(&key);
+        }
+        seen.insert(classpath_entry_key(entry))
+    });
+    entries.reverse();
+}
+
+fn classpath_entry_key(entry: &str) -> String {
+    let normalized = entry.replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn maven_layout_artifact_key(entry: &str) -> Option<String> {
+    let normalized = entry.replace('\\', "/");
+    let path = normalized.strip_suffix(".jar")?;
+    let path = path
+        .split_once("/libraries/")
+        .map(|(_, artifact_path)| artifact_path)
+        .unwrap_or(path);
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.len() < 4 {
+        return None;
+    }
+    let artifact = segments[segments.len() - 3];
+    let version = segments[segments.len() - 2];
+    let filename = segments[segments.len() - 1];
+    let expected_filename = format!("{artifact}-{version}");
+    if filename != expected_filename {
+        return None;
+    }
+    let group_segments = &segments[..segments.len() - 3];
+    if group_segments.is_empty()
+        || group_segments
+            .iter()
+            .any(|segment| segment.is_empty() || segment == &".." || segment.contains(':'))
+    {
+        return None;
+    }
+    let group = group_segments.join("/");
+    let key = format!("{group}/{artifact}");
+    if cfg!(windows) {
+        Some(key.to_ascii_lowercase())
+    } else {
+        Some(key)
+    }
+}
+
+fn modloader_metadata_replaces_client_jar(
+    modloader_metadata: Option<&ModloaderLaunchMetadata>,
+) -> bool {
+    modloader_metadata.is_some_and(|metadata| {
+        metadata
+            .main_class
+            .eq_ignore_ascii_case("cpw.mods.bootstraplauncher.BootstrapLauncher")
+    })
+}
+
+fn cached_minecraft_version_details_path(
+    version_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<PathBuf> {
+    ensure_safe_path_segment(version_id, "Minecraft version id")?;
+    Ok(PathBuf::from(&directories.cache_dir)
+        .join("versions")
+        .join(version_id)
+        .join(format!("{version_id}.json")))
+}
+
+fn load_cached_minecraft_version_details(
+    version_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<Option<MinecraftVersionDetails>> {
+    let path = cached_minecraft_version_details_path(version_id, directories)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let details = serde_json::from_slice::<MinecraftVersionDetails>(&fs::read(&path)?)?;
+    ensure!(
+        details.id == version_id,
+        "cached Minecraft version details '{}' do not match requested version '{}'",
+        details.id,
+        version_id
+    );
+    Ok(Some(details))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModloaderLaunchMetadata {
+    main_class: String,
+    classpath_entries: Vec<String>,
+    jvm_arguments: Vec<MinecraftArgument>,
+    game_arguments: Vec<MinecraftArgument>,
+}
+
+fn load_cached_modloader_launch_metadata(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<Option<ModloaderLaunchMetadata>> {
+    let Some(loader_id) = modloader_metadata_loader_id(&profile.loader) else {
+        return Ok(None);
+    };
+    let path = modloader_metadata_path(loader_id, &profile.game_version, directories)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let metadata = parse_modloader_launch_metadata(
+        &profile.loader,
+        &fs::read_to_string(&path)?,
+        &directories.cache_dir,
+    )?;
+    Ok(Some(metadata))
+}
+
+fn modloader_metadata_loader_id(loader: &ModLoader) -> Option<&'static str> {
+    match loader {
+        ModLoader::Fabric => Some("fabric-loader"),
+        ModLoader::Quilt => Some("quilt-loader"),
+        ModLoader::Forge => Some("forge"),
+        ModLoader::Neoforge => Some("neoforge"),
+        _ => None,
+    }
+}
+
+fn modloader_metadata_path(
+    loader_id: &str,
+    game_version: &str,
+    directories: &LauncherDirectories,
+) -> Result<PathBuf> {
+    ensure_safe_path_segment(loader_id, "modloader id")?;
+    ensure_safe_path_segment(game_version, "modloader Minecraft version")?;
+    Ok(PathBuf::from(&directories.cache_dir)
+        .join("modloaders")
+        .join(loader_id)
+        .join(game_version)
+        .join("metadata.json"))
+}
+
+fn parse_modloader_launch_metadata(
+    loader: &ModLoader,
+    json: &str,
+    cache_dir: &str,
+) -> Result<ModloaderLaunchMetadata> {
+    match loader {
+        ModLoader::Fabric | ModLoader::Quilt => {
+            let entries = serde_json::from_str::<Vec<ModloaderMetadataEntry>>(json)?;
+            let entry = entries.into_iter().next().ok_or_else(|| {
+                anyhow!("modloader metadata response did not include any loaders")
+            })?;
+            modloader_launch_metadata_from_entry(loader, entry, cache_dir)
+        }
+        ModLoader::Forge | ModLoader::Neoforge => {
+            parse_generated_modloader_launch_metadata(json, cache_dir)
+        }
+        ModLoader::Vanilla => Err(anyhow!("vanilla profiles do not have modloader metadata")),
+    }
+}
+
+fn modloader_launch_metadata_from_entry(
+    loader: &ModLoader,
+    entry: ModloaderMetadataEntry,
+    cache_dir: &str,
+) -> Result<ModloaderLaunchMetadata> {
+    let main_class = entry.launcher_meta.main_class.client().trim().to_owned();
+    ensure!(
+        !main_class.is_empty(),
+        "modloader client main class is required"
+    );
+    let mut coordinates = Vec::new();
+    if let Some(maven) = trimmed_optional(entry.loader.maven) {
+        coordinates.push(maven);
+    }
+    if let Some(maven) = entry
+        .intermediary
+        .and_then(|intermediary| trimmed_optional(intermediary.maven))
+    {
+        coordinates.push(maven);
+    }
+    if let Some(maven) = entry
+        .hashed
+        .and_then(|hashed| trimmed_optional(hashed.maven))
+    {
+        coordinates.push(maven);
+    }
+
+    let mut libraries = entry.launcher_meta.libraries.common;
+    libraries.extend(entry.launcher_meta.libraries.client);
+    for library in libraries {
+        coordinates.push(library.name);
+    }
+    let classpath_entries = coordinates
+        .into_iter()
+        .map(|coordinate| maven_coordinate_cache_path(cache_dir, &coordinate))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !classpath_entries.is_empty(),
+        "{:?} metadata did not include loader libraries",
+        loader
+    );
+    Ok(ModloaderLaunchMetadata {
+        main_class,
+        classpath_entries,
+        jvm_arguments: Vec::new(),
+        game_arguments: Vec::new(),
+    })
+}
+
+fn parse_generated_modloader_launch_metadata(
+    json: &str,
+    cache_dir: &str,
+) -> Result<ModloaderLaunchMetadata> {
+    let version = serde_json::from_str::<GeneratedModloaderVersionJson>(json)?;
+    let main_class = version.main_class.trim().to_owned();
+    ensure!(
+        !main_class.is_empty(),
+        "generated modloader version mainClass is required"
+    );
+    let processor_coordinates = modloader_processor_coordinates(&version.installer_processors)?;
+    let mut classpath_entries = Vec::new();
+    for library in &version.libraries {
+        if processor_coordinates.contains(library.name.trim()) {
+            continue;
+        }
+        if !library_allowed_on_current_os(library) {
+            continue;
+        }
+        if let Some(artifact) = library.downloads.artifact.as_ref() {
+            ensure_safe_relative_path(&artifact.path, "generated modloader library path")?;
+            classpath_entries.push(format!("{cache_dir}/libraries/{}", artifact.path));
+        }
+    }
+    ensure!(
+        !classpath_entries.is_empty(),
+        "generated modloader version did not include libraries"
+    );
+    let arguments = version.arguments.unwrap_or_default();
+    Ok(ModloaderLaunchMetadata {
+        main_class,
+        classpath_entries,
+        jvm_arguments: arguments.jvm,
+        game_arguments: arguments.game,
+    })
+}
+
+fn build_modloader_dependency_download_plan_from_metadata(
+    profile: &ProfileSummary,
+    json: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    if matches!(profile.loader, ModLoader::Forge | ModLoader::Neoforge) {
+        return build_generated_modloader_dependency_download_plan(profile, json, directories);
+    }
+    ensure!(
+        matches!(profile.loader, ModLoader::Fabric | ModLoader::Quilt),
+        "only modloader profiles can produce dependency downloads"
+    );
+    let entries = serde_json::from_str::<Vec<ModloaderMetadataEntry>>(json)?;
+    let entry = entries
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("modloader metadata response did not include any loaders"))?;
+    let mut items = Vec::new();
+    push_modloader_coordinate_download_item(
+        &mut items,
+        &profile.loader,
+        entry.loader,
+        None,
+        &directories.cache_dir,
+    )?;
+    if let Some(intermediary) = entry.intermediary {
+        push_modloader_coordinate_download_item(
+            &mut items,
+            &profile.loader,
+            intermediary,
+            None,
+            &directories.cache_dir,
+        )?;
+    }
+    if let Some(hashed) = entry.hashed {
+        push_modloader_coordinate_download_item(
+            &mut items,
+            &profile.loader,
+            hashed,
+            None,
+            &directories.cache_dir,
+        )?;
+    }
+    let mut libraries = entry.launcher_meta.libraries.common;
+    libraries.extend(entry.launcher_meta.libraries.client);
+    for library in libraries {
+        push_modloader_library_download_item(&mut items, library, &directories.cache_dir)?;
+    }
+    Ok(DownloadPlan {
+        version_id: format!(
+            "{}-{}-dependencies",
+            profile.id,
+            modloader_slug(&profile.loader)
+        ),
+        items,
+    })
+}
+
+fn build_generated_modloader_dependency_download_plan(
+    profile: &ProfileSummary,
+    json: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let version = serde_json::from_str::<GeneratedModloaderVersionJson>(json)?;
+    let mut items = Vec::new();
+    let mut forge_runtime_version = None;
+    for library in version.libraries {
+        if !library_allowed_on_current_os(&library) {
+            continue;
+        }
+        if let Some(version) = library.name.strip_prefix("net.minecraftforge:fmlloader:") {
+            forge_runtime_version = Some(version.to_owned());
+        }
+        let Some(artifact) = library.downloads.artifact else {
+            continue;
+        };
+        ensure_safe_relative_path(&artifact.path, "generated modloader library path")?;
+        validate_http_download_url(&artifact.url)?;
+        items.push(DownloadItem {
+            id: format!("modloader-library-{}", profile_id_from_name(&library.name)),
+            kind: DownloadKind::Library,
+            url: artifact.url,
+            sha1: Some(artifact.sha1),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(artifact.size),
+            destination: format!("{}/libraries/{}", directories.cache_dir, artifact.path),
+        });
+    }
+    if let Some(version) = forge_runtime_version {
+        push_maven_download_item(
+            &mut items,
+            &format!("net.minecraftforge:forge:{version}:universal"),
+            "https://maven.minecraftforge.net/",
+            None,
+            None,
+            None,
+            &directories.cache_dir,
+        )?;
+        for artifact in [
+            "fmlcore",
+            "javafmllanguage",
+            "lowcodelanguage",
+            "mclanguage",
+        ] {
+            push_maven_download_item(
+                &mut items,
+                &format!("net.minecraftforge:{artifact}:{version}"),
+                "https://maven.minecraftforge.net/",
+                None,
+                None,
+                None,
+                &directories.cache_dir,
+            )?;
+        }
+    }
+    let processor_coordinates = modloader_processor_coordinates(&version.installer_processors)?;
+    for coordinate in processor_coordinates {
+        let base_url = default_modloader_maven_base_url(&profile.loader, &coordinate);
+        push_maven_download_item(
+            &mut items,
+            coordinate.as_str(),
+            base_url,
+            None,
+            None,
+            None,
+            &directories.cache_dir,
+        )?;
+    }
+    ensure!(
+        !items.is_empty(),
+        "generated modloader metadata did not include downloadable libraries"
+    );
+    Ok(DownloadPlan {
+        version_id: format!(
+            "{}-{}-dependencies",
+            profile.id,
+            modloader_slug(&profile.loader)
+        ),
+        items,
+    })
+}
+
+pub fn extract_modloader_installer_metadata_for_profile(
+    profile: &ProfileSummary,
+    plan: &DownloadPlan,
+    directories: &LauncherDirectories,
+) -> Result<Option<OperationPlan>> {
+    if !matches!(profile.loader, ModLoader::Forge | ModLoader::Neoforge) {
+        return Ok(None);
+    }
+    let installer = plan
+        .items
+        .iter()
+        .find(|item| item.kind == DownloadKind::ModLoaderInstaller);
+    let Some(installer) = installer else {
+        return Ok(None);
+    };
+    let installer_path = PathBuf::from(&installer.destination);
+    ensure!(
+        installer_path.is_file(),
+        "modloader installer '{}' has not been downloaded",
+        installer.destination
+    );
+    let bytes = fs::read(&installer_path)?;
+    let mut extracted = extract_modloader_installer_metadata(&bytes)?;
+    extracted.version.installer_path = Some(installer.destination.clone());
+    extract_modloader_installer_data_files_for_profile(
+        &bytes,
+        profile,
+        &extracted.version.installer_data,
+        directories,
+    )?;
+    let client_processors = client_modloader_installer_processors(&extracted.processors)
+        .cloned()
+        .collect::<Vec<_>>();
+    extracted.version.installer_processors = client_processors.clone();
+    let generated_json = serde_json::to_string_pretty(&extracted.version)?;
+    parse_generated_modloader_launch_metadata(&generated_json, &directories.cache_dir)?;
+
+    let loader_id = modloader_metadata_loader_id(&profile.loader)
+        .ok_or_else(|| anyhow!("profile loader does not support installer metadata"))?;
+    let metadata_path = modloader_metadata_path(loader_id, &profile.game_version, directories)?;
+    if let Some(parent) = metadata_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&metadata_path, generated_json)?;
+
+    let operation_id = Uuid::new_v4();
+    let mut events = vec![operation_event(
+        operation_id,
+        LauncherEventKind::Planning,
+        format!(
+            "Reading {} installer metadata.",
+            modloader_slug(&profile.loader)
+        ),
+        Some(25),
+    )];
+    if !client_processors.is_empty() {
+        events.push(operation_event(
+            operation_id,
+            LauncherEventKind::Planning,
+            format!(
+                "Discovered {} client {} installer processor{}.",
+                client_processors.len(),
+                modloader_slug(&profile.loader),
+                if client_processors.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            Some(65),
+        ));
+    }
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Completed,
+        format!(
+            "Cached {} launch metadata for {}.",
+            modloader_slug(&profile.loader),
+            profile.game_version
+        ),
+        Some(100),
+    ));
+    Ok(Some(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::DownloadArtifacts,
+        subject_id: profile.id.clone(),
+        events,
+    }))
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModloaderInstallerProcessorPlan {
+    pub executable: String,
+    pub executable_jar: String,
+    pub classpath: Vec<String>,
+    pub args: Vec<String>,
+    pub working_dir: String,
+    pub expected_outputs: BTreeMap<String, String>,
+}
+
+pub fn build_modloader_installer_processor_plan_for_profile(
+    profile: &ProfileSummary,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+) -> Result<Option<Vec<ModloaderInstallerProcessorPlan>>> {
+    if !matches!(profile.loader, ModLoader::Forge | ModLoader::Neoforge) {
+        return Ok(None);
+    }
+    validate_profiles(std::slice::from_ref(profile))?;
+    validate_settings(settings)?;
+
+    let loader_id = modloader_metadata_loader_id(&profile.loader)
+        .ok_or_else(|| anyhow!("profile loader does not support installer processors"))?;
+    let metadata_path = modloader_metadata_path(loader_id, &profile.game_version, directories)?;
+    if !metadata_path.is_file() {
+        return Ok(None);
+    }
+    let generated = fs::read_to_string(&metadata_path)?;
+    let version = serde_json::from_str::<GeneratedModloaderVersionJson>(&generated)?;
+    let processors = client_modloader_installer_processors(&version.installer_processors)
+        .cloned()
+        .collect::<Vec<_>>();
+    let required_java = required_java_major_for_minecraft(&profile.game_version);
+    let executable = select_java_executable_for_launch(required_java)?;
+    let working_dir = format!("{}/profiles/{}", directories.data_dir, profile.id);
+
+    processors
+        .iter()
+        .map(|processor| {
+            build_modloader_installer_processor_plan(
+                profile,
+                processor,
+                &version.installer_data,
+                version.installer_path.as_deref(),
+                &executable,
+                &working_dir,
+                directories,
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+pub fn build_modloader_installer_processor_command_specs_for_profile(
+    profile: &ProfileSummary,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+) -> Result<Option<Vec<ProcessCommandSpec>>> {
+    let Some(processors) =
+        build_modloader_installer_processor_plan_for_profile(profile, settings, directories)?
+    else {
+        return Ok(None);
+    };
+    processors
+        .iter()
+        .map(build_modloader_installer_processor_command_spec)
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+pub fn build_modloader_installer_processor_command_spec(
+    processor: &ModloaderInstallerProcessorPlan,
+) -> Result<ProcessCommandSpec> {
+    ensure!(
+        !processor.executable.trim().is_empty(),
+        "modloader processor Java executable is required"
+    );
+    ensure!(
+        !processor.working_dir.trim().is_empty(),
+        "modloader processor working directory is required"
+    );
+    ensure!(
+        Path::new(&processor.executable_jar).is_file(),
+        "modloader processor jar '{}' has not been downloaded",
+        processor.executable_jar
+    );
+    for classpath_entry in &processor.classpath {
+        ensure!(
+            Path::new(classpath_entry).is_file(),
+            "modloader processor classpath entry '{}' has not been downloaded. Install or repair the profile before running installer processors.",
+            classpath_entry
+        );
+    }
+    let main_class = read_jar_main_class(&processor.executable_jar)?;
+    let classpath_separator = if cfg!(windows) { ";" } else { ":" };
+    let mut args = vec![
+        "-cp".to_owned(),
+        processor.classpath.join(classpath_separator),
+        main_class,
+    ];
+    args.extend(processor.args.clone());
+
+    Ok(ProcessCommandSpec {
+        executable: processor.executable.clone(),
+        args,
+        working_dir: processor.working_dir.clone(),
+        env: vec![ProcessEnvVar {
+            key: "THEBOYSLAUNCHER_MODLOADER_PROCESSOR".to_owned(),
+            value: processor.executable_jar.clone(),
+        }],
+    })
+}
+
+pub fn execute_modloader_installer_processors_for_profile(
+    profile: &ProfileSummary,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+) -> Result<Option<OperationPlan>> {
+    let Some(processors) =
+        build_modloader_installer_processor_plan_for_profile(profile, settings, directories)?
+    else {
+        return Ok(None);
+    };
+    if processors.is_empty() {
+        return Ok(None);
+    }
+    execute_modloader_installer_processor_plans(&profile.id, &processors).map(Some)
+}
+
+pub fn execute_modloader_installer_processors_for_profile_with_event_callback<F>(
+    profile: &ProfileSummary,
+    settings: &LauncherSettings,
+    directories: &LauncherDirectories,
+    on_event: F,
+) -> Result<Option<OperationPlan>>
+where
+    F: FnMut(LauncherEvent) -> Result<()>,
+{
+    let Some(processors) =
+        build_modloader_installer_processor_plan_for_profile(profile, settings, directories)?
+    else {
+        return Ok(None);
+    };
+    if processors.is_empty() {
+        return Ok(None);
+    }
+    execute_modloader_installer_processor_plans_with_event_callback(
+        &profile.id,
+        &processors,
+        on_event,
+    )
+    .map(Some)
+}
+
+pub fn execute_modloader_installer_processor_plans(
+    profile_id: &str,
+    processors: &[ModloaderInstallerProcessorPlan],
+) -> Result<OperationPlan> {
+    execute_modloader_installer_processor_plans_with_runner_and_events(
+        profile_id,
+        processors,
+        |spec| run_process_command_spec_to_completion(spec),
+        |_| Ok(()),
+    )
+}
+
+pub fn execute_modloader_installer_processor_plans_with_event_callback<F>(
+    profile_id: &str,
+    processors: &[ModloaderInstallerProcessorPlan],
+    on_event: F,
+) -> Result<OperationPlan>
+where
+    F: FnMut(LauncherEvent) -> Result<()>,
+{
+    execute_modloader_installer_processor_plans_with_runner_and_events(
+        profile_id,
+        processors,
+        |spec| run_process_command_spec_to_completion(spec),
+        on_event,
+    )
+}
+
+#[cfg(test)]
+fn execute_modloader_installer_processor_plans_with_runner<F>(
+    profile_id: &str,
+    processors: &[ModloaderInstallerProcessorPlan],
+    runner: F,
+) -> Result<OperationPlan>
+where
+    F: FnMut(&ProcessCommandSpec) -> Result<ProcessCompletion>,
+{
+    execute_modloader_installer_processor_plans_with_runner_and_events(
+        profile_id,
+        processors,
+        runner,
+        |_| Ok(()),
+    )
+}
+
+fn execute_modloader_installer_processor_plans_with_runner_and_events<F, E>(
+    profile_id: &str,
+    processors: &[ModloaderInstallerProcessorPlan],
+    mut runner: F,
+    mut on_event: E,
+) -> Result<OperationPlan>
+where
+    F: FnMut(&ProcessCommandSpec) -> Result<ProcessCompletion>,
+    E: FnMut(LauncherEvent) -> Result<()>,
+{
+    ensure!(
+        !processors.is_empty(),
+        "modloader installer processor plan is empty"
+    );
+    let operation_id = Uuid::new_v4();
+    let mut events = Vec::new();
+    push_processor_event(
+        &mut events,
+        &mut on_event,
+        processor_operation_event(
+            operation_id,
+            profile_id,
+            LauncherEventKind::Queued,
+            format!(
+                "Queued {} modloader installer processor{}.",
+                processors.len(),
+                if processors.len() == 1 { "" } else { "s" }
+            ),
+            Some(0),
+        ),
+    )?;
+
+    for (index, processor) in processors.iter().enumerate() {
+        let ordinal = index + 1;
+        let progress = processor_progress(ordinal, processors.len());
+        let spec = match build_modloader_installer_processor_command_spec(processor) {
+            Ok(spec) => spec,
+            Err(error) => {
+                let detail = format!(
+                    "Modloader installer processor {ordinal}/{} could not be prepared: {error}",
+                    processors.len()
+                );
+                push_processor_failure_event(
+                    &mut events,
+                    &mut on_event,
+                    operation_id,
+                    profile_id,
+                    ordinal,
+                    processors.len(),
+                    progress.saturating_sub(10),
+                    Some(detail),
+                )?;
+                return Err(error).with_context(|| {
+                    format!(
+                        "modloader installer processor {ordinal}/{} could not be prepared",
+                        processors.len()
+                    )
+                });
+            }
+        };
+        push_processor_event(
+            &mut events,
+            &mut on_event,
+            processor_operation_event(
+                operation_id,
+                profile_id,
+                LauncherEventKind::Planning,
+                format!(
+                    "Prepared modloader installer processor {ordinal}/{}.",
+                    processors.len()
+                ),
+                Some(progress.saturating_sub(10)),
+            ),
+        )?;
+        let completion = match runner(&spec) {
+            Ok(completion) => completion,
+            Err(error) => {
+                let detail = format!(
+                    "Modloader installer processor {ordinal}/{} failed: {error}",
+                    processors.len()
+                );
+                push_processor_failure_event(
+                    &mut events,
+                    &mut on_event,
+                    operation_id,
+                    profile_id,
+                    ordinal,
+                    processors.len(),
+                    progress,
+                    Some(detail),
+                )?;
+                return Err(error).with_context(|| {
+                    format!(
+                        "modloader installer processor {ordinal}/{} failed",
+                        processors.len()
+                    )
+                });
+            }
+        };
+        if completion.exit_code != 0 {
+            let detail = processor_completion_error_message(ordinal, processors.len(), &completion);
+            push_processor_failure_event(
+                &mut events,
+                &mut on_event,
+                operation_id,
+                profile_id,
+                ordinal,
+                processors.len(),
+                progress,
+                Some(detail.clone()),
+            )?;
+            return Err(anyhow!(detail));
+        }
+        if let Err(error) = verify_modloader_processor_outputs(processor) {
+            let detail = format!(
+                "Modloader installer processor {ordinal}/{} output verification failed: {error}",
+                processors.len()
+            );
+            push_processor_failure_event(
+                &mut events,
+                &mut on_event,
+                operation_id,
+                profile_id,
+                ordinal,
+                processors.len(),
+                progress,
+                Some(detail),
+            )?;
+            return Err(error);
+        }
+        push_processor_event(
+            &mut events,
+            &mut on_event,
+            processor_operation_event(
+                operation_id,
+                profile_id,
+                LauncherEventKind::Verifying,
+                format!(
+                    "Verified modloader installer processor {ordinal}/{} outputs.",
+                    processors.len()
+                ),
+                Some(progress),
+            ),
+        )?;
+    }
+
+    push_processor_event(
+        &mut events,
+        &mut on_event,
+        processor_operation_event(
+            operation_id,
+            profile_id,
+            LauncherEventKind::Completed,
+            "Modloader installer processors completed.",
+            Some(100),
+        ),
+    )?;
+
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::DownloadArtifacts,
+        subject_id: profile_id.to_owned(),
+        events,
+    })
+}
+
+struct ProcessCompletion {
+    exit_code: i32,
+    stdout_tail: String,
+    stderr_tail: String,
+}
+
+impl ProcessCompletion {
+    #[cfg(test)]
+    fn success() -> Self {
+        Self {
+            exit_code: 0,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn failure(
+        exit_code: i32,
+        stdout_tail: impl Into<String>,
+        stderr_tail: impl Into<String>,
+    ) -> Self {
+        Self {
+            exit_code,
+            stdout_tail: stdout_tail.into(),
+            stderr_tail: stderr_tail.into(),
+        }
+    }
+}
+
+fn run_process_command_spec_to_completion(spec: &ProcessCommandSpec) -> Result<ProcessCompletion> {
+    ensure!(!spec.executable.trim().is_empty(), "executable is required");
+    prepare_process_working_dir(spec)?;
+    let spawn_args = process_spawn_args(spec)?;
+    let mut command = Command::new(&spec.executable);
+    command
+        .args(&spawn_args)
+        .current_dir(&spec.working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for env_var in &spec.env {
+        command.env(&env_var.key, &env_var.value);
+    }
+    apply_windowless_child_process(&mut command);
+    let output = command.output()?;
+    Ok(ProcessCompletion {
+        exit_code: output.status.code().unwrap_or(1),
+        stdout_tail: process_output_tail(&output.stdout),
+        stderr_tail: process_output_tail(&output.stderr),
+    })
+}
+
+fn process_output_tail(bytes: &[u8]) -> String {
+    const MAX_OUTPUT_TAIL_LINES: usize = 20;
+    let text = String::from_utf8_lossy(bytes);
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(MAX_OUTPUT_TAIL_LINES);
+    lines[start..].join("\n")
+}
+
+#[cfg(windows)]
+fn apply_windowless_child_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn apply_windowless_child_process(_command: &mut Command) {}
+
+fn processor_completion_error_message(
+    ordinal: usize,
+    total: usize,
+    completion: &ProcessCompletion,
+) -> String {
+    let mut message = format!(
+        "modloader installer processor {ordinal}/{total} exited with code {}",
+        completion.exit_code
+    );
+    if !completion.stderr_tail.trim().is_empty() {
+        message.push_str("; stderr tail: ");
+        message.push_str(completion.stderr_tail.trim());
+    }
+    if !completion.stdout_tail.trim().is_empty() {
+        message.push_str("; stdout tail: ");
+        message.push_str(completion.stdout_tail.trim());
+    }
+    message
+}
+
+fn verify_modloader_processor_outputs(processor: &ModloaderInstallerProcessorPlan) -> Result<()> {
+    for (path, expected_sha1) in &processor.expected_outputs {
+        let expected_sha1 = expected_sha1.trim().to_ascii_lowercase();
+        ensure!(
+            expected_sha1.len() == 40
+                && expected_sha1
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit()),
+            "modloader processor output '{}' declares an invalid SHA-1 hash",
+            path
+        );
+        let bytes = fs::read(path)
+            .with_context(|| format!("modloader processor output '{}' was not written", path))?;
+        ensure!(
+            sha1_hex(&bytes) == expected_sha1,
+            "modloader processor output '{}' sha1 mismatch",
+            path
+        );
+    }
+    Ok(())
+}
+
+fn processor_progress(ordinal: usize, total: usize) -> u8 {
+    let total = total.max(1);
+    let progress = 20 + ((ordinal * 70) / total);
+    progress.min(95) as u8
+}
+
+fn push_processor_event<F>(
+    events: &mut Vec<LauncherEvent>,
+    on_event: &mut F,
+    event: LauncherEvent,
+) -> Result<()>
+where
+    F: FnMut(LauncherEvent) -> Result<()>,
+{
+    on_event(event.clone())?;
+    events.push(event);
+    Ok(())
+}
+
+fn push_processor_failure_event<F>(
+    events: &mut Vec<LauncherEvent>,
+    on_event: &mut F,
+    operation_id: Uuid,
+    profile_id: &str,
+    ordinal: usize,
+    total: usize,
+    progress_percent: u8,
+    message: Option<String>,
+) -> Result<()>
+where
+    F: FnMut(LauncherEvent) -> Result<()>,
+{
+    let message = message
+        .unwrap_or_else(|| format!("Modloader installer processor {ordinal}/{total} failed."));
+    push_processor_event(
+        events,
+        on_event,
+        processor_operation_event(
+            operation_id,
+            profile_id,
+            LauncherEventKind::Failed,
+            message,
+            Some(progress_percent.min(99)),
+        ),
+    )
+}
+
+fn processor_operation_event(
+    operation_id: Uuid,
+    profile_id: &str,
+    kind: LauncherEventKind,
+    message: impl Into<String>,
+    progress_percent: Option<u8>,
+) -> LauncherEvent {
+    let mut event = operation_event(operation_id, kind, message, progress_percent);
+    event.operation = Some(LauncherOperation::DownloadArtifacts);
+    event.subject_id = Some(profile_id.to_owned());
+    event
+}
+
+fn build_modloader_installer_processor_plan(
+    profile: &ProfileSummary,
+    processor: &ModloaderInstallerProcessor,
+    installer_data: &BTreeMap<String, ModloaderInstallerDataValue>,
+    installer_path: Option<&str>,
+    executable: &str,
+    working_dir: &str,
+    directories: &LauncherDirectories,
+) -> Result<ModloaderInstallerProcessorPlan> {
+    let jar = trimmed_optional(processor.jar.clone())
+        .ok_or_else(|| anyhow!("modloader installer processor jar is required"))?;
+    let executable_jar = maven_coordinate_cache_path(&directories.cache_dir, &jar)?;
+    let mut classpath = vec![executable_jar.clone()];
+    for coordinate in &processor.classpath {
+        let Some(coordinate) = trimmed_optional(Some(coordinate.clone())) else {
+            continue;
+        };
+        let entry = maven_coordinate_cache_path(&directories.cache_dir, &coordinate)?;
+        if !classpath.contains(&entry) {
+            classpath.push(entry);
+        }
+    }
+
+    let mut placeholders = modloader_installer_processor_placeholders(
+        profile,
+        directories,
+        installer_data,
+        installer_path,
+    )?;
+    let mut expected_outputs = BTreeMap::new();
+    for (placeholder, expected_hash) in &processor.outputs {
+        let token = modloader_processor_placeholder_token(placeholder)?;
+        let path =
+            placeholders
+                .get(placeholder)
+                .cloned()
+                .unwrap_or(modloader_processor_output_path(
+                    profile,
+                    &token,
+                    directories,
+                )?);
+        placeholders.insert(placeholder.clone(), path.clone());
+        if let Some(expected_hash) = expected_hash.as_str().map(str::trim) {
+            if !expected_hash.is_empty() {
+                expected_outputs.insert(
+                    path,
+                    substitute_modloader_processor_placeholders(
+                        expected_hash,
+                        &placeholders,
+                        &directories.cache_dir,
+                    )?,
+                );
+            }
+        }
+    }
+
+    let mut args = Vec::new();
+    for arg in &processor.args {
+        push_modloader_processor_arg_values(&mut args, arg, &placeholders, &directories.cache_dir)?;
+    }
+
+    Ok(ModloaderInstallerProcessorPlan {
+        executable: executable.to_owned(),
+        executable_jar,
+        classpath,
+        args,
+        working_dir: working_dir.to_owned(),
+        expected_outputs,
+    })
+}
+
+fn modloader_installer_processor_placeholders(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+    installer_data: &BTreeMap<String, ModloaderInstallerDataValue>,
+    installer_path: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    let client_jar = format!(
+        "{}/versions/{}/client.jar",
+        directories.cache_dir, profile.game_version
+    );
+    let working_dir = format!("{}/profiles/{}", directories.data_dir, profile.id);
+    let mut placeholders = BTreeMap::new();
+    placeholders.insert("{CACHE_DIR}".to_owned(), directories.cache_dir.clone());
+    placeholders.insert(
+        "{LIBRARY_DIR}".to_owned(),
+        format!("{}/libraries", directories.cache_dir),
+    );
+    placeholders.insert("{MINECRAFT_JAR}".to_owned(), client_jar);
+    placeholders.insert(
+        "{MINECRAFT_VERSION}".to_owned(),
+        profile.game_version.clone(),
+    );
+    placeholders.insert("{ROOT}".to_owned(), working_dir.clone());
+    placeholders.insert("{SIDE}".to_owned(), "client".to_owned());
+    placeholders.insert("{WORKING_DIR}".to_owned(), working_dir);
+    if let Some(installer_path) = installer_path {
+        placeholders.insert("{INSTALLER}".to_owned(), installer_path.to_owned());
+    }
+    for (key, value) in installer_data {
+        let Some(raw_value) = value.client.as_ref() else {
+            continue;
+        };
+        let value = modloader_installer_data_value(raw_value, profile, directories)?;
+        placeholders.insert(format!("{{{key}}}"), value);
+    }
+    Ok(placeholders)
+}
+
+fn modloader_installer_data_value(
+    value: &Value,
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<String> {
+    let raw = match value {
+        Value::String(value) => value.trim(),
+        Value::Number(number) => return Ok(number.to_string()),
+        Value::Bool(value) => return Ok(value.to_string()),
+        Value::Null => return Ok(String::new()),
+        Value::Array(_) | Value::Object(_) => {
+            bail!("modloader installer data values must be scalars")
+        }
+    };
+    if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+        return Ok(raw[1..raw.len() - 1].to_owned());
+    }
+    if raw.starts_with('[') && raw.ends_with(']') && raw.len() >= 2 {
+        return maven_coordinate_cache_path(&directories.cache_dir, &raw[1..raw.len() - 1]);
+    }
+    if let Some(relative) = raw.strip_prefix('/') {
+        ensure_safe_relative_path(relative, "modloader installer data path")?;
+        return Ok(format!(
+            "{}/modloaders/{}/{}/installer-data/{}",
+            directories.cache_dir,
+            modloader_slug(&profile.loader),
+            profile.game_version,
+            relative
+        ));
+    }
+    Ok(raw.to_owned())
+}
+
+fn modloader_processor_placeholder_token(placeholder: &str) -> Result<String> {
+    let trimmed = placeholder.trim();
+    ensure!(
+        trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.len() > 2,
+        "modloader installer output placeholder must use braces: {trimmed}"
+    );
+    let token = &trimmed[1..trimmed.len() - 1];
+    ensure_safe_path_segment(
+        &profile_id_from_name(token),
+        "modloader processor output token",
+    )?;
+    Ok(token.to_owned())
+}
+
+fn modloader_processor_output_path(
+    profile: &ProfileSummary,
+    token: &str,
+    directories: &LauncherDirectories,
+) -> Result<String> {
+    let filename = format!("{}.jar", profile_id_from_name(token));
+    ensure_safe_path_segment(&filename, "modloader processor output filename")?;
+    Ok(format!(
+        "{}/modloaders/{}/{}/processor-outputs/{}",
+        directories.cache_dir,
+        modloader_slug(&profile.loader),
+        profile.game_version,
+        filename
+    ))
+}
+
+fn push_modloader_processor_arg_values(
+    args: &mut Vec<String>,
+    value: &Value,
+    placeholders: &BTreeMap<String, String>,
+    cache_dir: &str,
+) -> Result<()> {
+    match value {
+        Value::String(raw) => args.push(substitute_modloader_processor_placeholders(
+            raw,
+            placeholders,
+            cache_dir,
+        )?),
+        Value::Number(number) => args.push(number.to_string()),
+        Value::Bool(value) => args.push(value.to_string()),
+        Value::Array(values) => {
+            for value in values {
+                push_modloader_processor_arg_values(args, value, placeholders, cache_dir)?;
+            }
+        }
+        Value::Null => {}
+        Value::Object(_) => return Err(anyhow!("modloader processor arguments cannot be objects")),
+    }
+    Ok(())
+}
+
+fn modloader_processor_maven_argument_references(args: &[Value]) -> Result<Vec<String>> {
+    let mut references = Vec::new();
+    for arg in args {
+        collect_modloader_processor_maven_argument_references(arg, &mut references)?;
+    }
+    Ok(references)
+}
+
+fn collect_modloader_processor_maven_argument_references(
+    value: &Value,
+    references: &mut Vec<String>,
+) -> Result<()> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+                let coordinate = trimmed[1..trimmed.len() - 1].to_owned();
+                maven_coordinate_artifact_path(&coordinate)?;
+                references.push(coordinate);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_modloader_processor_maven_argument_references(value, references)?;
+            }
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => {}
+        Value::Object(_) => return Err(anyhow!("modloader processor arguments cannot be objects")),
+    }
+    Ok(())
+}
+
+fn substitute_modloader_processor_placeholders(
+    value: &str,
+    placeholders: &BTreeMap<String, String>,
+    cache_dir: &str,
+) -> Result<String> {
+    let mut substituted = value.to_owned();
+    for (placeholder, replacement) in placeholders {
+        substituted = substituted.replace(placeholder, replacement);
+    }
+    ensure!(
+        !substituted.contains('{') && !substituted.contains('}'),
+        "unsupported modloader processor placeholder in argument '{value}'"
+    );
+    if substituted.starts_with('[') && substituted.ends_with(']') && substituted.len() >= 2 {
+        return maven_coordinate_cache_path(cache_dir, &substituted[1..substituted.len() - 1]);
+    }
+    Ok(substituted)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExtractedModloaderInstallerMetadata {
+    version: GeneratedModloaderVersionJson,
+    processors: Vec<ModloaderInstallerProcessor>,
+}
+
+fn extract_modloader_installer_metadata(
+    bytes: &[u8],
+) -> Result<ExtractedModloaderInstallerMetadata> {
+    let reader = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)?;
+    let mut version = None;
+    if let Ok(mut version_file) = archive.by_name("version.json") {
+        let mut json = String::new();
+        version_file.read_to_string(&mut json)?;
+        version = Some(serde_json::from_str::<GeneratedModloaderVersionJson>(
+            &json,
+        )?);
+    }
+    if let Ok(mut profile_file) = archive.by_name("install_profile.json") {
+        let mut json = String::new();
+        profile_file.read_to_string(&mut json)?;
+        let profile = serde_json::from_str::<ModloaderInstallerProfileJson>(&json)?;
+        let mut version = match (version, profile.version_info) {
+            (Some(mut version), Some(profile_version)) => {
+                merge_generated_modloader_libraries(&mut version, profile_version.libraries);
+                version
+            }
+            (Some(version), None) => version,
+            (None, Some(profile_version)) => profile_version,
+            (None, None) => {
+                return Err(anyhow!(
+                    "installer did not include version.json or install_profile.json versionInfo"
+                ));
+            }
+        };
+        merge_generated_modloader_libraries(&mut version, profile.libraries);
+        version.installer_data = profile.data;
+        return Ok(ExtractedModloaderInstallerMetadata {
+            version,
+            processors: profile.processors,
+        });
+    }
+    if let Some(version) = version {
+        return Ok(ExtractedModloaderInstallerMetadata {
+            version,
+            processors: Vec::new(),
+        });
+    }
+    Err(anyhow!(
+        "modloader installer did not include version.json or install_profile.json versionInfo"
+    ))
+}
+
+fn merge_generated_modloader_libraries(
+    version: &mut GeneratedModloaderVersionJson,
+    libraries: Vec<MinecraftLibrary>,
+) {
+    for library in libraries {
+        if version
+            .libraries
+            .iter()
+            .any(|existing| existing.name == library.name)
+        {
+            continue;
+        }
+        version.libraries.push(library);
+    }
+}
+
+fn extract_modloader_installer_data_files_for_profile(
+    bytes: &[u8],
+    profile: &ProfileSummary,
+    installer_data: &BTreeMap<String, ModloaderInstallerDataValue>,
+    directories: &LauncherDirectories,
+) -> Result<usize> {
+    let mut required_paths = Vec::new();
+    for value in installer_data.values() {
+        let Some(Value::String(raw)) = value.client.as_ref() else {
+            continue;
+        };
+        let Some(relative) = raw.trim().strip_prefix('/') else {
+            continue;
+        };
+        ensure_safe_relative_path(relative, "modloader installer data path")?;
+        if !required_paths.iter().any(|path| path == relative) {
+            required_paths.push(relative.to_owned());
+        }
+    }
+    if required_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let reader = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)?;
+    let data_root = PathBuf::from(&directories.cache_dir)
+        .join("modloaders")
+        .join(modloader_slug(&profile.loader))
+        .join(&profile.game_version)
+        .join("installer-data");
+    let mut extracted = 0usize;
+    for relative in required_paths {
+        let mut entry = archive.by_name(&relative).with_context(|| {
+            format!("modloader installer did not include data file /{relative}")
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+        let destination = data_root.join(&relative);
+        ensure!(
+            path_starts_with(&destination, &data_root),
+            "modloader installer data file escapes the data directory"
+        );
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = fs::File::create(&destination).map_err(|error| {
+            anyhow!(
+                "failed to create modloader installer data file {}: {error}",
+                display_path(&destination)
+            )
+        })?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| {
+            anyhow!("failed to extract modloader installer data file /{relative}: {error}")
+        })?;
+        extracted += 1;
+    }
+    Ok(extracted)
+}
+
+fn read_jar_main_class(path: impl AsRef<Path>) -> Result<String> {
+    let path = path.as_ref();
+    let bytes = fs::read(path)?;
+    let reader = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)?;
+    let mut manifest = archive.by_name("META-INF/MANIFEST.MF").with_context(|| {
+        format!(
+            "jar '{}' does not include META-INF/MANIFEST.MF",
+            path.display()
+        )
+    })?;
+    let mut manifest_text = String::new();
+    manifest.read_to_string(&mut manifest_text)?;
+    manifest_main_class(&manifest_text).ok_or_else(|| {
+        anyhow!(
+            "jar '{}' manifest does not declare Main-Class",
+            path.display()
+        )
+    })
+}
+
+fn manifest_main_class(manifest: &str) -> Option<String> {
+    let mut unfolded: Vec<String> = Vec::new();
+    for line in manifest.lines() {
+        if let Some(continued) = line.strip_prefix(' ') {
+            if let Some(last) = unfolded.last_mut() {
+                last.push_str(continued);
+            }
+        } else {
+            unfolded.push(line.trim_end_matches('\r').to_owned());
+        }
+    }
+
+    unfolded.into_iter().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.eq_ignore_ascii_case("Main-Class") {
+            let main_class = value.trim();
+            if !main_class.is_empty() {
+                return Some(main_class.to_owned());
+            }
+        }
+        None
+    })
+}
+
+fn client_modloader_installer_processors(
+    processors: &[ModloaderInstallerProcessor],
+) -> impl Iterator<Item = &ModloaderInstallerProcessor> {
+    processors.iter().filter(|processor| {
+        processor.sides.is_empty()
+            || processor
+                .sides
+                .iter()
+                .any(|side| side.eq_ignore_ascii_case("client"))
+    })
+}
+
+fn modloader_processor_coordinates(
+    processors: &[ModloaderInstallerProcessor],
+) -> Result<BTreeSet<String>> {
+    let mut coordinates = BTreeSet::new();
+    for processor in processors {
+        if let Some(jar) = trimmed_optional(processor.jar.clone()) {
+            coordinates.insert(jar);
+        }
+        for coordinate in &processor.classpath {
+            if let Some(coordinate) = trimmed_optional(Some(coordinate.clone())) {
+                coordinates.insert(coordinate);
+            }
+        }
+        for coordinate in modloader_processor_maven_argument_references(&processor.args)? {
+            coordinates.insert(coordinate);
+        }
+    }
+    Ok(coordinates)
+}
+
+fn push_modloader_coordinate_download_item(
+    items: &mut Vec<DownloadItem>,
+    loader: &ModLoader,
+    coordinate: ModloaderMavenCoordinate,
+    base_url: Option<&str>,
+    cache_dir: &str,
+) -> Result<()> {
+    let maven = trimmed_optional(coordinate.maven)
+        .ok_or_else(|| anyhow!("modloader dependency Maven coordinate is required"))?;
+    let url_base = base_url
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_modloader_maven_base_url(loader, &maven).to_owned());
+    let hashes = coordinate.hashes.unwrap_or_default();
+    push_maven_download_item(
+        items,
+        &maven,
+        &url_base,
+        trimmed_optional(hashes.sha1),
+        trimmed_optional(hashes.sha256),
+        coordinate.file_size,
+        cache_dir,
+    )
+}
+
+fn push_modloader_library_download_item(
+    items: &mut Vec<DownloadItem>,
+    library: ModloaderLauncherLibrary,
+    cache_dir: &str,
+) -> Result<()> {
+    let base_url = library
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "modloader library '{}' is missing a Maven URL",
+                library.name
+            )
+        })?;
+    push_maven_download_item(
+        items,
+        &library.name,
+        base_url,
+        trimmed_optional(library.sha1),
+        trimmed_optional(library.sha256),
+        library.size,
+        cache_dir,
+    )
+}
+
+fn push_maven_download_item(
+    items: &mut Vec<DownloadItem>,
+    coordinate: &str,
+    base_url: &str,
+    sha1: Option<String>,
+    sha256: Option<String>,
+    size: Option<u64>,
+    cache_dir: &str,
+) -> Result<()> {
+    validate_http_download_url(base_url)?;
+    let artifact_path = maven_coordinate_artifact_path(coordinate)?;
+    let base = reqwest::Url::parse(base_url.trim())?;
+    let url = base.join(&artifact_path)?.to_string();
+    validate_http_download_url(&url)?;
+    items.push(DownloadItem {
+        id: format!("modloader-library-{}", profile_id_from_name(coordinate)),
+        kind: DownloadKind::Library,
+        url,
+        sha1,
+        sha256,
+        sha512: None,
+        md5: None,
+        murmur2: None,
+        size,
+        destination: format!("{cache_dir}/libraries/{artifact_path}"),
+    });
+    Ok(())
+}
+
+fn default_modloader_maven_base_url(loader: &ModLoader, coordinate: &str) -> &'static str {
+    if coordinate.starts_with("net.fabricmc:") {
+        "https://maven.fabricmc.net/"
+    } else if matches!(loader, ModLoader::Quilt) || coordinate.starts_with("org.quiltmc:") {
+        "https://maven.quiltmc.org/repository/release/"
+    } else if matches!(loader, ModLoader::Neoforge) || coordinate.starts_with("net.neoforged:") {
+        "https://maven.neoforged.net/releases/"
+    } else if matches!(loader, ModLoader::Forge)
+        || coordinate.starts_with("net.minecraftforge:")
+        || coordinate.starts_with("de.oceanlabs.mcp:")
+    {
+        "https://maven.minecraftforge.net/"
+    } else {
+        "https://maven.fabricmc.net/"
+    }
+}
+
+fn maven_coordinate_cache_path(cache_dir: &str, coordinate: &str) -> Result<String> {
+    let artifact_path = maven_coordinate_artifact_path(coordinate)?;
+    Ok(format!("{cache_dir}/libraries/{artifact_path}"))
+}
+
+fn maven_coordinate_artifact_path(coordinate: &str) -> Result<String> {
+    let coordinate = coordinate.trim();
+    let (coordinate_without_extension, extension) = coordinate
+        .split_once('@')
+        .map(|(coordinate, extension)| (coordinate, extension.trim()))
+        .unwrap_or((coordinate, "jar"));
+    ensure_safe_path_segment(extension, "Maven artifact extension")?;
+    let parts = coordinate_without_extension.split(':').collect::<Vec<_>>();
+    ensure!(
+        parts.len() == 3 || parts.len() == 4,
+        "Maven coordinate '{coordinate}' must include group, artifact, version, and optional classifier"
+    );
+    let group = parts[0].trim();
+    let artifact = parts[1].trim();
+    let version = parts[2].trim();
+    let classifier = parts.get(3).map(|classifier| classifier.trim());
+    ensure_safe_relative_path(&group.replace('.', "/"), "Maven group path")?;
+    ensure_safe_path_segment(artifact, "Maven artifact id")?;
+    ensure_safe_path_segment(&version, "Maven version")?;
+    if let Some(classifier) = classifier {
+        ensure_safe_path_segment(classifier, "Maven classifier")?;
+    }
+    let file_name = if let Some(classifier) = classifier {
+        format!("{artifact}-{version}-{classifier}.{extension}")
+    } else {
+        format!("{artifact}-{version}.{extension}")
+    };
+    Ok(format!(
+        "{}/{}/{}/{}",
+        group.replace('.', "/"),
+        artifact,
+        version,
+        file_name
+    ))
+}
+
+fn expand_minecraft_arguments(
+    arguments: &[MinecraftArgument],
+    context: &MinecraftLaunchContext<'_>,
+) -> Result<Vec<String>> {
+    let mut expanded = Vec::new();
+    for argument in arguments {
+        match argument {
+            MinecraftArgument::String(value) => {
+                expanded.push(substitute_minecraft_argument(value, context)?);
+            }
+            MinecraftArgument::Object(object)
+                if minecraft_argument_rules_allow(object, context) =>
+            {
+                match &object.value {
+                    MinecraftArgumentValue::String(value) => {
+                        expanded.push(substitute_minecraft_argument(value, context)?);
+                    }
+                    MinecraftArgumentValue::List(values) => {
+                        for value in values {
+                            expanded.push(substitute_minecraft_argument(value, context)?);
+                        }
+                    }
+                }
+            }
+            MinecraftArgument::Object(_) => {}
+        }
+    }
+    Ok(expanded)
+}
+
+fn minecraft_argument_rules_allow(
+    argument: &MinecraftArgumentObject,
+    context: &MinecraftLaunchContext<'_>,
+) -> bool {
+    if argument.rules.is_empty() {
+        return true;
+    }
+    let current_os = minecraft_os_name();
+    let mut allowed = false;
+    for rule in &argument.rules {
+        let os_matches = rule
+            .os
+            .as_ref()
+            .and_then(|os| os.name.as_deref())
+            .map(|name| name == current_os)
+            .unwrap_or(true);
+        let features_match = rule
+            .features
+            .as_ref()
+            .map(|features| minecraft_rule_features_match(features, context))
+            .unwrap_or(true);
+        if os_matches && features_match {
+            allowed = matches!(rule.action, MinecraftRuleAction::Allow);
+        }
+    }
+    allowed
+}
+
+fn minecraft_rule_features_match(
+    features: &MinecraftRuleFeatures,
+    context: &MinecraftLaunchContext<'_>,
+) -> bool {
+    let known_features_match = features
+        .has_custom_resolution
+        .map(|expected| expected == context.profile.resolution.is_some())
+        .unwrap_or(true)
+        && features
+            .is_demo_user
+            .map(|expected| !expected)
+            .unwrap_or(true)
+        && features
+            .has_quick_plays_support
+            .map(|expected| !expected)
+            .unwrap_or(true)
+        && features
+            .is_quick_play_singleplayer
+            .map(|expected| !expected)
+            .unwrap_or(true)
+        && features
+            .is_quick_play_multiplayer
+            .map(|expected| !expected)
+            .unwrap_or(true)
+        && features
+            .is_quick_play_realms
+            .map(|expected| !expected)
+            .unwrap_or(true);
+
+    known_features_match && features.extra.values().all(|expected| !*expected)
+}
+
+fn substitute_minecraft_argument(
+    value: &str,
+    context: &MinecraftLaunchContext<'_>,
+) -> Result<String> {
+    let resolution_width = context
+        .profile
+        .resolution
+        .as_ref()
+        .map(|resolution| resolution.width)
+        .unwrap_or(854)
+        .to_string();
+    let resolution_height = context
+        .profile
+        .resolution
+        .as_ref()
+        .map(|resolution| resolution.height)
+        .unwrap_or(480)
+        .to_string();
+    let natives_dir = format!(
+        "{}/natives/{}",
+        context.cache_dir, context.profile.game_version
+    );
+    let game_assets = format!("{}/virtual/legacy", context.assets_dir);
+    let library_dir = format!("{}/libraries", context.cache_dir);
+    let classpath_separator = if cfg!(windows) { ";" } else { ":" };
+    let replacements = [
+        ("${auth_player_name}", context.username),
+        ("${version_name}", context.profile.game_version.as_str()),
+        ("${game_directory}", context.working_dir),
+        ("${assets_root}", context.assets_dir),
+        ("${game_assets}", game_assets.as_str()),
+        ("${assets_index_name}", context.asset_index_id.as_str()),
+        ("${auth_uuid}", context.uuid),
+        ("${auth_access_token}", context.access_token),
+        ("${auth_session}", context.access_token),
+        ("${user_properties}", "{}"),
+        ("${clientid}", ""),
+        ("${auth_xuid}", ""),
+        ("${user_type}", "msa"),
+        ("${version_type}", context.version_type.as_str()),
+        ("${natives_directory}", natives_dir.as_str()),
+        ("${library_directory}", library_dir.as_str()),
+        ("${classpath_separator}", classpath_separator),
+        ("${launcher_name}", "TheBoysLauncher"),
+        ("${launcher_version}", env!("CARGO_PKG_VERSION")),
+        ("${classpath}", context.classpath),
+        ("${resolution_width}", resolution_width.as_str()),
+        ("${resolution_height}", resolution_height.as_str()),
+    ];
+    let mut substituted = value.to_owned();
+    for (placeholder, replacement) in replacements {
+        substituted = substituted.replace(placeholder, replacement);
+    }
+    ensure!(
+        !substituted.contains("${"),
+        "unsupported Minecraft launch argument placeholder in '{value}'"
+    );
+    Ok(substituted)
+}
+
+pub fn build_process_command_spec(launch_plan: &LaunchPlan) -> Result<ProcessCommandSpec> {
+    ensure!(
+        !launch_plan.java_executable.trim().is_empty(),
+        "java executable is required"
+    );
+    ensure!(
+        !launch_plan.working_dir.trim().is_empty(),
+        "working directory is required"
+    );
+    validate_launch_plan_java_executable(launch_plan)?;
+    validate_launch_plan_artifacts(launch_plan)?;
+
+    Ok(ProcessCommandSpec {
+        executable: launch_plan.java_executable.clone(),
+        args: launch_plan.arguments.clone(),
+        working_dir: launch_plan.working_dir.clone(),
+        env: vec![
+            ProcessEnvVar {
+                key: "THEBOYSLAUNCHER_PROFILE_ID".to_owned(),
+                value: launch_plan.profile_id.clone(),
+            },
+            ProcessEnvVar {
+                key: "THEBOYSLAUNCHER_PROFILE_NAME".to_owned(),
+                value: launch_plan.profile_name.clone(),
+            },
+        ],
+    })
+}
+
+fn validate_launch_plan_java_executable(launch_plan: &LaunchPlan) -> Result<()> {
+    let executable = launch_plan.java_executable.trim();
+    let path = Path::new(executable);
+    let is_explicit_path =
+        path.is_absolute() || executable.contains('/') || executable.contains('\\');
+    if !is_explicit_path || path.is_file() {
+        return Ok(());
+    }
+    bail!(
+        "Java executable {} is missing. Install a managed Java runtime from Settings before launching.",
+        executable
+    )
+}
+
+fn validate_launch_plan_artifacts(launch_plan: &LaunchPlan) -> Result<()> {
+    let missing = missing_launch_plan_artifacts(launch_plan)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if missing.len() == 1 {
+        bail!(
+            "launch artifact is missing: {}. Install or repair the profile before launching.",
+            missing[0]
+        );
+    }
+    bail!(
+        "launch artifacts are missing: {}. Install or repair the profile before launching.",
+        missing.join("; ")
+    );
+}
+
+fn missing_launch_plan_artifacts(launch_plan: &LaunchPlan) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    missing.extend(missing_launch_plan_classpath_entries(launch_plan)?);
+    missing.extend(missing_launch_plan_module_path_entries(launch_plan)?);
+    if let Some(asset_index) = missing_launch_plan_asset_index(launch_plan)? {
+        missing.push(asset_index);
+    }
+    if let Some(natives_dir) = missing_launch_plan_natives_directory(launch_plan) {
+        missing.push(natives_dir);
+    }
+    Ok(missing)
+}
+
+fn missing_launch_plan_classpath_entries(launch_plan: &LaunchPlan) -> Result<Vec<String>> {
+    let Some((_, classpath)) = launch_plan_argument_value_for_any(
+        &launch_plan.arguments,
+        &["-cp", "-classpath", "--class-path"],
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut missing = Vec::new();
+    for entry in classpath_entries(&classpath) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.contains('*') {
+            if let Some(wildcard_issue) = classpath_wildcard_missing_artifact(entry)? {
+                missing.push(wildcard_issue);
+            }
+            continue;
+        }
+        if !Path::new(entry).is_file() {
+            missing.push(entry.to_owned());
+        }
+    }
+    Ok(missing)
+}
+
+fn missing_launch_plan_module_path_entries(launch_plan: &LaunchPlan) -> Result<Vec<String>> {
+    let Some((_, module_path)) =
+        launch_plan_argument_value_for_any(&launch_plan.arguments, &["-p", "--module-path"])?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut missing = Vec::new();
+    for entry in classpath_entries(&module_path) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.contains('*') {
+            if let Some(wildcard_issue) = classpath_wildcard_missing_artifact(entry)? {
+                missing.push(format!("module path {wildcard_issue}"));
+            }
+            continue;
+        }
+        if !Path::new(entry).is_file() {
+            missing.push(format!("module path {entry}"));
+        }
+    }
+    Ok(missing)
+}
+
+fn missing_launch_plan_asset_index(launch_plan: &LaunchPlan) -> Result<Option<String>> {
+    let assets_dir = launch_plan_argument_value_checked(&launch_plan.arguments, "--assetsDir")?;
+    let asset_index = launch_plan_argument_value_checked(&launch_plan.arguments, "--assetIndex")?;
+    let (assets_dir, asset_index) = match (assets_dir, asset_index) {
+        (Some(assets_dir), Some(asset_index)) => (assets_dir, asset_index),
+        (Some(_), None) => return Ok(None),
+        (None, Some(_)) => {
+            return Ok(Some(
+                "asset launch argument --assetIndex requires --assetsDir".to_owned(),
+            ));
+        }
+        (None, None) => return Ok(None),
+    };
+    ensure_safe_path_segment(&asset_index, "Minecraft asset index id")?;
+    let asset_index_path = PathBuf::from(assets_dir)
+        .join("indexes")
+        .join(format!("{asset_index}.json"));
+    if asset_index_path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "asset index {}",
+        display_path(&asset_index_path)
+    )))
+}
+
+fn missing_launch_plan_natives_directory(launch_plan: &LaunchPlan) -> Option<String> {
+    let natives_dir = launch_plan
+        .arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("-Djava.library.path="))?;
+    if Path::new(natives_dir).is_dir() {
+        return None;
+    }
+    Some(format!("natives directory {natives_dir}"))
+}
+
+#[cfg(test)]
+fn launch_plan_argument_value(arguments: &[String], name: &str) -> Option<String> {
+    arguments
+        .windows(2)
+        .find_map(|pair| (pair[0] == name).then(|| pair[1].clone()))
+}
+
+fn launch_plan_argument_value_for_any<'a>(
+    arguments: &[String],
+    names: &'a [&'a str],
+) -> Result<Option<(&'a str, String)>> {
+    for name in names {
+        if let Some(value) = launch_plan_argument_value_checked(arguments, name)? {
+            return Ok(Some((name, value)));
+        }
+    }
+    Ok(None)
+}
+
+fn launch_plan_argument_value_checked(arguments: &[String], name: &str) -> Result<Option<String>> {
+    let Some(index) = arguments.iter().position(|argument| argument == name) else {
+        return Ok(None);
+    };
+    let value = arguments
+        .get(index + 1)
+        .ok_or_else(|| anyhow!("launch argument '{name}' is missing a value"))?
+        .trim();
+    ensure!(
+        !value.is_empty(),
+        "launch argument '{name}' is missing a value"
+    );
+    ensure!(
+        !looks_like_launch_option(value),
+        "launch argument '{name}' is missing a value"
+    );
+    Ok(Some(value.to_owned()))
+}
+
+fn looks_like_launch_option(value: &str) -> bool {
+    value.starts_with('-')
+}
+
+fn classpath_entries(classpath: &str) -> Vec<&str> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    classpath.split(separator).collect()
+}
+
+fn classpath_wildcard_missing_artifact(entry: &str) -> Result<Option<String>> {
+    if !entry.contains('*') {
+        return Ok(None);
+    }
+    let Some(parent) = entry
+        .strip_suffix("/*")
+        .or_else(|| entry.strip_suffix("\\*"))
+    else {
+        return Ok(Some(format!("unsupported classpath wildcard {entry}")));
+    };
+    ensure!(
+        !parent.trim().is_empty(),
+        "classpath wildcard parent directory is required"
+    );
+    let parent = Path::new(parent);
+    if parent.is_dir() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "classpath wildcard directory {}",
+        display_path(parent)
+    )))
+}
+
+fn server_launch_arguments(server: &ServerLaunchTarget) -> Result<Vec<String>> {
+    let address = server.address.trim();
+    ensure!(!address.is_empty(), "server address is required");
+    validate_server_address(address)?;
+    if let Some(port) = server.port {
+        ensure!(port > 0, "server port must be greater than zero");
+    }
+
+    let mut arguments = vec!["--server".to_owned(), address.to_owned()];
+    if let Some(port) = server.port {
+        arguments.push("--port".to_owned());
+        arguments.push(port.to_string());
+    }
+    Ok(arguments)
+}
+
+fn validate_server_address(address: &str) -> Result<()> {
+    ensure!(
+        address.len() <= 253,
+        "server address must be 253 characters or fewer"
+    );
+    ensure!(
+        !address.contains("://"),
+        "server address must be a host, not a URL"
+    );
+    ensure!(
+        !address.chars().any(char::is_control),
+        "server address cannot contain control characters"
+    );
+    ensure!(
+        !address.chars().any(char::is_whitespace),
+        "server address cannot contain whitespace"
+    );
+    ensure!(
+        !address
+            .chars()
+            .any(|character| matches!(character, '/' | '\\' | '?' | '#' | '@' | '%')),
+        "server address cannot contain URL path, query, fragment, userinfo, or escape characters"
+    );
+    ensure!(
+        address
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '-' | '_' | ':' | '[' | ']')),
+        "server address contains unsupported characters"
+    );
+    Ok(())
+}
+
+fn validate_minecraft_session(session: &MinecraftSession) -> Result<()> {
+    let username = session.username.trim();
+    ensure!(
+        !username.is_empty(),
+        "Minecraft session username is required"
+    );
+    ensure!(
+        username.len() <= 16
+            && username
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "Minecraft session username is invalid"
+    );
+    ensure!(
+        !session.access_token.trim().is_empty(),
+        "Minecraft access token is required"
+    );
+    ensure!(
+        session.uuid != Uuid::nil(),
+        "Minecraft session UUID is required"
+    );
+    Ok(())
+}
+
+fn validate_stored_minecraft_session(session: &StoredMinecraftSession) -> Result<()> {
+    validate_minecraft_session(&session.session)?;
+    ensure!(
+        session.stored_at_unix_seconds > 0,
+        "Minecraft session stored timestamp is required"
+    );
+    if let Some(account_id) = session.account_id.as_deref() {
+        ensure!(
+            !account_id.trim().is_empty(),
+            "Minecraft session account id cannot be blank"
+        );
+        ensure!(
+            !account_id.chars().any(char::is_whitespace),
+            "Minecraft session account id cannot contain whitespace"
+        );
+    }
+    if let Some(expires_at) = session.expires_at_unix_seconds {
+        ensure!(
+            expires_at > session.stored_at_unix_seconds,
+            "Minecraft session expiration must be after it was stored"
+        );
+    }
+    if let Some(refresh_token) = session.microsoft_refresh_token.as_deref() {
+        ensure!(
+            !refresh_token.trim().is_empty(),
+            "Microsoft refresh token cannot be blank"
+        );
+        ensure!(
+            !refresh_token.chars().any(char::is_whitespace),
+            "Microsoft refresh token cannot contain whitespace"
+        );
+    }
+    if let Some(client_id) = session.microsoft_client_id.as_deref() {
+        ensure!(
+            !client_id.trim().is_empty(),
+            "Microsoft OAuth client id cannot be blank"
+        );
+        ensure!(
+            client_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+            "Microsoft OAuth client id contains unsupported characters"
+        );
+    }
+    if session.microsoft_refresh_token.is_some() {
+        ensure!(
+            session.microsoft_client_id.is_some(),
+            "Microsoft OAuth client id is required when storing a refresh token"
+        );
+    }
+    if let Some(user_id) = session.microsoft_user_id.as_deref() {
+        ensure!(
+            !user_id.trim().is_empty(),
+            "Microsoft user id cannot be blank"
+        );
+        ensure!(
+            !user_id.chars().any(char::is_whitespace),
+            "Microsoft user id cannot contain whitespace"
+        );
+    }
+    if let Some(scopes) = session.microsoft_scopes.as_deref() {
+        ensure!(
+            !scopes.trim().is_empty(),
+            "Microsoft OAuth scopes cannot be blank"
+        );
+    }
+    Ok(())
+}
+
+fn validate_usable_stored_minecraft_session(
+    session: &StoredMinecraftSession,
+    now_unix_seconds: u64,
+) -> Result<()> {
+    validate_stored_minecraft_session(session)?;
+    if let Some(expires_at) = session.expires_at_unix_seconds {
+        ensure!(
+            expires_at > now_unix_seconds,
+            "stored Minecraft session has expired"
+        );
+    }
+    Ok(())
+}
+
+pub fn prepare_process_working_dir(spec: &ProcessCommandSpec) -> Result<()> {
+    ensure!(
+        !spec.working_dir.trim().is_empty(),
+        "working directory is required"
+    );
+    fs::create_dir_all(&spec.working_dir)?;
+    Ok(())
+}
+
+fn process_spawn_args(spec: &ProcessCommandSpec) -> Result<Vec<String>> {
+    if !should_use_java_argument_file(spec) {
+        return Ok(spec.args.clone());
+    }
+
+    let arg_file = materialize_java_argument_file(spec)?;
+    Ok(vec![format!("@{}", display_path(&arg_file))])
+}
+
+fn should_use_java_argument_file(spec: &ProcessCommandSpec) -> bool {
+    if !is_java_executable(&spec.executable) {
+        return false;
+    }
+    spec.args.iter().map(|arg| arg.len() + 1).sum::<usize>() > JAVA_ARG_FILE_THRESHOLD_CHARS
+}
+
+fn is_java_executable(executable: &str) -> bool {
+    Path::new(executable)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_ascii_lowercase().starts_with("java"))
+        .unwrap_or(false)
+}
+
+fn materialize_java_argument_file(spec: &ProcessCommandSpec) -> Result<PathBuf> {
+    let arg_file_dir = PathBuf::from(&spec.working_dir)
+        .join(".theboyslauncher")
+        .join("launch-args");
+    fs::create_dir_all(&arg_file_dir)?;
+    let arg_file = arg_file_dir.join(format!("{}.args", Uuid::new_v4()));
+    let contents = spec
+        .args
+        .iter()
+        .map(|arg| quote_java_argument_file_arg(arg))
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_private_file_atomic(&arg_file, contents.as_bytes())?;
+    Ok(arg_file)
+}
+
+fn quote_java_argument_file_arg(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for character in arg.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+pub fn spawn_process(spec: &ProcessCommandSpec) -> Result<ProcessStartResult> {
+    ensure!(!spec.executable.trim().is_empty(), "executable is required");
+    prepare_process_working_dir(spec)?;
+    let spawn_args = process_spawn_args(spec)?;
+
+    let mut command = Command::new(&spec.executable);
+    command
+        .args(&spawn_args)
+        .current_dir(&spec.working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for env_var in &spec.env {
+        command.env(&env_var.key, &env_var.value);
+    }
+    apply_windowless_child_process(&mut command);
+
+    let child = command.spawn()?;
+    Ok(ProcessStartResult {
+        process_id: child.id(),
+        command: spec.clone(),
+    })
+}
+
+pub struct ProcessRegistry {
+    processes: Mutex<BTreeMap<Uuid, ManagedProcess>>,
+    subscribers: Arc<Mutex<Vec<Sender<ManagedProcessSummary>>>>,
+}
+
+struct ManagedProcess {
+    child: Child,
+    command: ProcessCommandSpec,
+    state: ManagedProcessState,
+    exit_code: Option<i32>,
+    stop_requested: bool,
+    started_at_unix_seconds: u64,
+    exited_at_unix_seconds: Option<u64>,
+    output: Arc<Mutex<Vec<ProcessOutputLine>>>,
+    total_output_line_count: Arc<AtomicU64>,
+    lifecycle: Arc<Mutex<ProcessLifecycleSnapshot>>,
+}
+
+#[derive(Clone)]
+struct ProcessLifecycleSnapshot {
+    state: ManagedProcessState,
+    stop_requested: bool,
+    exit_code: Option<i32>,
+    exited_at_unix_seconds: Option<u64>,
+}
+
+impl ProcessRegistry {
+    pub fn new() -> Self {
+        Self {
+            processes: Mutex::new(BTreeMap::new()),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn spawn(&self, spec: ProcessCommandSpec) -> Result<ManagedProcessSummary> {
+        ensure!(!spec.executable.trim().is_empty(), "executable is required");
+        prepare_process_working_dir(&spec)?;
+        let spawn_args = process_spawn_args(&spec)?;
+
+        let mut command = Command::new(&spec.executable);
+        command
+            .args(&spawn_args)
+            .current_dir(&spec.working_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for env_var in &spec.env {
+            command.env(&env_var.key, &env_var.value);
+        }
+        apply_windowless_child_process(&mut command);
+
+        let mut child = command.spawn()?;
+        let process_id = child.id();
+        let id = Uuid::new_v4();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let total_output_line_count = Arc::new(AtomicU64::new(0));
+        let started_at_unix_seconds = current_unix_seconds();
+        let lifecycle = Arc::new(Mutex::new(ProcessLifecycleSnapshot {
+            state: ManagedProcessState::Running,
+            stop_requested: false,
+            exit_code: None,
+            exited_at_unix_seconds: None,
+        }));
+        if let Some(stdout) = child.stdout.take() {
+            spawn_output_reader(
+                stdout,
+                ProcessOutputStream::Stdout,
+                ProcessUpdateContext {
+                    id,
+                    process_id,
+                    command: spec.clone(),
+                    started_at_unix_seconds,
+                    output: Arc::clone(&output),
+                    total_output_line_count: Arc::clone(&total_output_line_count),
+                    lifecycle: Arc::clone(&lifecycle),
+                    subscribers: Arc::clone(&self.subscribers),
+                },
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_output_reader(
+                stderr,
+                ProcessOutputStream::Stderr,
+                ProcessUpdateContext {
+                    id,
+                    process_id,
+                    command: spec.clone(),
+                    started_at_unix_seconds,
+                    output: Arc::clone(&output),
+                    total_output_line_count: Arc::clone(&total_output_line_count),
+                    lifecycle: Arc::clone(&lifecycle),
+                    subscribers: Arc::clone(&self.subscribers),
+                },
+            );
+        }
+        let managed = ManagedProcess {
+            child,
+            command: spec,
+            state: ManagedProcessState::Running,
+            exit_code: None,
+            stop_requested: false,
+            started_at_unix_seconds,
+            exited_at_unix_seconds: None,
+            output,
+            total_output_line_count,
+            lifecycle,
+        };
+        let summary = managed.summary(id, process_id);
+
+        self.processes
+            .lock()
+            .map_err(|_| anyhow!("process registry lock is poisoned"))?
+            .insert(id, managed);
+
+        self.broadcast(&summary)?;
+        Ok(summary)
+    }
+
+    pub fn list(&self) -> Result<Vec<ManagedProcessSummary>> {
+        let mut processes = self
+            .processes
+            .lock()
+            .map_err(|_| anyhow!("process registry lock is poisoned"))?;
+        let changed = refresh_processes(&mut processes)?;
+
+        let summaries = processes
+            .iter()
+            .map(|(id, process)| process.summary(*id, process.child.id()))
+            .collect::<Vec<_>>();
+        drop(processes);
+        for summary in changed {
+            self.broadcast(&summary)?;
+        }
+        Ok(summaries)
+    }
+
+    pub fn clear_exited(&self) -> Result<Vec<ManagedProcessSummary>> {
+        let mut processes = self
+            .processes
+            .lock()
+            .map_err(|_| anyhow!("process registry lock is poisoned"))?;
+        let changed = refresh_processes(&mut processes)?;
+        processes.retain(|_, process| process.state != ManagedProcessState::Exited);
+        let summaries = processes
+            .iter()
+            .map(|(id, process)| process.summary(*id, process.child.id()))
+            .collect::<Vec<_>>();
+        drop(processes);
+        for summary in changed {
+            self.broadcast(&summary)?;
+        }
+        Ok(summaries)
+    }
+
+    pub fn stop(&self, id: Uuid) -> Result<ManagedProcessSummary> {
+        let (changed, stop_requested, summary) = {
+            let mut processes = self
+                .processes
+                .lock()
+                .map_err(|_| anyhow!("process registry lock is poisoned"))?;
+            let changed = refresh_processes(&mut processes)?;
+
+            let process = processes
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("managed process not found: {id}"))?;
+            let mut stop_requested = None;
+            if process.state == ManagedProcessState::Running {
+                process.state = ManagedProcessState::StopRequested;
+                process.stop_requested = true;
+                process.sync_lifecycle_snapshot()?;
+                stop_requested = Some(process.summary(id, process.child.id()));
+                process.child.kill()?;
+                let status = process.child.wait()?;
+                process.exit_code = status.code();
+                process.state = ManagedProcessState::Exited;
+                process.exited_at_unix_seconds = Some(current_unix_seconds());
+                process.sync_lifecycle_snapshot()?;
+            }
+
+            (
+                changed,
+                stop_requested,
+                process.summary(id, process.child.id()),
+            )
+        };
+        let already_broadcast = changed
+            .iter()
+            .any(|changed_summary| changed_summary.id == id);
+        let stop_was_requested = stop_requested.is_some();
+        for changed_summary in changed {
+            self.broadcast(&changed_summary)?;
+        }
+        if let Some(stop_requested) = stop_requested {
+            self.broadcast(&stop_requested)?;
+        }
+        if stop_was_requested && !already_broadcast {
+            self.broadcast(&summary)?;
+        }
+        Ok(summary)
+    }
+
+    pub fn wait_for_startup(
+        &self,
+        id: Uuid,
+        grace_period: Duration,
+    ) -> Result<ManagedProcessSummary> {
+        let deadline = Instant::now() + grace_period;
+        loop {
+            let (changed, summary) = {
+                let mut processes = self
+                    .processes
+                    .lock()
+                    .map_err(|_| anyhow!("process registry lock is poisoned"))?;
+                let changed = refresh_processes(&mut processes)?;
+                let process = processes
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("managed process not found: {id}"))?;
+                (changed, process.summary(id, process.child.id()))
+            };
+            for changed_summary in changed {
+                self.broadcast(&changed_summary)?;
+            }
+            if summary.state != ManagedProcessState::Running || Instant::now() >= deadline {
+                return Ok(summary);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn export_log(
+        &self,
+        id: Uuid,
+        directories: &LauncherDirectories,
+    ) -> Result<ProcessLogExport> {
+        let (changed, summary) = {
+            let mut processes = self
+                .processes
+                .lock()
+                .map_err(|_| anyhow!("process registry lock is poisoned"))?;
+            let changed = refresh_processes(&mut processes)?;
+            let process = processes
+                .get(&id)
+                .ok_or_else(|| anyhow!("managed process not found: {id}"))?;
+            (changed, process.summary(id, process.child.id()))
+        };
+        for changed_summary in changed {
+            self.broadcast(&changed_summary)?;
+        }
+        export_process_log(&summary, directories)
+    }
+
+    pub fn subscribe(&self) -> Result<Receiver<ManagedProcessSummary>> {
+        let (tx, rx) = mpsc::channel();
+        self.subscribers
+            .lock()
+            .map_err(|_| anyhow!("process registry subscriber list is poisoned"))?
+            .push(tx);
+        Ok(rx)
+    }
+
+    fn broadcast(&self, summary: &ManagedProcessSummary) -> Result<()> {
+        broadcast_process_summary(&self.subscribers, summary)
+    }
+}
+
+impl Default for ProcessRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManagedProcess {
+    fn sync_lifecycle_snapshot(&self) -> Result<()> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow!("process lifecycle lock is poisoned"))?;
+        lifecycle.state = self.state.clone();
+        lifecycle.stop_requested = self.stop_requested;
+        lifecycle.exit_code = self.exit_code;
+        lifecycle.exited_at_unix_seconds = self.exited_at_unix_seconds;
+        Ok(())
+    }
+
+    fn summary(&self, id: Uuid, process_id: u32) -> ManagedProcessSummary {
+        let runtime_until = self
+            .exited_at_unix_seconds
+            .unwrap_or_else(current_unix_seconds)
+            .max(self.started_at_unix_seconds);
+        let output = self
+            .output
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or_default();
+        let total_output_line_count = self.total_output_line_count.load(Ordering::Relaxed);
+        let dropped_output_line_count = total_output_line_count.saturating_sub(output.len() as u64);
+        ManagedProcessSummary {
+            id,
+            process_id,
+            command: redact_process_command_spec(&self.command),
+            state: self.state.clone(),
+            stop_requested: self.stop_requested,
+            exit_code: self.exit_code,
+            started_at_unix_seconds: self.started_at_unix_seconds,
+            exited_at_unix_seconds: self.exited_at_unix_seconds,
+            runtime_seconds: runtime_until.saturating_sub(self.started_at_unix_seconds),
+            total_output_line_count,
+            dropped_output_line_count,
+            output,
+        }
+    }
+}
+
+fn refresh_processes(
+    processes: &mut BTreeMap<Uuid, ManagedProcess>,
+) -> Result<Vec<ManagedProcessSummary>> {
+    let mut changed = Vec::new();
+    for (id, process) in processes.iter_mut() {
+        if process.state == ManagedProcessState::Running {
+            if let Some(status) = process.child.try_wait()? {
+                process.exit_code = status.code();
+                process.state = ManagedProcessState::Exited;
+                process.exited_at_unix_seconds = Some(current_unix_seconds());
+                process.sync_lifecycle_snapshot()?;
+                changed.push(process.summary(*id, process.child.id()));
+            }
+        }
+    }
+    Ok(changed)
+}
+
+pub fn export_process_log(
+    summary: &ManagedProcessSummary,
+    directories: &LauncherDirectories,
+) -> Result<ProcessLogExport> {
+    ensure!(
+        !directories.log_dir.trim().is_empty(),
+        "log directory is required"
+    );
+    let output_dir = PathBuf::from(&directories.log_dir).join("processes");
+    fs::create_dir_all(&output_dir)?;
+    let path = output_dir.join(format!(
+        "{}-{}.log",
+        summary.started_at_unix_seconds, summary.id
+    ));
+    fs::write(&path, format_process_log(summary))?;
+    Ok(ProcessLogExport {
+        managed_process_id: summary.id,
+        process_id: summary.process_id,
+        path: display_path(&path),
+        line_count: summary.output.len(),
+        total_output_line_count: summary.total_output_line_count,
+        dropped_output_line_count: summary.dropped_output_line_count,
+    })
+}
+
+fn format_process_log(summary: &ManagedProcessSummary) -> String {
+    let mut lines = vec![
+        format!("managedProcessId: {}", summary.id),
+        format!("processId: {}", summary.process_id),
+        format!("state: {:?}", summary.state),
+        format!("exitCode: {:?}", summary.exit_code),
+        format!("startedAtUnixSeconds: {}", summary.started_at_unix_seconds),
+        format!("exitedAtUnixSeconds: {:?}", summary.exited_at_unix_seconds),
+        format!("runtimeSeconds: {}", summary.runtime_seconds),
+        format!("totalOutputLineCount: {}", summary.total_output_line_count),
+        format!(
+            "droppedOutputLineCount: {}",
+            summary.dropped_output_line_count
+        ),
+        format!("capturedOutputLineCount: {}", summary.output.len()),
+        format!("executable: {}", summary.command.executable),
+        format!("workingDir: {}", summary.command.working_dir),
+        format!(
+            "args: {}",
+            redact_process_args(&summary.command.args).join(" ")
+        ),
+        "env:".to_owned(),
+    ];
+    for env_var in redact_process_env(&summary.command.env) {
+        lines.push(format!("  {}={}", env_var.key, env_var.value));
+    }
+    lines.extend([String::new(), "output:".to_owned()]);
+    for line in &summary.output {
+        lines.push(format!("{:?}: {}", line.stream, line.line));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn redact_process_command_spec(spec: &ProcessCommandSpec) -> ProcessCommandSpec {
+    ProcessCommandSpec {
+        executable: spec.executable.clone(),
+        args: redact_process_args(&spec.args),
+        working_dir: spec.working_dir.clone(),
+        env: redact_process_env(&spec.env),
+    }
+}
+
+fn redact_process_args(args: &[String]) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for argument in args {
+        if redact_next {
+            redacted.push("[redacted]".to_owned());
+            redact_next = false;
+            continue;
+        }
+        if is_sensitive_process_arg(argument) {
+            redacted.push(argument.clone());
+            redact_next = true;
+        } else if let Some((key, _)) = argument.split_once('=') {
+            if is_sensitive_process_arg(key) {
+                redacted.push(format!("{key}=[redacted]"));
+            } else {
+                redacted.push(argument.clone());
+            }
+        } else {
+            redacted.push(argument.clone());
+        }
+    }
+    redacted
+}
+
+fn is_sensitive_process_arg(argument: &str) -> bool {
+    matches!(argument, "--accessToken" | "--access_token" | "--token")
+}
+
+fn redact_process_env(env: &[ProcessEnvVar]) -> Vec<ProcessEnvVar> {
+    env.iter()
+        .map(|env_var| ProcessEnvVar {
+            key: env_var.key.clone(),
+            value: if is_sensitive_process_env_key(&env_var.key) {
+                "[redacted]".to_owned()
+            } else {
+                env_var.value.clone()
+            },
+        })
+        .collect()
+}
+
+fn is_sensitive_process_env_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("credential")
+}
+
+struct ProcessUpdateContext {
+    id: Uuid,
+    process_id: u32,
+    command: ProcessCommandSpec,
+    started_at_unix_seconds: u64,
+    output: Arc<Mutex<Vec<ProcessOutputLine>>>,
+    total_output_line_count: Arc<AtomicU64>,
+    lifecycle: Arc<Mutex<ProcessLifecycleSnapshot>>,
+    subscribers: Arc<Mutex<Vec<Sender<ManagedProcessSummary>>>>,
+}
+
+fn spawn_output_reader<R>(reader: R, stream: ProcessOutputStream, context: ProcessUpdateContext)
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            let total_output_line_count = context
+                .total_output_line_count
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let output_snapshot = if let Ok(mut output) = context.output.lock() {
+                output.push(ProcessOutputLine {
+                    stream: stream.clone(),
+                    line,
+                });
+                trim_process_output(&mut output, PROCESS_OUTPUT_CAPACITY);
+                output.clone()
+            } else {
+                break;
+            };
+            let dropped_output_line_count =
+                total_output_line_count.saturating_sub(output_snapshot.len() as u64);
+            let lifecycle = match context.lifecycle.lock() {
+                Ok(lifecycle) => lifecycle.clone(),
+                Err(_) => break,
+            };
+            let runtime_until = lifecycle
+                .exited_at_unix_seconds
+                .unwrap_or_else(current_unix_seconds)
+                .max(context.started_at_unix_seconds);
+            let summary = ManagedProcessSummary {
+                id: context.id,
+                process_id: context.process_id,
+                command: redact_process_command_spec(&context.command),
+                state: lifecycle.state,
+                stop_requested: lifecycle.stop_requested,
+                exit_code: lifecycle.exit_code,
+                started_at_unix_seconds: context.started_at_unix_seconds,
+                exited_at_unix_seconds: lifecycle.exited_at_unix_seconds,
+                runtime_seconds: runtime_until.saturating_sub(context.started_at_unix_seconds),
+                total_output_line_count,
+                dropped_output_line_count,
+                output: output_snapshot,
+            };
+            let _ = broadcast_process_summary(&context.subscribers, &summary);
+        }
+    });
+}
+
+fn broadcast_process_summary(
+    subscribers: &Arc<Mutex<Vec<Sender<ManagedProcessSummary>>>>,
+    summary: &ManagedProcessSummary,
+) -> Result<()> {
+    let mut subscribers = subscribers
+        .lock()
+        .map_err(|_| anyhow!("process registry subscriber list is poisoned"))?;
+    subscribers.retain(|subscriber| subscriber.send(summary.clone()).is_ok());
+    Ok(())
+}
+
+fn trim_process_output(output: &mut Vec<ProcessOutputLine>, capacity: usize) {
+    if output.len() > capacity {
+        let overflow = output.len() - capacity;
+        output.drain(0..overflow);
+    }
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub struct LauncherEventLog {
+    events: Mutex<Vec<LauncherEvent>>,
+    subscribers: Mutex<Vec<Sender<LauncherEvent>>>,
+    capacity: usize,
+}
+
+impl LauncherEventLog {
+    pub fn new() -> Self {
+        Self::with_capacity(500)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            subscribers: Mutex::new(Vec::new()),
+            capacity,
+        }
+    }
+
+    pub fn record_plan(&self, plan: &OperationPlan) -> Result<Vec<LauncherEvent>> {
+        let occurred_at_unix_seconds = current_unix_seconds();
+        let new_events = plan
+            .events
+            .iter()
+            .cloned()
+            .map(|mut event| {
+                event.operation = Some(plan.operation.clone());
+                event.subject_id = Some(plan.subject_id.clone());
+                event.occurred_at_unix_seconds = occurred_at_unix_seconds;
+                event
+            })
+            .collect::<Vec<_>>();
+        let snapshot = {
+            let mut events = self
+                .events
+                .lock()
+                .map_err(|_| anyhow!("launcher event log lock is poisoned"))?;
+            events.extend(new_events.iter().cloned());
+            trim_event_log(&mut events, self.capacity);
+            events.clone()
+        };
+        self.broadcast(&new_events)?;
+        Ok(snapshot)
+    }
+
+    pub fn record_event(&self, mut event: LauncherEvent) -> Result<Vec<LauncherEvent>> {
+        if event.occurred_at_unix_seconds == 0 {
+            event.occurred_at_unix_seconds = current_unix_seconds();
+        }
+        let snapshot = {
+            let mut events = self
+                .events
+                .lock()
+                .map_err(|_| anyhow!("launcher event log lock is poisoned"))?;
+            events.push(event.clone());
+            trim_event_log(&mut events, self.capacity);
+            events.clone()
+        };
+        self.broadcast(std::slice::from_ref(&event))?;
+        Ok(snapshot)
+    }
+
+    pub fn list(&self, limit: Option<usize>) -> Result<Vec<LauncherEvent>> {
+        let events = self
+            .events
+            .lock()
+            .map_err(|_| anyhow!("launcher event log lock is poisoned"))?;
+        let limit = limit.unwrap_or(events.len());
+        let skip = events.len().saturating_sub(limit);
+        Ok(events.iter().skip(skip).cloned().collect())
+    }
+
+    pub fn subscribe(&self) -> Result<Receiver<LauncherEvent>> {
+        let (tx, rx) = mpsc::channel();
+        self.subscribers
+            .lock()
+            .map_err(|_| anyhow!("launcher event subscriber list is poisoned"))?
+            .push(tx);
+        Ok(rx)
+    }
+
+    fn broadcast(&self, events: &[LauncherEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .map_err(|_| anyhow!("launcher event subscriber list is poisoned"))?;
+        subscribers.retain(|subscriber| {
+            events
+                .iter()
+                .all(|event| subscriber.send(event.clone()).is_ok())
+        });
+        Ok(())
+    }
+}
+
+impl Default for LauncherEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn trim_event_log(events: &mut Vec<LauncherEvent>, capacity: usize) {
+    if capacity == 0 {
+        events.clear();
+    } else if events.len() > capacity {
+        let overflow = events.len() - capacity;
+        events.drain(0..overflow);
+    }
+}
+
+pub fn discover_java_runtimes() -> Vec<JavaRuntimeSummary> {
+    #[cfg(test)]
+    if let Some(runtimes) = java_runtime_discovery_override() {
+        return runtimes;
+    }
+
+    let mut runtimes = BTreeMap::new();
+
+    for (path, source) in java_candidate_paths() {
+        if !path.is_file() {
+            continue;
+        }
+        let key = display_path(&path).to_ascii_lowercase();
+        if runtimes.contains_key(&key) {
+            continue;
+        }
+        if let Ok(runtime) = inspect_java_runtime(&path, source) {
+            runtimes.insert(key, runtime);
+        }
+    }
+
+    runtimes.into_values().collect()
+}
+
+#[cfg(test)]
+static JAVA_RUNTIME_DISCOVERY_OVERRIDE: std::sync::Mutex<Option<Vec<JavaRuntimeSummary>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn java_runtime_discovery_override() -> Option<Vec<JavaRuntimeSummary>> {
+    JAVA_RUNTIME_DISCOVERY_OVERRIDE
+        .lock()
+        .expect("Java runtime override lock should be available")
+        .clone()
+}
+
+pub async fn fetch_recommended_java_runtime_manifest() -> Result<Vec<JavaRuntimeManifestEntry>> {
+    let Some(url) = env::var(JAVA_RUNTIME_MANIFEST_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(recommended_java_runtime_manifest());
+    };
+
+    validate_http_download_url(&url)?;
+    let response = download_http_client().get(&url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Ok(recommended_java_runtime_manifest());
+    }
+    let body = response.text().await?;
+    parse_recommended_java_runtime_manifest_json(&body)
+        .or_else(|_| Ok(recommended_java_runtime_manifest()))
+}
+
+pub fn recommended_java_runtime_manifest() -> Vec<JavaRuntimeManifestEntry> {
+    vec![
+        JavaRuntimeManifestEntry {
+            runtime_id: "temurin-25-windows-x64".to_owned(),
+            label: "Temurin 25".to_owned(),
+            vendor: "Eclipse Adoptium".to_owned(),
+            major_version: 25,
+            platform: "windows-x64".to_owned(),
+            url: "https://api.adoptium.net/v3/binary/latest/25/ga/windows/x64/jdk/hotspot/normal/eclipse".to_owned(),
+            sha1: None,
+            size: None,
+            archive_file_name: Some("temurin-25-windows-x64.zip".to_owned()),
+            notes: "Recommended for current Minecraft versions that require Java 25.".to_owned(),
+        },
+        JavaRuntimeManifestEntry {
+            runtime_id: "temurin-21-windows-x64".to_owned(),
+            label: "Temurin 21 LTS".to_owned(),
+            vendor: "Eclipse Adoptium".to_owned(),
+            major_version: 21,
+            platform: "windows-x64".to_owned(),
+            url: "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse".to_owned(),
+            sha1: None,
+            size: None,
+            archive_file_name: Some("temurin-21-windows-x64.zip".to_owned()),
+            notes: "Recommended for Minecraft 1.20.5 and newer.".to_owned(),
+        },
+        JavaRuntimeManifestEntry {
+            runtime_id: "temurin-17-windows-x64".to_owned(),
+            label: "Temurin 17 LTS".to_owned(),
+            vendor: "Eclipse Adoptium".to_owned(),
+            major_version: 17,
+            platform: "windows-x64".to_owned(),
+            url: "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse".to_owned(),
+            sha1: None,
+            size: None,
+            archive_file_name: Some("temurin-17-windows-x64.zip".to_owned()),
+            notes: "Recommended for Minecraft 1.18 through 1.20.4.".to_owned(),
+        },
+        JavaRuntimeManifestEntry {
+            runtime_id: "temurin-8-windows-x64".to_owned(),
+            label: "Temurin 8 LTS".to_owned(),
+            vendor: "Eclipse Adoptium".to_owned(),
+            major_version: 8,
+            platform: "windows-x64".to_owned(),
+            url: "https://api.adoptium.net/v3/binary/latest/8/ga/windows/x64/jdk/hotspot/normal/eclipse".to_owned(),
+            sha1: None,
+            size: None,
+            archive_file_name: Some("temurin-8-windows-x64.zip".to_owned()),
+            notes: "Recommended for legacy Minecraft beta and alpha versions.".to_owned(),
+        },
+    ]
+}
+
+fn parse_recommended_java_runtime_manifest_json(
+    body: &str,
+) -> Result<Vec<JavaRuntimeManifestEntry>> {
+    let value = serde_json::from_str::<Value>(body)?;
+    let entries_value = match value {
+        Value::Array(entries) => Value::Array(entries),
+        Value::Object(mut object) => object
+            .remove("runtimes")
+            .ok_or_else(|| anyhow!("Java runtime manifest is missing runtimes"))?,
+        _ => bail!("Java runtime manifest must be an array or object"),
+    };
+    let entries = serde_json::from_value::<Vec<JavaRuntimeManifestEntry>>(entries_value)?;
+    normalize_java_runtime_manifest_entries(entries)
+}
+
+fn normalize_java_runtime_manifest_entries(
+    entries: Vec<JavaRuntimeManifestEntry>,
+) -> Result<Vec<JavaRuntimeManifestEntry>> {
+    ensure!(
+        !entries.is_empty(),
+        "Java runtime manifest must contain at least one runtime"
+    );
+    let mut normalized = Vec::with_capacity(entries.len());
+    let mut seen_ids = BTreeMap::new();
+
+    for entry in entries {
+        let runtime_id = profile_id_from_name(&entry.runtime_id);
+        ensure!(!runtime_id.is_empty(), "Java runtime id is required");
+        ensure!(
+            seen_ids.insert(runtime_id.clone(), ()).is_none(),
+            "duplicate Java runtime id: {runtime_id}"
+        );
+        let label = entry.label.trim().to_owned();
+        let vendor = entry.vendor.trim().to_owned();
+        let platform = entry.platform.trim().to_owned();
+        let url = entry.url.trim().to_owned();
+        let archive_file_name = entry
+            .archive_file_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let notes = entry.notes.trim().to_owned();
+
+        ensure!(!label.is_empty(), "Java runtime label is required");
+        ensure!(!vendor.is_empty(), "Java runtime vendor is required");
+        ensure!(
+            entry.major_version > 0,
+            "Java runtime major version is required"
+        );
+        ensure!(!platform.is_empty(), "Java runtime platform is required");
+        validate_http_download_url(&url)?;
+        if let Some(archive_file_name) = archive_file_name.as_deref() {
+            ensure!(
+                Path::new(archive_file_name)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(archive_file_name),
+                "Java runtime archive file name must not contain path separators"
+            );
+        }
+
+        normalized.push(JavaRuntimeManifestEntry {
+            runtime_id,
+            label,
+            vendor,
+            major_version: entry.major_version,
+            platform,
+            url,
+            sha1: entry
+                .sha1
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            size: entry.size,
+            archive_file_name,
+            notes,
+        });
+    }
+
+    Ok(normalized)
+}
+
+pub fn java_runtime_request_from_manifest_entry(
+    entry: &JavaRuntimeManifestEntry,
+) -> JavaRuntimeDownloadRequest {
+    JavaRuntimeDownloadRequest {
+        runtime_id: entry.runtime_id.clone(),
+        url: entry.url.clone(),
+        sha1: entry.sha1.clone(),
+        size: entry.size,
+        archive_file_name: entry.archive_file_name.clone(),
+    }
+}
+
+pub fn inspect_java_runtime(path: &Path, source: JavaRuntimeSource) -> Result<JavaRuntimeSummary> {
+    match Command::new(path).arg("-version").output() {
+        Ok(output) => {
+            let version_text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            java_runtime_from_version_output(path, source.clone(), &version_text).or_else(|error| {
+                match source {
+                    JavaRuntimeSource::Bundled => java_runtime_from_release_file(path),
+                    _ => Err(error),
+                }
+            })
+        }
+        Err(error) => match source {
+            JavaRuntimeSource::Bundled => java_runtime_from_release_file(path),
+            _ => Err(error.into()),
+        },
+    }
+}
+
+pub fn java_runtime_from_version_output(
+    path: &Path,
+    source: JavaRuntimeSource,
+    version_output: &str,
+) -> Result<JavaRuntimeSummary> {
+    let (version, major_version) = parse_java_version(version_output)
+        .ok_or_else(|| anyhow!("could not parse Java version output"))?;
+    let path = display_path(path);
+
+    Ok(JavaRuntimeSummary {
+        id: format!("java-{major_version}-{}", profile_id_from_name(&path)),
+        path,
+        version,
+        major_version,
+        source,
+    })
+}
+
+pub fn parse_java_version(version_output: &str) -> Option<(String, u32)> {
+    let quoted = version_output
+        .split('"')
+        .nth(1)
+        .map(str::to_owned)
+        .or_else(|| {
+            version_output
+                .split_whitespace()
+                .find(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+                .map(str::to_owned)
+        })?;
+    let major = java_major_from_version(&quoted)?;
+    Some((quoted, major))
+}
+
+fn java_runtime_from_release_file(path: &Path) -> Result<JavaRuntimeSummary> {
+    let runtime_root = managed_runtime_root_for_java_path(path)
+        .ok_or_else(|| anyhow!("managed Java runtime path is not under a runtime root"))?;
+    let release_path = runtime_root.join("release");
+    let release = fs::read_to_string(&release_path).map_err(|error| {
+        anyhow!(
+            "failed to read managed Java runtime release file {}: {error}",
+            display_path(&release_path)
+        )
+    })?;
+    let version = parse_java_release_version(&release)
+        .ok_or_else(|| anyhow!("managed Java runtime release file is missing JAVA_VERSION"))?;
+    let major_version = java_major_from_version(&version)
+        .ok_or_else(|| anyhow!("managed Java runtime release file has invalid JAVA_VERSION"))?;
+    let path = display_path(path);
+
+    Ok(JavaRuntimeSummary {
+        id: format!("java-{major_version}-{}", profile_id_from_name(&path)),
+        path,
+        version,
+        major_version,
+        source: JavaRuntimeSource::Bundled,
+    })
+}
+
+fn managed_runtime_root_for_java_path(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("bin") {
+        parent.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent.to_path_buf())
+    }
+}
+
+fn parse_java_release_version(release: &str) -> Option<String> {
+    release.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "JAVA_VERSION" {
+            return None;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'').trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+pub fn select_java_runtime(
+    runtimes: &[JavaRuntimeSummary],
+    minimum_major_version: u32,
+) -> Option<JavaRuntimeSummary> {
+    let mut candidates = runtimes
+        .iter()
+        .filter(|runtime| java_runtime_compatible(runtime.major_version, minimum_major_version))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.major_version
+            .cmp(&right.major_version)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    candidates.into_iter().next()
+}
+
+fn java_runtime_compatible(runtime_major_version: u32, required_major_version: u32) -> bool {
+    if required_major_version <= 8 {
+        return runtime_major_version == 8;
+    }
+    runtime_major_version >= required_major_version
+}
+
+fn java_requirement_label(required_major_version: u32) -> String {
+    if required_major_version <= 8 {
+        "Java 8".to_owned()
+    } else {
+        format!("Java {required_major_version} or newer")
+    }
+}
+
+fn select_java_executable_for_launch(required_major_version: u32) -> Result<String> {
+    select_java_executable_from_runtimes(&discover_java_runtimes(), required_major_version)
+}
+
+fn select_java_executable_for_profile_launch(
+    profile: &ProfileSummary,
+    settings: &LauncherSettings,
+    required_major_version: u32,
+) -> Result<String> {
+    if let Some(path) = profile
+        .java_runtime_override_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return validate_java_runtime_override(path, required_major_version, "profile");
+    }
+    if let Some(path) = settings
+        .java_runtime_override_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return validate_java_runtime_override(path, required_major_version, "global");
+    }
+    select_java_executable_for_launch(required_major_version)
+}
+
+fn validate_java_runtime_override(
+    path: &str,
+    required_major_version: u32,
+    scope: &str,
+) -> Result<String> {
+    let runtime = inspect_java_runtime(Path::new(path), JavaRuntimeSource::Path).with_context(|| {
+        format!(
+            "configured {scope} Java override could not be inspected at {path}. Choose a valid java executable or use Automatic."
+        )
+    })?;
+    ensure!(
+        java_runtime_compatible(runtime.major_version, required_major_version),
+        "Minecraft requires {}, but the configured {} Java override is Java {} at {}. Choose Automatic or a compatible Java executable.",
+        java_requirement_label(required_major_version),
+        scope,
+        runtime.major_version,
+        runtime.path
+    );
+    Ok(runtime.path)
+}
+
+fn select_java_executable_from_runtimes(
+    runtimes: &[JavaRuntimeSummary],
+    required_major_version: u32,
+) -> Result<String> {
+    if let Some(runtime) = select_java_runtime(runtimes, required_major_version) {
+        return Ok(runtime.path);
+    }
+
+    let discovered = runtimes
+        .iter()
+        .map(|runtime| format!("Java {} at {}", runtime.major_version, runtime.path))
+        .collect::<Vec<_>>();
+    let discovered_message = if discovered.is_empty() {
+        "no Java runtimes were discovered".to_owned()
+    } else {
+        format!("discovered {}", discovered.join(", "))
+    };
+    bail!(
+        "Minecraft requires {}, but {}. Install a managed Java runtime from Settings before launching.",
+        java_requirement_label(required_major_version),
+        discovered_message
+    )
+}
+
+pub fn required_java_major_for_minecraft(game_version: &str) -> u32 {
+    if game_version
+        .split_once('w')
+        .and_then(|(year, _week)| year.parse::<u32>().ok())
+        .is_some_and(|year| year >= 26)
+    {
+        return 25;
+    }
+
+    let parts = game_version.split('.').collect::<Vec<_>>();
+    let major = parts.get(0).and_then(|value| value.parse::<u32>().ok());
+    let minor = parts.get(1).and_then(|value| value.parse::<u32>().ok());
+    let patch = parts
+        .get(2)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    match (major, minor, patch) {
+        (Some(26..), _, _) => 25,
+        (Some(1), Some(21..), _) => 21,
+        (Some(1), Some(20), patch) if patch >= 5 => 21,
+        (Some(1), Some(18..), _) => 17,
+        (Some(1), Some(17), _) => 16,
+        _ => 8,
+    }
+}
+
+fn required_java_major_for_profile_version(
+    game_version: &str,
+    details: Option<&MinecraftVersionDetails>,
+) -> u32 {
+    details
+        .and_then(|details| details.java_version.as_ref())
+        .map(|java| java.major_version)
+        .unwrap_or_else(|| required_java_major_for_minecraft(game_version))
+}
+
+pub async fn fetch_minecraft_version_manifest() -> Result<MinecraftVersionManifest> {
+    Ok(reqwest::get(VERSION_MANIFEST_URL).await?.json().await?)
+}
+
+pub async fn fetch_minecraft_version_details(url: &str) -> Result<MinecraftVersionDetails> {
+    validate_http_download_url(url)?;
+    Ok(reqwest::get(url.trim()).await?.json().await?)
+}
+
+pub async fn fetch_minecraft_asset_index(url: &str) -> Result<MinecraftAssetIndexObjects> {
+    validate_http_download_url(url)?;
+    Ok(reqwest::get(url.trim()).await?.json().await?)
+}
+
+pub fn resolve_minecraft_version(
+    manifest: &MinecraftVersionManifest,
+    requested_version: Option<&str>,
+) -> Result<MinecraftVersionSummary> {
+    let version_id = requested_version
+        .filter(|version| !version.trim().is_empty())
+        .unwrap_or(&manifest.latest.release);
+
+    manifest
+        .versions
+        .iter()
+        .find(|version| version.id == version_id)
+        .map(MinecraftVersionSummary::from)
+        .ok_or_else(|| anyhow!("Minecraft version '{version_id}' was not found"))
+}
+
+pub fn minecraft_version_summaries(
+    manifest: &MinecraftVersionManifest,
+) -> Vec<MinecraftVersionSummary> {
+    manifest
+        .versions
+        .iter()
+        .map(MinecraftVersionSummary::from)
+        .collect()
+}
+
+pub fn build_download_plan(
+    details: &MinecraftVersionDetails,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure_safe_path_segment(&details.id, "Minecraft version id")?;
+    ensure_safe_path_segment(&details.asset_index.id, "Minecraft asset index id")?;
+    validate_http_download_url(&details.downloads.client.url)?;
+    validate_http_download_url(&details.asset_index.url)?;
+    let mut items = Vec::new();
+
+    items.push(DownloadItem {
+        id: format!("client-{}", details.id),
+        kind: DownloadKind::ClientJar,
+        url: details.downloads.client.url.trim().to_owned(),
+        sha1: Some(details.downloads.client.sha1.clone()),
+        sha256: None,
+        sha512: None,
+        md5: None,
+        murmur2: None,
+        size: Some(details.downloads.client.size),
+        destination: format!(
+            "{}/versions/{}/client.jar",
+            directories.cache_dir, details.id
+        ),
+    });
+
+    items.push(DownloadItem {
+        id: format!("asset-index-{}", details.asset_index.id),
+        kind: DownloadKind::AssetIndex,
+        url: details.asset_index.url.trim().to_owned(),
+        sha1: Some(details.asset_index.sha1.clone()),
+        sha256: None,
+        sha512: None,
+        md5: None,
+        murmur2: None,
+        size: Some(details.asset_index.size),
+        destination: format!(
+            "{}/assets/indexes/{}.json",
+            directories.cache_dir, details.asset_index.id
+        ),
+    });
+
+    for library in &details.libraries {
+        if !library_allowed_on_current_os(library) {
+            continue;
+        }
+        if let Some(artifact) = library.downloads.artifact.as_ref() {
+            validate_http_download_url(&artifact.url)?;
+            ensure_safe_relative_path(&artifact.path, "library artifact path")?;
+            if native_library_coordinate_classifier_for_current_os(library).is_some() {
+                let file_name = Path::new(&artifact.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        anyhow!("native library artifact path must include a file name")
+                    })?;
+                items.push(DownloadItem {
+                    id: format!("native-library-{}", library.name),
+                    kind: DownloadKind::NativeLibrary,
+                    url: artifact.url.trim().to_owned(),
+                    sha1: Some(artifact.sha1.clone()),
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(artifact.size),
+                    destination: format!(
+                        "{}/natives/{}/{}",
+                        directories.cache_dir, details.id, file_name
+                    ),
+                });
+                continue;
+            }
+            items.push(DownloadItem {
+                id: format!("library-{}", library.name),
+                kind: DownloadKind::Library,
+                url: artifact.url.trim().to_owned(),
+                sha1: Some(artifact.sha1.clone()),
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: Some(artifact.size),
+                destination: format!("{}/libraries/{}", directories.cache_dir, artifact.path),
+            });
+        }
+        if let Some((classifier, artifact)) = native_library_artifact_for_current_os(library) {
+            validate_http_download_url(&artifact.url)?;
+            ensure_safe_relative_path(&artifact.path, "native library artifact path")?;
+            let file_name = Path::new(&artifact.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("native library artifact path must include a file name"))?;
+            items.push(DownloadItem {
+                id: format!("native-library-{}-{classifier}", library.name),
+                kind: DownloadKind::NativeLibrary,
+                url: artifact.url.trim().to_owned(),
+                sha1: Some(artifact.sha1.clone()),
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: Some(artifact.size),
+                destination: format!(
+                    "{}/natives/{}/{}",
+                    directories.cache_dir, details.id, file_name
+                ),
+            });
+        }
+    }
+
+    Ok(DownloadPlan {
+        version_id: details.id.clone(),
+        items,
+    })
+}
+
+fn prepend_version_json_download_item(
+    plan: &mut DownloadPlan,
+    version: &MinecraftVersionSummary,
+    directories: &LauncherDirectories,
+) -> Result<()> {
+    ensure!(
+        plan.version_id == version.id,
+        "download plan version '{}' does not match metadata version '{}'",
+        plan.version_id,
+        version.id
+    );
+    validate_http_download_url(&version.url)?;
+    let destination = cached_minecraft_version_details_path(&version.id, directories)?;
+    plan.items.insert(
+        0,
+        DownloadItem {
+            id: format!("version-json-{}", version.id),
+            kind: DownloadKind::VersionJson,
+            url: version.url.trim().to_owned(),
+            sha1: version.sha1.clone(),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: display_path(&destination),
+        },
+    );
+    Ok(())
+}
+
+pub fn build_curated_pack_file_download_plan(
+    pack_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let entry = modpack_catalog_entry(pack_id)?;
+    build_curated_pack_file_download_plan_from_entry(&entry, directories)
+}
+
+fn build_curated_pack_file_download_plan_from_entry(
+    entry: &ModpackCatalogEntry,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let profile_root = PathBuf::from(&directories.data_dir)
+        .join("profiles")
+        .join(&entry.id);
+    let items = curated_pack_files_for_entry(entry)?
+        .into_iter()
+        .map(|file| pack_file_download_item(&profile_root, file))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(DownloadPlan {
+        version_id: entry.id.clone(),
+        items,
+    })
+}
+
+pub async fn fetch_packwiz_pack_file_download_plan(
+    pack_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let (plan, _) = fetch_packwiz_pack_file_download_plan_with_info(pack_id, directories).await?;
+    Ok(plan)
+}
+
+pub async fn fetch_packwiz_pack_file_download_plan_with_remote_catalog(
+    pack_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let catalog = fetch_modpack_catalog_with_fallback().await;
+    let entry = catalog
+        .iter()
+        .find(|pack| pack.id == pack_id)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))?;
+    let (plan, _) = fetch_packwiz_pack_file_download_plan_for_entry(entry, directories).await?;
+    Ok(plan)
+}
+
+async fn fetch_packwiz_pack_file_download_plan_with_info(
+    pack_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<(DownloadPlan, PackwizPackInfo)> {
+    ensure!(!pack_id.trim().is_empty(), "pack_id is required");
+    let entry = modpack_catalog_entry(pack_id)?;
+    fetch_packwiz_pack_file_download_plan_for_entry(&entry, directories).await
+}
+
+async fn fetch_packwiz_pack_file_download_plan_for_entry(
+    entry: &ModpackCatalogEntry,
+    directories: &LauncherDirectories,
+) -> Result<(DownloadPlan, PackwizPackInfo)> {
+    let pack_info = fetch_packwiz_pack_info(&entry.pack_url).await?;
+    let index = fetch_packwiz_index(&entry.pack_url, &pack_info).await?;
+    let plan =
+        build_packwiz_pack_file_download_plan_from_index(&entry, &pack_info, &index, directories)?;
+    Ok((plan, pack_info))
+}
+
+pub async fn fetch_install_auxiliary_download_plan_for_pack_profile(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let (mut plan, pack_info) =
+        fetch_packwiz_pack_file_download_plan_with_info(&profile.id, directories).await?;
+    if pack_info.loader != ModLoader::Vanilla {
+        append_modloader_items_for_pack_info(&mut plan, profile, &pack_info, directories)?;
+    }
+    Ok(plan)
+}
+
+pub async fn fetch_install_auxiliary_download_plan_for_catalog_entry_profile(
+    entry: &ModpackCatalogEntry,
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let (mut plan, pack_info) =
+        fetch_packwiz_pack_file_download_plan_for_entry(entry, directories).await?;
+    if pack_info.loader != ModLoader::Vanilla {
+        append_modloader_items_for_pack_info(&mut plan, profile, &pack_info, directories)?;
+    }
+    Ok(plan)
+}
+
+pub async fn fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let catalog = fetch_modpack_catalog_with_fallback().await;
+    let entry = catalog
+        .iter()
+        .find(|pack| pack.id == profile.id)
+        .ok_or_else(|| anyhow!("pack '{}' was not found", profile.id))?;
+    fetch_install_auxiliary_download_plan_for_catalog_entry_profile(entry, profile, directories)
+        .await
+}
+
+pub async fn fetch_repair_auxiliary_download_plan_for_profile_with_remote_catalog(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let catalog = fetch_modpack_catalog_with_fallback().await;
+    fetch_repair_auxiliary_download_plan_for_profile_with_catalog(profile, &catalog, directories)
+        .await
+}
+
+pub async fn fetch_repair_auxiliary_download_plan_for_profile_with_catalog(
+    profile: &ProfileSummary,
+    catalog: &[ModpackCatalogEntry],
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    if let Some(entry) = repair_catalog_entry_for_profile(profile, catalog) {
+        return fetch_install_auxiliary_download_plan_for_catalog_entry_profile(
+            entry,
+            profile,
+            directories,
+        )
+        .await;
+    }
+    build_repair_auxiliary_download_plan_for_profile(profile, directories)
+}
+
+fn repair_catalog_entry_for_profile<'a>(
+    profile: &ProfileSummary,
+    catalog: &'a [ModpackCatalogEntry],
+) -> Option<&'a ModpackCatalogEntry> {
+    profile.installed_pack_version.as_ref()?;
+    catalog.iter().find(|pack| pack.id == profile.id)
+}
+
+fn build_packwiz_pack_file_download_plan_from_index(
+    entry: &ModpackCatalogEntry,
+    pack_info: &PackwizPackInfo,
+    index: &PackwizIndexInfo,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure!(
+        !index.hash_format.trim().is_empty(),
+        "packwiz index hash-format is required"
+    );
+    let profile_root = PathBuf::from(&directories.data_dir)
+        .join("profiles")
+        .join(&entry.id);
+    let mut files = curated_pack_files_for_entry(entry)?;
+    if let Some(index_file) = pack_info.index_file.as_deref() {
+        let (sha1, sha256, sha512, md5, murmur2) = match (
+            pack_info.index_hash_format.as_deref(),
+            pack_info.index_hash.as_deref(),
+        ) {
+            (Some(hash_format), Some(hash)) => packwiz_download_hashes(hash_format, hash)?,
+            _ => (None, None, None, None, None),
+        };
+        files.push(CuratedPackFile {
+            id: format!("{}-packwiz-index", entry.id),
+            url: resolve_packwiz_relative_url(&entry.pack_url, index_file)?,
+            sha1,
+            sha256,
+            sha512,
+            md5,
+            murmur2,
+            size: None,
+            target_path: index_file.to_owned(),
+            preserve: false,
+        });
+    }
+
+    for file in &index.files {
+        let (sha1, sha256, sha512, md5, murmur2) =
+            packwiz_download_hashes(&index.hash_format, &file.hash)?;
+        let target_path = file.alias.as_deref().unwrap_or(&file.file);
+        let role = if file.metafile {
+            "metafile"
+        } else if file.preserve {
+            "preserved"
+        } else {
+            "file"
+        };
+        let hash_prefix = file.hash.chars().take(12).collect::<String>();
+        files.push(CuratedPackFile {
+            id: profile_id_from_name(&format!(
+                "{} {} {} {}",
+                entry.id, role, target_path, hash_prefix
+            )),
+            url: resolve_packwiz_relative_url(&entry.pack_url, &file.file)?,
+            sha1,
+            sha256,
+            sha512,
+            md5,
+            murmur2,
+            size: None,
+            target_path: target_path.to_owned(),
+            preserve: file.preserve,
+        });
+    }
+
+    let items = files
+        .into_iter()
+        .map(|file| pack_file_download_item(&profile_root, file))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(DownloadPlan {
+        version_id: entry.id.clone(),
+        items,
+    })
+}
+
+pub fn build_modloader_download_plan(
+    profile_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    let profile = load_profiles()?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))?;
+    build_modloader_download_plan_for_profile(&profile, directories)
+}
+
+pub fn build_modloader_dependency_download_plan(
+    profile_id: &str,
+    directories: &LauncherDirectories,
+) -> Result<Option<DownloadPlan>> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    let profile = load_profiles()?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))?;
+    build_modloader_dependency_download_plan_for_profile(&profile, directories)
+}
+
+pub fn build_modloader_dependency_download_plan_for_profile(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<Option<DownloadPlan>> {
+    let Some(loader_id) = modloader_metadata_loader_id(&profile.loader) else {
+        return Ok(None);
+    };
+    let path = modloader_metadata_path(loader_id, &profile.game_version, directories)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(
+        build_modloader_dependency_download_plan_from_metadata(
+            profile,
+            &fs::read_to_string(path)?,
+            directories,
+        )?,
+    ))
+}
+
+pub fn build_managed_java_runtime_download_plan(
+    request: JavaRuntimeDownloadRequest,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let runtime_id = profile_id_from_name(&request.runtime_id);
+    ensure!(!runtime_id.is_empty(), "runtime_id is required");
+    validate_http_download_url(&request.url)?;
+
+    let archive_file_name = request
+        .archive_file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("runtime.zip");
+    ensure!(
+        Path::new(archive_file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(archive_file_name),
+        "runtime archive file name must not contain path separators"
+    );
+
+    let runtime_root = PathBuf::from(&directories.data_dir)
+        .join("runtimes")
+        .join(&runtime_id);
+    let destination = runtime_root.join("downloads").join(archive_file_name);
+    ensure!(
+        path_starts_with(&destination, &runtime_root),
+        "runtime archive destination is outside the runtime directory"
+    );
+
+    Ok(DownloadPlan {
+        version_id: runtime_id.clone(),
+        items: vec![DownloadItem {
+            id: format!("java-runtime-archive-{runtime_id}"),
+            kind: DownloadKind::JavaRuntimeArchive,
+            url: request.url.trim().to_owned(),
+            sha1: request.sha1,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: request.size,
+            destination: display_path(&destination),
+        }],
+    })
+}
+
+pub fn plan_managed_java_runtime_install(plan: &DownloadPlan) -> Result<OperationPlan> {
+    ensure!(
+        !plan.version_id.trim().is_empty(),
+        "runtime version_id is required"
+    );
+    ensure!(
+        !plan.items.is_empty(),
+        "runtime install requires at least one downloaded archive"
+    );
+    ensure!(
+        plan.items
+            .iter()
+            .all(|item| item.kind == DownloadKind::JavaRuntimeArchive),
+        "runtime install plan only accepts Java runtime archive items"
+    );
+
+    let runtime_root = managed_runtime_root_from_archive_plan(plan)?;
+    let archive_count = plan.items.len();
+    let operation_id = Uuid::new_v4();
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::InstallJavaRuntime,
+        subject_id: plan.version_id.clone(),
+        events: vec![
+            operation_event(
+                operation_id,
+                LauncherEventKind::Queued,
+                format!("Java runtime install queued for {}", plan.version_id),
+                Some(0),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Verifying,
+                format!("Verified {archive_count} Java runtime archive(s)."),
+                Some(35),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Planning,
+                format!(
+                    "Prepared managed runtime directory {}.",
+                    display_path(&runtime_root)
+                ),
+                Some(70),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Completed,
+                format!(
+                    "Java runtime {} is ready for archive extraction.",
+                    plan.version_id
+                ),
+                Some(100),
+            ),
+        ],
+    })
+}
+
+pub fn execute_managed_java_runtime_install(plan: &DownloadPlan) -> Result<OperationPlan> {
+    ensure!(
+        !plan.version_id.trim().is_empty(),
+        "runtime version_id is required"
+    );
+    ensure!(
+        !plan.items.is_empty(),
+        "runtime install requires at least one downloaded archive"
+    );
+    ensure!(
+        plan.items
+            .iter()
+            .all(|item| item.kind == DownloadKind::JavaRuntimeArchive),
+        "runtime install only accepts Java runtime archive items"
+    );
+
+    let runtime_root = managed_runtime_root_from_archive_plan(plan)?;
+    fs::create_dir_all(&runtime_root)?;
+    let mut extracted_files = 0usize;
+    for item in &plan.items {
+        extracted_files += extract_managed_java_runtime_archive(item, &runtime_root)?;
+    }
+
+    let archive_count = plan.items.len();
+    let operation_id = Uuid::new_v4();
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::InstallJavaRuntime,
+        subject_id: plan.version_id.clone(),
+        events: vec![
+            operation_event(
+                operation_id,
+                LauncherEventKind::Queued,
+                format!("Java runtime install queued for {}", plan.version_id),
+                Some(0),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Verifying,
+                format!("Verified {archive_count} Java runtime archive(s)."),
+                Some(30),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Planning,
+                format!(
+                    "Extracted {extracted_files} Java runtime file(s) into {}.",
+                    display_path(&runtime_root)
+                ),
+                Some(85),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Completed,
+                format!("Java runtime {} is installed.", plan.version_id),
+                Some(100),
+            ),
+        ],
+    })
+}
+
+fn extract_managed_java_runtime_archive(item: &DownloadItem, runtime_root: &Path) -> Result<usize> {
+    let archive_path = Path::new(&item.destination);
+    let archive_name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if archive_name.ends_with(".zip") {
+        extract_managed_java_runtime_zip(item, runtime_root)
+    } else if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+        extract_managed_java_runtime_tar_gz(item, runtime_root)
+    } else {
+        Err(anyhow!(
+            "unsupported Java runtime archive format: {}",
+            item.destination
+        ))
+    }
+}
+
+fn extract_managed_java_runtime_zip(item: &DownloadItem, runtime_root: &Path) -> Result<usize> {
+    let archive_file = fs::File::open(&item.destination).map_err(|error| {
+        anyhow!(
+            "failed to open Java runtime archive {}: {error}",
+            item.destination
+        )
+    })?;
+    let mut archive = zip::ZipArchive::new(archive_file).map_err(|error| {
+        anyhow!(
+            "failed to read Java runtime archive {}: {error}",
+            item.destination
+        )
+    })?;
+    let mut extracted_files = 0usize;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            anyhow!("failed to read Java runtime archive entry {index}: {error}")
+        })?;
+        let enclosed_name = entry.enclosed_name().ok_or_else(|| {
+            anyhow!(
+                "Java runtime archive contains an unsafe path: {}",
+                entry.name()
+            )
+        })?;
+        ensure_safe_archive_path(&enclosed_name)?;
+        let destination = runtime_root.join(enclosed_name);
+        ensure!(
+            path_starts_with(&destination, runtime_root),
+            "Java runtime archive entry escapes the runtime directory"
+        );
+
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)?;
+            continue;
+        }
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = fs::File::create(&destination).map_err(|error| {
+            anyhow!(
+                "failed to create extracted runtime file {}: {error}",
+                display_path(&destination)
+            )
+        })?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| {
+            anyhow!(
+                "failed to extract Java runtime archive entry {}: {error}",
+                entry.name()
+            )
+        })?;
+        extracted_files += 1;
+    }
+
+    Ok(extracted_files)
+}
+
+fn extract_managed_java_runtime_tar_gz(item: &DownloadItem, runtime_root: &Path) -> Result<usize> {
+    let archive_file = fs::File::open(&item.destination).map_err(|error| {
+        anyhow!(
+            "failed to open Java runtime archive {}: {error}",
+            item.destination
+        )
+    })?;
+    let decoder = flate2::read::GzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut extracted_files = 0usize;
+
+    for entry in archive.entries().map_err(|error| {
+        anyhow!(
+            "failed to read Java runtime archive {}: {error}",
+            item.destination
+        )
+    })? {
+        let mut entry =
+            entry.map_err(|error| anyhow!("failed to read Java runtime archive entry: {error}"))?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| anyhow!("failed to read Java runtime archive entry path: {error}"))?
+            .to_path_buf();
+        ensure_safe_archive_path(&entry_path)?;
+        let destination = runtime_root.join(&entry_path);
+        ensure!(
+            path_starts_with(&destination, runtime_root),
+            "Java runtime archive entry escapes the runtime directory"
+        );
+
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&destination)?;
+            continue;
+        }
+
+        ensure!(
+            entry.header().entry_type().is_file(),
+            "Java runtime archive contains an unsupported entry type: {}",
+            display_path(&entry_path)
+        );
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = fs::File::create(&destination).map_err(|error| {
+            anyhow!(
+                "failed to create extracted runtime file {}: {error}",
+                display_path(&destination)
+            )
+        })?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| {
+            anyhow!(
+                "failed to extract Java runtime archive entry {}: {error}",
+                display_path(&entry_path)
+            )
+        })?;
+        extracted_files += 1;
+    }
+
+    Ok(extracted_files)
+}
+
+fn ensure_safe_archive_path(path: &Path) -> Result<()> {
+    let safe = !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+    ensure!(
+        safe,
+        "archive contains an unsafe path: {}",
+        display_path(path)
+    );
+    Ok(())
+}
+
+pub fn extract_native_libraries_from_download_plan(plan: &DownloadPlan) -> Result<usize> {
+    ensure!(
+        !plan.version_id.trim().is_empty(),
+        "native extraction requires a version id"
+    );
+    let native_items = plan
+        .items
+        .iter()
+        .filter(|item| item.kind == DownloadKind::NativeLibrary)
+        .collect::<Vec<_>>();
+    let mut extracted_files = 0usize;
+    for item in native_items {
+        extracted_files += extract_native_library_archive(item, &plan.version_id)?;
+    }
+    Ok(extracted_files)
+}
+
+fn extract_native_library_archive(item: &DownloadItem, version_id: &str) -> Result<usize> {
+    ensure!(
+        item.kind == DownloadKind::NativeLibrary,
+        "only native library artifacts can be extracted as natives"
+    );
+    ensure_safe_path_segment(version_id, "Minecraft version id")?;
+    let archive_path = Path::new(&item.destination);
+    ensure!(
+        archive_path.is_file(),
+        "native library archive has not been downloaded: {}",
+        item.destination
+    );
+    let natives_root = native_library_root_from_archive_path(archive_path, version_id)?;
+    let archive_file = fs::File::open(archive_path).map_err(|error| {
+        anyhow!(
+            "failed to open native library archive {}: {error}",
+            item.destination
+        )
+    })?;
+    let mut archive = zip::ZipArchive::new(archive_file).map_err(|error| {
+        anyhow!(
+            "failed to read native library archive {}: {error}",
+            item.destination
+        )
+    })?;
+    let mut extracted_files = 0usize;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            anyhow!("failed to read native library archive entry {index}: {error}")
+        })?;
+        let Some(enclosed_name) = entry.enclosed_name() else {
+            return Err(anyhow!(
+                "native library archive contains an unsafe path: {}",
+                entry.name()
+            ));
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        if !native_archive_entry_should_extract(&enclosed_name) {
+            continue;
+        }
+        ensure_safe_archive_path(&enclosed_name)?;
+        let destination = natives_root.join(
+            enclosed_name
+                .file_name()
+                .ok_or_else(|| anyhow!("native library archive entry must include a file name"))?,
+        );
+        ensure!(
+            path_starts_with(&destination, &natives_root),
+            "native library archive entry escapes the natives directory"
+        );
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = fs::File::create(&destination).map_err(|error| {
+            anyhow!(
+                "failed to create extracted native library file {}: {error}",
+                display_path(&destination)
+            )
+        })?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| {
+            anyhow!(
+                "failed to extract native library archive entry {}: {error}",
+                entry.name()
+            )
+        })?;
+        mirror_native_library_for_java_child_path(&destination, &natives_root)?;
+        extracted_files += 1;
+    }
+
+    Ok(extracted_files)
+}
+
+fn mirror_native_library_for_java_child_path(
+    destination: &Path,
+    natives_root: &Path,
+) -> Result<()> {
+    let java_natives_root = natives_root.join("java");
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| anyhow!("native library destination must include a file name"))?;
+    let mirrored_destination = java_natives_root.join(file_name);
+    if mirrored_destination == destination {
+        return Ok(());
+    }
+    fs::create_dir_all(&java_natives_root)?;
+    fs::copy(destination, &mirrored_destination).map_err(|error| {
+        anyhow!(
+            "failed to mirror native library file {} to {}: {error}",
+            display_path(destination),
+            display_path(&mirrored_destination)
+        )
+    })?;
+    Ok(())
+}
+
+fn native_library_root_from_archive_path(archive_path: &Path, version_id: &str) -> Result<PathBuf> {
+    let native_root = archive_path
+        .parent()
+        .ok_or_else(|| anyhow!("native library archive destination must have a parent"))?;
+    ensure!(
+        native_root.file_name().and_then(|name| name.to_str()) == Some(version_id),
+        "native library archive must be staged under the matching version natives directory"
+    );
+    ensure!(
+        native_root
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            == Some("natives"),
+        "native library archive must be staged in a natives directory"
+    );
+    Ok(native_root.to_path_buf())
+}
+
+fn native_archive_entry_should_extract(path: &Path) -> bool {
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("META-INF")
+    }) {
+        return false;
+    }
+    path.file_name().is_some()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(native_library_extension_allowed)
+            .unwrap_or(false)
+}
+
+fn native_library_extension_allowed(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "dll" | "so" | "dylib" | "jnilib"
+    )
+}
+
+fn managed_runtime_root_from_archive_plan(plan: &DownloadPlan) -> Result<PathBuf> {
+    let first = plan
+        .items
+        .first()
+        .ok_or_else(|| anyhow!("runtime install requires at least one downloaded archive"))?;
+    let destination = PathBuf::from(&first.destination);
+    let downloads_dir = destination
+        .parent()
+        .ok_or_else(|| anyhow!("runtime archive destination must have a parent directory"))?;
+    ensure!(
+        downloads_dir.file_name().and_then(|name| name.to_str()) == Some("downloads"),
+        "runtime archive must be staged in a downloads directory"
+    );
+    let runtime_root = downloads_dir
+        .parent()
+        .ok_or_else(|| anyhow!("runtime archive downloads directory must have a runtime parent"))?;
+    ensure!(
+        runtime_root.file_name().and_then(|name| name.to_str()) == Some(plan.version_id.as_str()),
+        "runtime archive directory must match the runtime version_id"
+    );
+
+    for item in &plan.items {
+        let item_destination = PathBuf::from(&item.destination);
+        ensure!(
+            path_starts_with(&item_destination, runtime_root),
+            "runtime archive destination is outside the managed runtime directory"
+        );
+        ensure!(
+            item_destination.is_file(),
+            "runtime archive has not been downloaded: {}",
+            item.destination
+        );
+    }
+
+    Ok(runtime_root.to_path_buf())
+}
+
+pub fn extend_download_plan_with_assets(
+    plan: &mut DownloadPlan,
+    asset_index: &MinecraftAssetIndexObjects,
+    directories: &LauncherDirectories,
+) -> Result<()> {
+    let mut objects = asset_index.objects.iter().collect::<Vec<_>>();
+    objects.sort_by(|left, right| left.0.cmp(right.0));
+
+    for (asset_path, object) in objects {
+        ensure!(
+            object.hash.len() >= 2,
+            "asset '{asset_path}' has an invalid hash"
+        );
+        let prefix = &object.hash[..2];
+        plan.items.push(DownloadItem {
+            id: format!("asset-object-{asset_path}"),
+            kind: DownloadKind::AssetObject,
+            url: format!(
+                "https://resources.download.minecraft.net/{prefix}/{}",
+                object.hash
+            ),
+            sha1: Some(object.hash.clone()),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(object.size),
+            destination: format!(
+                "{}/assets/objects/{prefix}/{}",
+                directories.cache_dir, object.hash
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+pub async fn build_vanilla_download_plan(
+    version_id: Option<&str>,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let manifest = fetch_minecraft_version_manifest().await?;
+    let version = resolve_minecraft_version(&manifest, version_id)?;
+    let details = fetch_minecraft_version_details(&version.url).await?;
+    let mut plan = build_download_plan(&details, directories)?;
+    prepend_version_json_download_item(&mut plan, &version, directories)?;
+    let asset_index = fetch_minecraft_asset_index(&details.asset_index.url).await?;
+    extend_download_plan_with_assets(&mut plan, &asset_index, directories)?;
+    Ok(plan)
+}
+
+pub async fn download_item(item: &DownloadItem) -> Result<DownloadOutcome> {
+    validate_http_download_url(&item.url)?;
+    let destination = PathBuf::from(&item.destination);
+    if destination.is_file()
+        && (is_preserved_download_item(item) || download_item_matches(&destination, item)?)
+    {
+        return Ok(DownloadOutcome::AlreadyPresent);
+    }
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        let response = match download_http_client().get(&item.url).send().await {
+            Ok(response) => response,
+            Err(error) if should_retry_reqwest_error(&error, attempt) => {
+                tokio::time::sleep(DOWNLOAD_RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "download '{}' failed after {} attempt(s): {}",
+                    item.id,
+                    attempt,
+                    error
+                ));
+            }
+        };
+        let status = response.status();
+        if is_retryable_download_status(status) && attempt < DOWNLOAD_MAX_ATTEMPTS {
+            tokio::time::sleep(DOWNLOAD_RETRY_DELAY).await;
+            continue;
+        }
+        ensure!(
+            status.is_success(),
+            "download '{}' failed with HTTP status {} after {} attempt(s)",
+            item.id,
+            status.as_u16(),
+            attempt
+        );
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) if should_retry_reqwest_error(&error, attempt) => {
+                tokio::time::sleep(DOWNLOAD_RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "download '{}' failed after {} attempt(s): {}",
+                    item.id,
+                    attempt,
+                    error
+                ));
+            }
+        };
+        return write_download_item_bytes(item, &bytes);
+    }
+    unreachable!("download retry loop always returns on final attempt")
+}
+
+fn should_retry_reqwest_error(error: &reqwest::Error, attempt: usize) -> bool {
+    attempt < DOWNLOAD_MAX_ATTEMPTS && (error.is_timeout() || error.is_connect() || error.is_body())
+}
+
+fn is_retryable_download_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_EARLY
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+pub async fn execute_download_plan(plan: &DownloadPlan) -> Result<OperationPlan> {
+    execute_download_plan_with_concurrent_writer_and_events(
+        plan,
+        |item| async move { download_item(&item).await },
+        |_event| Ok(()),
+    )
+    .await
+}
+
+pub async fn execute_download_plan_with_event_callback<F>(
+    plan: &DownloadPlan,
+    on_event: F,
+) -> Result<OperationPlan>
+where
+    F: FnMut(LauncherEvent) -> Result<()>,
+{
+    execute_download_plan_with_concurrent_writer_and_events(
+        plan,
+        |item| async move { download_item(&item).await },
+        on_event,
+    )
+    .await
+}
+
+pub fn execute_download_plan_with_bytes(
+    plan: &DownloadPlan,
+    bytes_by_id: &HashMap<String, Vec<u8>>,
+) -> Result<OperationPlan> {
+    execute_download_plan_with_outcomes(plan, |item| {
+        let bytes = bytes_by_id
+            .get(&item.id)
+            .ok_or_else(|| anyhow!("missing fixture bytes for download '{}'", item.id))?;
+        write_download_item_bytes(item, bytes)
+    })
+}
+
+pub fn plan_download_artifacts(plan: &DownloadPlan) -> OperationPlan {
+    build_download_operation_plan(plan, &HashMap::new())
+}
+
+pub fn direct_pack_file_download_plan(plan: &DownloadPlan) -> Result<Option<DownloadPlan>> {
+    let items = plan
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            kind if is_pack_file_download_kind(kind) => {
+                match is_packwiz_metafile_download_item(item) {
+                    Ok(false) => Some(Ok(item.clone())),
+                    Ok(true) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            }
+            _ => None,
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if items.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DownloadPlan {
+        version_id: format!("{}-direct-pack-files", plan.version_id),
+        items,
+    }))
+}
+
+fn is_packwiz_metafile_download_item(item: &DownloadItem) -> Result<bool> {
+    let parsed = reqwest::Url::parse(item.url.trim())
+        .map_err(|error| anyhow!("pack file url '{}' is invalid: {error}", item.url))?;
+    let file_name = parsed
+        .path_segments()
+        .and_then(|segments| segments.last())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Ok(file_name.ends_with(".pw.toml"))
+}
+
+fn is_pack_file_download_kind(kind: &DownloadKind) -> bool {
+    matches!(
+        kind,
+        DownloadKind::PackFile | DownloadKind::PreservedPackFile
+    )
+}
+
+fn is_preserved_download_item(item: &DownloadItem) -> bool {
+    item.kind == DownloadKind::PreservedPackFile
+}
+
+pub async fn fetch_packwiz_metafile_download_plan(
+    plan: &DownloadPlan,
+) -> Result<Option<DownloadPlan>> {
+    let metafiles = plan
+        .items
+        .iter()
+        .filter(|item| is_pack_file_download_kind(&item.kind))
+        .filter_map(|item| match is_packwiz_metafile_download_item(item) {
+            Ok(true) => Some(Ok(item.clone())),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if metafiles.is_empty() {
+        return Ok(None);
+    }
+
+    let mut items = Vec::new();
+    for item in metafiles {
+        let response = metadata_http_client()
+            .get(item.url.trim())
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await?;
+        ensure!(
+            status == 200,
+            "packwiz metafile request failed with HTTP {status}"
+        );
+        validate_download_bytes(&item, &body)?;
+        let body = String::from_utf8(body.to_vec()).map_err(|error| {
+            anyhow!(
+                "packwiz metafile '{}' response is not valid UTF-8: {error}",
+                item.id
+            )
+        })?;
+        let metafile = parse_packwiz_metafile_toml(&body)?;
+        if !packwiz_metafile_applies_to_client(&metafile) {
+            continue;
+        }
+        if let Some(resolved) = packwiz_metafile_direct_download_item(&item, &metafile)? {
+            items.push(resolved);
+        } else if let Some(resolved) = packwiz_metafile_curseforge_download_item(&item, &metafile)?
+        {
+            items.push(resolved);
+        } else if let Some(resolved) =
+            fetch_modrinth_packwiz_metafile_download_item(&item, &metafile).await?
+        {
+            items.push(resolved);
+        } else {
+            return Err(anyhow!(
+                "packwiz metafile '{}' has no supported download provider",
+                metafile.filename
+            ));
+        }
+    }
+
+    if items.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DownloadPlan {
+        version_id: format!("{}-metafile-downloads", plan.version_id),
+        items,
+    }))
+}
+
+#[cfg(test)]
+fn packwiz_metafile_download_item(
+    metafile_item: &DownloadItem,
+    toml_text: &str,
+) -> Result<Option<DownloadItem>> {
+    let metafile = parse_packwiz_metafile_toml(toml_text)?;
+    if !packwiz_metafile_applies_to_client(&metafile) {
+        return Ok(None);
+    }
+    if let Some(resolved) = packwiz_metafile_direct_download_item(metafile_item, &metafile)? {
+        return Ok(Some(resolved));
+    }
+    if let Some(resolved) = packwiz_metafile_curseforge_download_item(metafile_item, &metafile)? {
+        return Ok(Some(resolved));
+    }
+
+    Err(anyhow!(
+        "packwiz metafile '{}' requires provider metadata resolution",
+        metafile.filename
+    ))
+}
+
+fn packwiz_metafile_direct_download_item(
+    metafile_item: &DownloadItem,
+    metafile: &PackwizMetafileToml,
+) -> Result<Option<DownloadItem>> {
+    let Some(download) = metafile.download.as_ref() else {
+        return Ok(None);
+    };
+    let Some(url) = download.url.as_ref() else {
+        return Ok(None);
+    };
+    let destination = packwiz_metafile_destination(metafile_item, &metafile.filename)?;
+    let (sha1, sha256, sha512, md5, murmur2) = packwiz_metafile_download_hashes(download)?;
+
+    Ok(Some(DownloadItem {
+        id: packwiz_metafile_resolved_id(metafile_item),
+        kind: metafile_item.kind.clone(),
+        url: url.clone(),
+        sha1,
+        sha256,
+        sha512,
+        md5,
+        murmur2,
+        size: None,
+        destination,
+    }))
+}
+
+fn packwiz_metafile_curseforge_download_item(
+    metafile_item: &DownloadItem,
+    metafile: &PackwizMetafileToml,
+) -> Result<Option<DownloadItem>> {
+    let Some(curseforge) = metafile
+        .update
+        .as_ref()
+        .and_then(|update| update.curseforge.as_ref())
+    else {
+        return Ok(None);
+    };
+    let download = metafile
+        .download
+        .as_ref()
+        .ok_or_else(|| anyhow!("CurseForge packwiz metafile requires [download] hash metadata"))?;
+    let (sha1, sha256, sha512, md5, murmur2) = packwiz_metafile_download_hashes(download)?;
+    let url = curseforge_download_url(
+        curseforge.project_id,
+        curseforge.file_id,
+        &metafile.filename,
+    )?;
+    Ok(Some(DownloadItem {
+        id: packwiz_metafile_resolved_id(metafile_item),
+        kind: metafile_item.kind.clone(),
+        url,
+        sha1,
+        sha256,
+        sha512,
+        md5,
+        murmur2,
+        size: None,
+        destination: packwiz_metafile_destination(metafile_item, &metafile.filename)?,
+    }))
+}
+
+fn packwiz_metafile_download_hashes(
+    download: &PackwizMetafileDownloadToml,
+) -> Result<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    match download.hash_format.as_str() {
+        "sha1" => Ok((Some(download.hash.clone()), None, None, None, None)),
+        "sha256" => Ok((None, Some(download.hash.clone()), None, None, None)),
+        "sha512" => Ok((None, None, Some(download.hash.clone()), None, None)),
+        "md5" => Ok((None, None, None, Some(download.hash.clone()), None)),
+        "murmur2" => Ok((None, None, None, None, Some(download.hash.clone()))),
+        format => Err(anyhow!(
+            "unsupported packwiz metafile hash-format '{format}'"
+        )),
+    }
+}
+
+async fn fetch_modrinth_packwiz_metafile_download_item(
+    metafile_item: &DownloadItem,
+    metafile: &PackwizMetafileToml,
+) -> Result<Option<DownloadItem>> {
+    let Some(modrinth) = metafile
+        .update
+        .as_ref()
+        .and_then(|update| update.modrinth.as_ref())
+    else {
+        return Ok(None);
+    };
+    let version_url = modrinth_version_api_url(&modrinth.version)?;
+    let response = metadata_http_client()
+        .get(version_url)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Modrinth version '{}' request failed with HTTP {status}",
+        modrinth.version
+    );
+    modrinth_version_download_item_from_json(metafile_item, metafile, &body)
+}
+
+fn modrinth_version_download_item_from_json(
+    metafile_item: &DownloadItem,
+    metafile: &PackwizMetafileToml,
+    json_text: &str,
+) -> Result<Option<DownloadItem>> {
+    let version = serde_json::from_str::<ModrinthVersionResponse>(json_text)?;
+    let file = version
+        .files
+        .iter()
+        .find(|file| file.primary)
+        .or_else(|| {
+            version
+                .files
+                .iter()
+                .find(|file| file.filename == metafile.filename)
+        })
+        .or_else(|| version.files.first())
+        .ok_or_else(|| anyhow!("Modrinth version '{}' has no files", version.id))?;
+    validate_http_download_url(&file.url)?;
+    let sha1 = file
+        .hashes
+        .sha1
+        .as_deref()
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .ok_or_else(|| anyhow!("Modrinth file '{}' is missing a SHA-1 hash", file.filename))?
+        .to_ascii_lowercase();
+    ensure!(
+        sha1.len() == 40 && sha1.chars().all(|character| character.is_ascii_hexdigit()),
+        "Modrinth file '{}' SHA-1 hash must be a 40-character hex value",
+        file.filename
+    );
+
+    Ok(Some(DownloadItem {
+        id: packwiz_metafile_resolved_id(metafile_item),
+        kind: metafile_item.kind.clone(),
+        url: file.url.clone(),
+        sha1: Some(sha1),
+        sha256: None,
+        sha512: None,
+        md5: None,
+        murmur2: None,
+        size: file.size,
+        destination: packwiz_metafile_destination(metafile_item, &metafile.filename)?,
+    }))
+}
+
+fn packwiz_metafile_resolved_id(metafile_item: &DownloadItem) -> String {
+    format!(
+        "{}-resolved",
+        metafile_item.id.trim_end_matches("-metafile")
+    )
+}
+
+fn modrinth_version_api_url(version_id: &str) -> Result<String> {
+    let version_id = version_id.trim();
+    ensure_modrinth_identifier(version_id, "Modrinth version id")?;
+    Ok(format!("https://api.modrinth.com/v2/version/{version_id}"))
+}
+
+fn curseforge_download_url(project_id: u64, file_id: u64, filename: &str) -> Result<String> {
+    ensure!(project_id > 0, "CurseForge project id is required");
+    ensure!(file_id > 0, "CurseForge file id is required");
+    let filename = filename.trim();
+    ensure!(!filename.is_empty(), "CurseForge filename is required");
+    let file_group = file_id / 1000;
+    let file_remainder = file_id % 1000;
+    Ok(format!(
+        "https://edge.forgecdn.net/files/{file_group}/{file_remainder}/{}",
+        url_path_segment_encode(filename)
+    ))
+}
+
+fn url_path_segment_encode(segment: &str) -> String {
+    let mut encoded = String::new();
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn packwiz_metafile_applies_to_client(metafile: &PackwizMetafileToml) -> bool {
+    if metafile
+        .side
+        .as_deref()
+        .map(|side| side.eq_ignore_ascii_case("server"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if metafile
+        .option
+        .as_ref()
+        .map(|option| option.optional && !option.default.unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    true
+}
+
+fn packwiz_metafile_destination(metafile_item: &DownloadItem, filename: &str) -> Result<String> {
+    let destination = PathBuf::from(&metafile_item.destination);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("packwiz metafile destination must have a parent directory"))?;
+    let resolved = parent.join(filename);
+    ensure!(
+        path_starts_with(&resolved, parent),
+        "packwiz metafile filename escapes the metafile directory"
+    );
+    Ok(display_path(&resolved))
+}
+
+#[cfg(test)]
+async fn execute_download_plan_with_writer_and_events<F, Fut, E>(
+    plan: &DownloadPlan,
+    mut writer: F,
+    mut on_event: E,
+) -> Result<OperationPlan>
+where
+    F: FnMut(&DownloadItem) -> Fut,
+    Fut: std::future::Future<Output = Result<DownloadOutcome>>,
+    E: FnMut(LauncherEvent) -> Result<()>,
+{
+    let operation_id = Uuid::new_v4();
+    let total = plan.items.len().max(1);
+    let mut events = Vec::new();
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Queued,
+            format!("File download queued for {}", plan.version_id),
+            Some(0),
+        ),
+    )?;
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Planning,
+            download_plan_summary_message(plan),
+            Some(10),
+        ),
+    )?;
+
+    if plan.items.is_empty() {
+        push_download_event(
+            &mut events,
+            &mut on_event,
+            download_operation_event(
+                operation_id,
+                plan,
+                LauncherEventKind::Completed,
+                format!("No files to download for {}.", plan.version_id),
+                Some(100),
+            ),
+        )?;
+
+        return Ok(OperationPlan {
+            operation_id,
+            operation: LauncherOperation::DownloadArtifacts,
+            subject_id: plan.version_id.clone(),
+            events,
+        });
+    }
+
+    for (index, item) in plan.items.iter().enumerate() {
+        let start_progress = 10 + ((index * 75) / total) as u8;
+        push_download_event(
+            &mut events,
+            &mut on_event,
+            download_operation_event(
+                operation_id,
+                plan,
+                LauncherEventKind::Downloading,
+                format!("Downloading file: {}", download_item_label(item)),
+                Some(start_progress.min(84)),
+            ),
+        )?;
+
+        let progress = 10 + (((index + 1) * 75) / total) as u8;
+        let outcome = match writer(item).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                push_download_event(
+                    &mut events,
+                    &mut on_event,
+                    download_operation_event(
+                        operation_id,
+                        plan,
+                        LauncherEventKind::Failed,
+                        format!("Failed file: {}", download_item_label(item)),
+                        Some(progress.min(85)),
+                    ),
+                )?;
+                return Err(download_artifact_error(item, error));
+            }
+        };
+        let message = match outcome {
+            DownloadOutcome::AlreadyPresent => {
+                format!("File already present: {}", download_item_label(item))
+            }
+            DownloadOutcome::Downloaded => {
+                format!("Downloaded file: {}", download_item_label(item))
+            }
+        };
+        push_download_event(
+            &mut events,
+            &mut on_event,
+            download_operation_event(
+                operation_id,
+                plan,
+                LauncherEventKind::Downloading,
+                message,
+                Some(progress.min(85)),
+            ),
+        )?;
+    }
+
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Verifying,
+            "Verified downloaded files.",
+            Some(92),
+        ),
+    )?;
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Completed,
+            format!(
+                "File download completed: {}.",
+                download_plan_size_label(plan)
+            ),
+            Some(100),
+        ),
+    )?;
+
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::DownloadArtifacts,
+        subject_id: plan.version_id.clone(),
+        events,
+    })
+}
+
+async fn execute_download_plan_with_concurrent_writer_and_events<F, Fut, E>(
+    plan: &DownloadPlan,
+    writer: F,
+    mut on_event: E,
+) -> Result<OperationPlan>
+where
+    F: Fn(DownloadItem) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<DownloadOutcome>> + Send + 'static,
+    E: FnMut(LauncherEvent) -> Result<()>,
+{
+    let operation_id = Uuid::new_v4();
+    let total = plan.items.len().max(1);
+    let mut events = Vec::new();
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Queued,
+            format!("File download queued for {}", plan.version_id),
+            Some(0),
+        ),
+    )?;
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Planning,
+            download_plan_summary_message(plan),
+            Some(10),
+        ),
+    )?;
+
+    if plan.items.is_empty() {
+        push_download_event(
+            &mut events,
+            &mut on_event,
+            download_operation_event(
+                operation_id,
+                plan,
+                LauncherEventKind::Completed,
+                format!("No files to download for {}.", plan.version_id),
+                Some(100),
+            ),
+        )?;
+
+        return Ok(OperationPlan {
+            operation_id,
+            operation: LauncherOperation::DownloadArtifacts,
+            subject_id: plan.version_id.clone(),
+            events,
+        });
+    }
+
+    let concurrency = if download_plan_has_duplicate_destinations(plan) {
+        1
+    } else {
+        download_concurrency_limit()
+    };
+    let mut outcomes = HashMap::new();
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut next_index = 0usize;
+    let mut completed = 0usize;
+
+    while next_index < plan.items.len() || !join_set.is_empty() {
+        while next_index < plan.items.len() && join_set.len() < concurrency {
+            let item = plan.items[next_index].clone();
+            let start_progress = 10 + ((next_index * 10) / total) as u8;
+            push_download_event(
+                &mut events,
+                &mut on_event,
+                download_operation_event(
+                    operation_id,
+                    plan,
+                    LauncherEventKind::Downloading,
+                    format!("Downloading file: {}", download_item_label(&item)),
+                    Some(start_progress.min(20)),
+                ),
+            )?;
+            let writer = writer.clone();
+            join_set.spawn(async move {
+                let outcome = writer(item.clone()).await;
+                (item, outcome)
+            });
+            next_index += 1;
+        }
+
+        let joined = join_set
+            .join_next()
+            .await
+            .ok_or_else(|| anyhow!("download worker set ended unexpectedly"))?;
+        let (item, outcome) = joined.map_err(|error| anyhow!("download worker failed: {error}"))?;
+        completed += 1;
+        let progress = 20 + ((completed * 65) / total) as u8;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                push_download_event(
+                    &mut events,
+                    &mut on_event,
+                    download_operation_event(
+                        operation_id,
+                        plan,
+                        LauncherEventKind::Failed,
+                        format!("Failed file: {}", download_item_label(&item)),
+                        Some(progress.min(85)),
+                    ),
+                )?;
+                return Err(download_artifact_error(&item, error));
+            }
+        };
+        let message = match outcome {
+            DownloadOutcome::AlreadyPresent => {
+                format!("File already present: {}", download_item_label(&item))
+            }
+            DownloadOutcome::Downloaded => {
+                format!("Downloaded file: {}", download_item_label(&item))
+            }
+        };
+        outcomes.insert(item.id.clone(), outcome);
+        push_download_event(
+            &mut events,
+            &mut on_event,
+            download_operation_event(
+                operation_id,
+                plan,
+                LauncherEventKind::Downloading,
+                message,
+                Some(progress.min(85)),
+            ),
+        )?;
+    }
+
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Verifying,
+            "Verified downloaded files.",
+            Some(92),
+        ),
+    )?;
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Completed,
+            format!(
+                "File download completed: {}.",
+                download_plan_size_label(plan)
+            ),
+            Some(100),
+        ),
+    )?;
+
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::DownloadArtifacts,
+        subject_id: plan.version_id.clone(),
+        events,
+    })
+}
+
+fn download_artifact_error(item: &DownloadItem, error: anyhow::Error) -> anyhow::Error {
+    anyhow!("failed to download file '{}': {error:#}", item.id)
+}
+
+fn download_concurrency_limit() -> usize {
+    env::var(DOWNLOAD_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_DOWNLOAD_CONCURRENCY))
+        .unwrap_or(DEFAULT_DOWNLOAD_CONCURRENCY)
+}
+
+fn download_plan_has_duplicate_destinations(plan: &DownloadPlan) -> bool {
+    let mut destinations = BTreeSet::new();
+    plan.items
+        .iter()
+        .any(|item| !destinations.insert(item.destination.clone()))
+}
+
+fn execute_download_plan_with_outcomes<F>(
+    plan: &DownloadPlan,
+    mut writer: F,
+) -> Result<OperationPlan>
+where
+    F: FnMut(&DownloadItem) -> Result<DownloadOutcome>,
+{
+    let mut outcomes = HashMap::new();
+    for item in &plan.items {
+        outcomes.insert(item.id.clone(), writer(item)?);
+    }
+    Ok(build_download_operation_plan(plan, &outcomes))
+}
+
+fn build_download_operation_plan(
+    plan: &DownloadPlan,
+    outcomes: &HashMap<String, DownloadOutcome>,
+) -> OperationPlan {
+    let operation_id = Uuid::new_v4();
+    let total = plan.items.len().max(1);
+    let mut events = vec![
+        operation_event(
+            operation_id,
+            LauncherEventKind::Queued,
+            format!("File download queued for {}", plan.version_id),
+            Some(0),
+        ),
+        operation_event(
+            operation_id,
+            LauncherEventKind::Planning,
+            download_plan_summary_message(plan),
+            Some(10),
+        ),
+    ];
+
+    if plan.items.is_empty() {
+        events.push(operation_event(
+            operation_id,
+            LauncherEventKind::Completed,
+            format!("No files to download for {}.", plan.version_id),
+            Some(100),
+        ));
+
+        return OperationPlan {
+            operation_id,
+            operation: LauncherOperation::DownloadArtifacts,
+            subject_id: plan.version_id.clone(),
+            events,
+        };
+    }
+
+    for (index, item) in plan.items.iter().enumerate() {
+        let progress = 10 + (((index + 1) * 75) / total) as u8;
+        let message = match outcomes.get(&item.id) {
+            Some(DownloadOutcome::AlreadyPresent) => {
+                format!("File already present: {}", download_item_label(item))
+            }
+            Some(DownloadOutcome::Downloaded) => {
+                format!("Downloaded file: {}", download_item_label(item))
+            }
+            None => format!("Artifact pending: {}", download_item_label(item)),
+        };
+        events.push(operation_event(
+            operation_id,
+            LauncherEventKind::Downloading,
+            message,
+            Some(progress.min(85)),
+        ));
+    }
+
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Verifying,
+        "Verified downloaded files.",
+        Some(92),
+    ));
+    events.push(operation_event(
+        operation_id,
+        LauncherEventKind::Completed,
+        format!(
+            "File download completed: {}.",
+            download_plan_size_label(plan)
+        ),
+        Some(100),
+    ));
+
+    OperationPlan {
+        operation_id,
+        operation: LauncherOperation::DownloadArtifacts,
+        subject_id: plan.version_id.clone(),
+        events,
+    }
+}
+
+fn push_download_event<F>(
+    events: &mut Vec<LauncherEvent>,
+    on_event: &mut F,
+    event: LauncherEvent,
+) -> Result<()>
+where
+    F: FnMut(LauncherEvent) -> Result<()>,
+{
+    on_event(event.clone())?;
+    events.push(event);
+    Ok(())
+}
+
+fn download_operation_event(
+    operation_id: Uuid,
+    plan: &DownloadPlan,
+    kind: LauncherEventKind,
+    message: impl Into<String>,
+    progress_percent: Option<u8>,
+) -> LauncherEvent {
+    let mut event = operation_event(operation_id, kind, message, progress_percent);
+    event.operation = Some(LauncherOperation::DownloadArtifacts);
+    event.subject_id = Some(plan.version_id.clone());
+    event
+}
+
+fn download_plan_summary_message(plan: &DownloadPlan) -> String {
+    if plan.items.is_empty() {
+        return format!("Resolved no files for {}.", plan.version_id);
+    }
+    format!(
+        "Resolved {} file(s), {}.",
+        plan.items.len(),
+        download_plan_size_label(plan)
+    )
+}
+
+fn download_plan_size_label(plan: &DownloadPlan) -> String {
+    let known_size = plan.items.iter().filter_map(|item| item.size).sum::<u64>();
+    let unknown_count = plan.items.iter().filter(|item| item.size.is_none()).count();
+    match (known_size, unknown_count) {
+        (0, 0) => "0 B".to_owned(),
+        (_, 0) => format_download_size(known_size),
+        (0, 1) => "1 file with unknown size".to_owned(),
+        (0, count) => format!("{count} files with unknown sizes"),
+        (_, 1) => format!(
+            "{} known plus 1 unknown-size file",
+            format_download_size(known_size)
+        ),
+        (_, count) => format!(
+            "{} known plus {count} unknown-size files",
+            format_download_size(known_size)
+        ),
+    }
+}
+
+fn download_item_label(item: &DownloadItem) -> String {
+    match item.size {
+        Some(size) => format!(
+            "{} ({}, {})",
+            item.id,
+            download_kind_label(&item.kind),
+            format_download_size(size)
+        ),
+        None => format!("{} ({})", item.id, download_kind_label(&item.kind)),
+    }
+}
+
+fn download_kind_label(kind: &DownloadKind) -> &'static str {
+    match kind {
+        DownloadKind::VersionJson => "version metadata",
+        DownloadKind::ClientJar => "client jar",
+        DownloadKind::AssetIndex => "asset index",
+        DownloadKind::AssetObject => "asset object",
+        DownloadKind::Library => "library",
+        DownloadKind::NativeLibrary => "native library",
+        DownloadKind::PackFile => "pack file",
+        DownloadKind::PreservedPackFile => "preserved pack file",
+        DownloadKind::ModLoaderMetadata => "modloader metadata",
+        DownloadKind::ModLoaderInstaller => "modloader installer",
+        DownloadKind::JavaRuntimeArchive => "Java runtime archive",
+    }
+}
+
+fn format_download_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    }
+}
+
+pub fn write_download_item_bytes(item: &DownloadItem, bytes: &[u8]) -> Result<DownloadOutcome> {
+    let destination = PathBuf::from(&item.destination);
+
+    if destination.is_file()
+        && (is_preserved_download_item(item) || download_item_matches(&destination, item)?)
+    {
+        return Ok(DownloadOutcome::AlreadyPresent);
+    }
+
+    validate_download_bytes(item, bytes)?;
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create download destination directory {}",
+                display_path(parent)
+            )
+        })?;
+    }
+
+    let temp_path = destination.with_extension("download");
+    fs::write(&temp_path, bytes).with_context(|| {
+        format!(
+            "failed to write temporary download file {}",
+            display_path(&temp_path)
+        )
+    })?;
+    replace_file_with_temporary(&temp_path, &destination).with_context(|| {
+        format!(
+            "failed to replace download destination {} with {}",
+            display_path(&destination),
+            display_path(&temp_path)
+        )
+    })?;
+    Ok(DownloadOutcome::Downloaded)
+}
+
+pub fn download_item_matches(path: &Path, item: &DownloadItem) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let bytes = fs::read(path)?;
+    if let Some(expected_size) = item.size {
+        if bytes.len() as u64 != expected_size {
+            return Ok(false);
+        }
+    }
+    if let Some(expected_sha1) = item.sha1.as_deref() {
+        if sha1_hex(&bytes) != expected_sha1 {
+            return Ok(false);
+        }
+    }
+    if let Some(expected_sha256) = item.sha256.as_deref() {
+        if sha256_hex(&bytes) != expected_sha256 {
+            return Ok(false);
+        }
+    }
+    if let Some(expected_sha512) = item.sha512.as_deref() {
+        if sha512_hex(&bytes) != expected_sha512 {
+            return Ok(false);
+        }
+    }
+    if let Some(expected_md5) = item.md5.as_deref() {
+        if md5_hex(&bytes) != expected_md5 {
+            return Ok(false);
+        }
+    }
+    if let Some(expected_murmur2) = item.murmur2.as_deref() {
+        if murmur2_fingerprint(&bytes).to_string() != expected_murmur2 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadOutcome {
+    Downloaded,
+    AlreadyPresent,
+}
+
+fn validate_download_bytes(item: &DownloadItem, bytes: &[u8]) -> Result<()> {
+    if let Some(expected_size) = item.size {
+        ensure!(
+            bytes.len() as u64 == expected_size,
+            "download '{}' size mismatch",
+            item.id
+        );
+    }
+    if let Some(expected_sha1) = item.sha1.as_deref() {
+        ensure!(
+            sha1_hex(bytes) == expected_sha1,
+            "download '{}' sha1 mismatch",
+            item.id
+        );
+    }
+    if let Some(expected_sha256) = item.sha256.as_deref() {
+        ensure!(
+            sha256_hex(bytes) == expected_sha256,
+            "download '{}' sha256 mismatch",
+            item.id
+        );
+    }
+    if let Some(expected_sha512) = item.sha512.as_deref() {
+        ensure!(
+            sha512_hex(bytes) == expected_sha512,
+            "download '{}' sha512 mismatch",
+            item.id
+        );
+    }
+    if let Some(expected_md5) = item.md5.as_deref() {
+        ensure!(
+            md5_hex(bytes) == expected_md5,
+            "download '{}' md5 mismatch",
+            item.id
+        );
+    }
+    if let Some(expected_murmur2) = item.murmur2.as_deref() {
+        ensure!(
+            murmur2_fingerprint(bytes).to_string() == expected_murmur2,
+            "download '{}' murmur2 mismatch",
+            item.id
+        );
+    }
+    Ok(())
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha1::digest(bytes))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha512_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha512::digest(bytes))
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Md5::digest(bytes))
+}
+
+fn murmur2_fingerprint(bytes: &[u8]) -> u32 {
+    let filtered = bytes
+        .iter()
+        .copied()
+        .filter(|byte| !matches!(byte, b'\t' | b'\n' | b'\r' | b' '))
+        .collect::<Vec<_>>();
+    murmur2_32(&filtered, 1)
+}
+
+fn murmur2_32(bytes: &[u8], seed: u32) -> u32 {
+    const M: u32 = 0x5bd1e995;
+    const R: u32 = 24;
+
+    let mut hash = seed ^ bytes.len() as u32;
+    let mut chunks = bytes.chunks_exact(4);
+    for chunk in &mut chunks {
+        let mut value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        value = value.wrapping_mul(M);
+        value ^= value >> R;
+        value = value.wrapping_mul(M);
+
+        hash = hash.wrapping_mul(M);
+        hash ^= value;
+    }
+
+    let remaining = chunks.remainder();
+    match remaining.len() {
+        3 => {
+            hash ^= (remaining[2] as u32) << 16;
+            hash ^= (remaining[1] as u32) << 8;
+            hash ^= remaining[0] as u32;
+            hash = hash.wrapping_mul(M);
+        }
+        2 => {
+            hash ^= (remaining[1] as u32) << 8;
+            hash ^= remaining[0] as u32;
+            hash = hash.wrapping_mul(M);
+        }
+        1 => {
+            hash ^= remaining[0] as u32;
+            hash = hash.wrapping_mul(M);
+        }
+        _ => {}
+    }
+
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(M);
+    hash ^= hash >> 15;
+    hash
+}
+
+fn validate_http_download_url(url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    ensure!(!trimmed.is_empty(), "download url is required");
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|error| anyhow!("download url '{trimmed}' is invalid: {error}"))?;
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "download url '{}' must use http or https",
+        trimmed
+    );
+    ensure!(
+        parsed.host_str().is_some(),
+        "download url '{}' must include a host",
+        trimmed
+    );
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftVersionManifest {
+    pub latest: MinecraftLatestVersions,
+    pub versions: Vec<MinecraftVersionManifestEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftLatestVersions {
+    pub release: String,
+    pub snapshot: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftVersionManifestEntry {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub version_type: String,
+    pub url: String,
+    #[serde(default)]
+    pub sha1: Option<String>,
+    pub time: String,
+    pub release_time: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftVersionDetails {
+    pub id: String,
+    #[serde(default, rename = "type")]
+    pub version_type: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<MinecraftVersionArguments>,
+    #[serde(default, rename = "minecraftArguments")]
+    pub minecraft_arguments: Option<String>,
+    pub asset_index: MinecraftAssetIndex,
+    pub downloads: MinecraftVersionDownloads,
+    #[serde(default)]
+    pub java_version: Option<MinecraftJavaVersion>,
+    #[serde(default)]
+    pub libraries: Vec<MinecraftLibrary>,
+    #[serde(default)]
+    pub main_class: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftJavaVersion {
+    pub component: String,
+    pub major_version: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftVersionArguments {
+    #[serde(default)]
+    pub game: Vec<MinecraftArgument>,
+    #[serde(default)]
+    pub jvm: Vec<MinecraftArgument>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MinecraftArgument {
+    String(String),
+    Object(MinecraftArgumentObject),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftArgumentObject {
+    #[serde(default)]
+    pub rules: Vec<MinecraftRule>,
+    pub value: MinecraftArgumentValue,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MinecraftArgumentValue {
+    String(String),
+    List(Vec<String>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftAssetIndex {
+    pub id: String,
+    pub sha1: String,
+    pub size: u64,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftAssetIndexObjects {
+    pub objects: HashMap<String, MinecraftAssetObject>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftAssetObject {
+    pub hash: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftVersionDownloads {
+    pub client: MinecraftClientDownload,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftLibrary {
+    pub name: String,
+    pub downloads: MinecraftLibraryDownloads,
+    #[serde(default)]
+    pub natives: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub rules: Vec<MinecraftRule>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftLibraryDownloads {
+    #[serde(default)]
+    pub artifact: Option<MinecraftDownloadArtifact>,
+    #[serde(default)]
+    pub classifiers: HashMap<String, MinecraftDownloadArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftDownloadArtifact {
+    pub path: String,
+    pub sha1: String,
+    pub size: u64,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftClientDownload {
+    pub sha1: String,
+    pub size: u64,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftRule {
+    pub action: MinecraftRuleAction,
+    #[serde(default)]
+    pub features: Option<MinecraftRuleFeatures>,
+    pub os: Option<MinecraftRuleOs>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MinecraftRuleFeatures {
+    #[serde(default)]
+    pub has_custom_resolution: Option<bool>,
+    #[serde(default)]
+    pub is_demo_user: Option<bool>,
+    #[serde(default)]
+    pub has_quick_plays_support: Option<bool>,
+    #[serde(default)]
+    pub is_quick_play_singleplayer: Option<bool>,
+    #[serde(default)]
+    pub is_quick_play_multiplayer: Option<bool>,
+    #[serde(default)]
+    pub is_quick_play_realms: Option<bool>,
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MinecraftRuleAction {
+    Allow,
+    Disallow,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MinecraftRuleOs {
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ModloaderMetadataEntry {
+    loader: ModloaderMavenCoordinate,
+    #[serde(default)]
+    intermediary: Option<ModloaderMavenCoordinate>,
+    #[serde(default)]
+    hashed: Option<ModloaderMavenCoordinate>,
+    launcher_meta: ModloaderLauncherMeta,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ModloaderMavenCoordinate {
+    #[serde(default)]
+    maven: Option<String>,
+    #[serde(default)]
+    file_size: Option<u64>,
+    #[serde(default)]
+    hashes: Option<ModloaderHashes>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct ModloaderHashes {
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ModloaderLauncherMeta {
+    libraries: ModloaderLauncherLibraries,
+    main_class: ModloaderLauncherMainClass,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct ModloaderLauncherLibraries {
+    #[serde(default)]
+    client: Vec<ModloaderLauncherLibrary>,
+    #[serde(default)]
+    common: Vec<ModloaderLauncherLibrary>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ModloaderLauncherLibrary {
+    name: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum ModloaderLauncherMainClass {
+    ClientOnly(String),
+    PerSide { client: String },
+}
+
+impl ModloaderLauncherMainClass {
+    fn client(&self) -> &str {
+        match self {
+            Self::ClientOnly(main_class) => main_class,
+            Self::PerSide { client } => client,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedModloaderVersionJson {
+    #[serde(default)]
+    id: Option<String>,
+    main_class: String,
+    #[serde(default)]
+    arguments: Option<MinecraftVersionArguments>,
+    #[serde(default)]
+    libraries: Vec<MinecraftLibrary>,
+    #[serde(
+        default,
+        rename = "installerProcessors",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    installer_processors: Vec<ModloaderInstallerProcessor>,
+    #[serde(
+        default,
+        rename = "installerData",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    installer_data: BTreeMap<String, ModloaderInstallerDataValue>,
+    #[serde(
+        default,
+        rename = "installerPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    installer_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ModloaderInstallerProfileJson {
+    #[serde(default)]
+    version_info: Option<GeneratedModloaderVersionJson>,
+    #[serde(default)]
+    libraries: Vec<MinecraftLibrary>,
+    #[serde(default)]
+    data: BTreeMap<String, ModloaderInstallerDataValue>,
+    #[serde(default)]
+    processors: Vec<ModloaderInstallerProcessor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ModloaderInstallerDataValue {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ModloaderInstallerProcessor {
+    #[serde(default)]
+    sides: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    jar: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    classpath: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    args: Vec<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    outputs: BTreeMap<String, Value>,
+}
+
+impl From<&MinecraftVersionManifestEntry> for MinecraftVersionSummary {
+    fn from(value: &MinecraftVersionManifestEntry) -> Self {
+        Self {
+            id: value.id.clone(),
+            version_type: parse_version_type(&value.version_type),
+            url: value.url.clone(),
+            sha1: value.sha1.clone(),
+            release_time: value.release_time.clone(),
+        }
+    }
+}
+
+fn library_allowed_on_current_os(library: &MinecraftLibrary) -> bool {
+    if library.rules.is_empty() {
+        return true;
+    }
+
+    let current_os = minecraft_os_name();
+    let mut allowed = false;
+    for rule in &library.rules {
+        let os_matches = rule
+            .os
+            .as_ref()
+            .and_then(|os| os.name.as_deref())
+            .map(|name| name == current_os)
+            .unwrap_or(true);
+
+        if os_matches {
+            allowed = matches!(rule.action, MinecraftRuleAction::Allow);
+        }
+    }
+    allowed
+}
+
+fn native_library_artifact_for_current_os(
+    library: &MinecraftLibrary,
+) -> Option<(String, &MinecraftDownloadArtifact)> {
+    let classifier = library
+        .natives
+        .as_ref()
+        .and_then(|natives| natives.get(minecraft_os_name()))
+        .map(|classifier| classifier.replace("${arch}", "64"))
+        .or_else(|| Some(format!("natives-{}", minecraft_os_name())))?;
+    let artifact = library.downloads.classifiers.get(&classifier)?;
+    Some((classifier, artifact))
+}
+
+fn native_library_coordinate_classifier_for_current_os(library: &MinecraftLibrary) -> Option<&str> {
+    let classifier = library.name.split(':').nth(3)?;
+    native_classifier_matches_current_os(classifier).then_some(classifier)
+}
+
+fn native_classifier_matches_current_os(classifier: &str) -> bool {
+    match minecraft_os_name() {
+        "windows" => classifier == "natives-windows",
+        "linux" => classifier == "natives-linux",
+        "osx" => classifier == "natives-macos" || classifier == "natives-osx",
+        _ => false,
+    }
+}
+
+fn minecraft_os_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "osx"
+    } else {
+        "linux"
+    }
+}
+
+fn parse_version_type(version_type: &str) -> MinecraftVersionType {
+    match version_type {
+        "release" => MinecraftVersionType::Release,
+        "snapshot" => MinecraftVersionType::Snapshot,
+        "old_beta" => MinecraftVersionType::OldBeta,
+        "old_alpha" => MinecraftVersionType::OldAlpha,
+        _ => MinecraftVersionType::Unknown,
+    }
+}
+
+pub fn prepare_launcher_directories() -> Result<LauncherDirectories> {
+    let data_dir = launcher_data_dir()?;
+    let config_dir = launcher_config_dir()?;
+    let cache_dir = launcher_cache_dir()?;
+    let log_dir = launcher_log_dir(&data_dir)?;
+
+    for dir in [&data_dir, &config_dir, &cache_dir, &log_dir] {
+        fs::create_dir_all(dir)?;
+    }
+
+    Ok(LauncherDirectories {
+        data_dir: display_path(&data_dir),
+        config_dir: display_path(&config_dir),
+        cache_dir: display_path(&cache_dir),
+        log_dir: display_path(&log_dir),
+    })
+}
+
+fn settings_path() -> Result<PathBuf> {
+    let config_dir = launcher_config_dir()?;
+    fs::create_dir_all(&config_dir)?;
+    Ok(config_dir.join("settings.json"))
+}
+
+fn profiles_path() -> Result<PathBuf> {
+    let config_dir = launcher_config_dir()?;
+    fs::create_dir_all(&config_dir)?;
+    Ok(config_dir.join("profiles.json"))
+}
+
+fn minecraft_session_path() -> Result<PathBuf> {
+    let config_dir = launcher_config_dir()?;
+    fs::create_dir_all(&config_dir)?;
+    Ok(config_dir.join("minecraft-session.json"))
+}
+
+fn minecraft_accounts_path() -> Result<PathBuf> {
+    let config_dir = launcher_config_dir()?;
+    fs::create_dir_all(&config_dir)?;
+    Ok(config_dir.join("minecraft-accounts.json"))
+}
+
+fn launcher_project_dirs() -> Result<ProjectDirs> {
+    ProjectDirs::from("com", "theboys", "TheBoysLauncher")
+        .ok_or_else(|| anyhow!("could not resolve launcher directories"))
+}
+
+fn launcher_root_dir() -> Result<Option<PathBuf>> {
+    env_path("THEBOYS_LAUNCHER_ROOT_DIR")
+}
+
+fn launcher_data_dir() -> Result<PathBuf> {
+    if let Some(path) = env_path("THEBOYS_LAUNCHER_DATA_DIR")? {
+        return Ok(path);
+    }
+    if let Some(root) = launcher_root_dir()? {
+        return Ok(root.join("data"));
+    }
+    let project_dirs = ProjectDirs::from("com", "theboys", "TheBoysLauncher")
+        .ok_or_else(|| anyhow!("could not resolve launcher data directory"))?;
+    Ok(project_dirs.data_dir().to_path_buf())
+}
+
+fn launcher_config_dir() -> Result<PathBuf> {
+    if let Some(path) = env_path("THEBOYS_LAUNCHER_CONFIG_DIR")? {
+        return Ok(path);
+    }
+    if let Some(root) = launcher_root_dir()? {
+        return Ok(root.join("config"));
+    }
+    Ok(launcher_project_dirs()?.config_dir().to_path_buf())
+}
+
+fn launcher_cache_dir() -> Result<PathBuf> {
+    if let Some(path) = env_path("THEBOYS_LAUNCHER_CACHE_DIR")? {
+        return Ok(path);
+    }
+    if let Some(root) = launcher_root_dir()? {
+        return Ok(root.join("cache"));
+    }
+    Ok(launcher_project_dirs()?.cache_dir().to_path_buf())
+}
+
+fn launcher_log_dir(data_dir: &Path) -> Result<PathBuf> {
+    if let Some(path) = env_path("THEBOYS_LAUNCHER_LOG_DIR")? {
+        return Ok(path);
+    }
+    if let Some(root) = launcher_root_dir()? {
+        return Ok(root.join("logs"));
+    }
+    Ok(data_dir.join("logs"))
+}
+
+fn env_path(name: &str) -> Result<Option<PathBuf>> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(None);
+    };
+    ensure!(
+        !value.is_empty(),
+        "{name} must not be empty when it is configured"
+    );
+    Ok(Some(PathBuf::from(value)))
+}
+
+fn load_settings_from_path(path: &Path) -> Result<LauncherSettings> {
+    if !path.is_file() {
+        let settings = default_settings();
+        save_settings_to_path(path, &settings)?;
+        return Ok(settings);
+    }
+
+    let settings = serde_json::from_slice::<LauncherSettings>(&fs::read(path)?)?;
+    validate_settings(&settings)?;
+    Ok(settings)
+}
+
+fn load_profiles_from_path(path: &Path) -> Result<Vec<ProfileSummary>> {
+    if !path.is_file() {
+        let profiles = demo_profiles();
+        save_profiles_to_path(path, &profiles)?;
+        return Ok(profiles);
+    }
+
+    let profiles = serde_json::from_slice::<Vec<ProfileSummary>>(&fs::read(path)?)?;
+    validate_profiles(&profiles)?;
+    Ok(profiles)
+}
+
+fn load_minecraft_session_from_path(path: &Path) -> Result<Option<StoredMinecraftSession>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let mut session = serde_json::from_slice::<StoredMinecraftSession>(&fs::read(path)?)?;
+    unprotect_stored_minecraft_session_secrets(&mut session)?;
+    validate_stored_minecraft_session(&session)?;
+    Ok(Some(session))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMinecraftAccountsDocument {
+    #[serde(default)]
+    active_account_id: Option<String>,
+    #[serde(default)]
+    accounts: Vec<StoredMinecraftSession>,
+}
+
+fn stored_session_account_id(session: &StoredMinecraftSession) -> String {
+    session
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| session.session.uuid.to_string())
+}
+
+fn load_minecraft_accounts_document_from_path(
+    path: &Path,
+) -> Result<Option<StoredMinecraftAccountsDocument>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let mut document = serde_json::from_slice::<StoredMinecraftAccountsDocument>(&fs::read(path)?)?;
+    for session in &mut document.accounts {
+        unprotect_stored_minecraft_session_secrets(session)?;
+        validate_stored_minecraft_session(session)?;
+    }
+    Ok(Some(document))
+}
+
+fn save_minecraft_accounts_document_to_path(
+    path: &Path,
+    document: &StoredMinecraftAccountsDocument,
+) -> Result<()> {
+    for session in &document.accounts {
+        validate_stored_minecraft_session(session)?;
+    }
+    let mut persisted_document = document.clone();
+    for session in &mut persisted_document.accounts {
+        protect_stored_minecraft_session_secrets(session)?;
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_private_file_atomic(path, &serde_json::to_vec_pretty(&persisted_document)?)?;
+    Ok(())
+}
+
+fn load_active_minecraft_session_from_paths(
+    session_path: &Path,
+    accounts_path: &Path,
+) -> Result<Option<StoredMinecraftSession>> {
+    if let Some(document) = load_minecraft_accounts_document_from_path(accounts_path)? {
+        if let Some(active_account_id) = document.active_account_id.as_deref() {
+            if let Some(session) = document
+                .accounts
+                .iter()
+                .find(|session| stored_session_account_id(session) == active_account_id)
+            {
+                return Ok(Some(session.clone()));
+            }
+        }
+        if let Some(session) = document.accounts.first() {
+            return Ok(Some(session.clone()));
+        }
+    }
+
+    load_minecraft_session_from_path(session_path)
+}
+
+fn save_minecraft_session_to_paths(
+    session_path: &Path,
+    accounts_path: &Path,
+    session: StoredMinecraftSession,
+) -> Result<StoredMinecraftSession> {
+    let saved = save_minecraft_session_to_path(session_path, session)?;
+    let account_id = stored_session_account_id(&saved);
+    let mut document = load_minecraft_accounts_document_from_path(accounts_path)?.unwrap_or(
+        StoredMinecraftAccountsDocument {
+            active_account_id: None,
+            accounts: Vec::new(),
+        },
+    );
+    document
+        .accounts
+        .retain(|existing| stored_session_account_id(existing) != account_id);
+    document.accounts.push(saved.clone());
+    document.accounts.sort_by(|left, right| {
+        left.session
+            .username
+            .to_ascii_lowercase()
+            .cmp(&right.session.username.to_ascii_lowercase())
+            .then_with(|| stored_session_account_id(left).cmp(&stored_session_account_id(right)))
+    });
+    document.active_account_id = Some(account_id);
+    save_minecraft_accounts_document_to_path(accounts_path, &document)?;
+    Ok(saved)
+}
+
+fn clear_active_minecraft_session_at_paths(
+    session_path: &Path,
+    accounts_path: &Path,
+) -> Result<()> {
+    let active_account_id = load_active_minecraft_session_from_paths(session_path, accounts_path)?
+        .map(|session| stored_session_account_id(&session));
+    if let Some(active_account_id) = active_account_id {
+        if let Some(mut document) = load_minecraft_accounts_document_from_path(accounts_path)? {
+            document
+                .accounts
+                .retain(|session| stored_session_account_id(session) != active_account_id);
+            document.active_account_id = document.accounts.first().map(stored_session_account_id);
+            if document.accounts.is_empty() {
+                if accounts_path.exists() {
+                    fs::remove_file(accounts_path)?;
+                }
+            } else {
+                save_minecraft_accounts_document_to_path(accounts_path, &document)?;
+            }
+            if let Some(next_session) = document.accounts.first() {
+                save_minecraft_session_to_path(session_path, next_session.clone())?;
+                return Ok(());
+            }
+        }
+    }
+
+    clear_minecraft_session_at_path(session_path)
+}
+
+fn list_minecraft_accounts_from_paths(
+    session_path: &Path,
+    accounts_path: &Path,
+) -> Result<Vec<StoredMinecraftAccountSummary>> {
+    let document = load_minecraft_accounts_document_from_path(accounts_path)?.or_else(|| {
+        load_minecraft_session_from_path(session_path)
+            .ok()
+            .flatten()
+            .map(|session| StoredMinecraftAccountsDocument {
+                active_account_id: Some(stored_session_account_id(&session)),
+                accounts: vec![session],
+            })
+    });
+    let Some(document) = document else {
+        return Ok(Vec::new());
+    };
+    let active_account_id = document
+        .active_account_id
+        .as_deref()
+        .map(str::to_owned)
+        .or_else(|| document.accounts.first().map(stored_session_account_id));
+    Ok(document
+        .accounts
+        .into_iter()
+        .map(|session| {
+            let account_id = stored_session_account_id(&session);
+            StoredMinecraftAccountSummary {
+                active: active_account_id.as_deref() == Some(account_id.as_str()),
+                account_id,
+                username: session.session.username,
+                uuid: session.session.uuid,
+                expires_at_unix_seconds: session.expires_at_unix_seconds,
+            }
+        })
+        .collect())
+}
+
+fn select_minecraft_account_at_paths(
+    session_path: &Path,
+    accounts_path: &Path,
+    account_id: &str,
+) -> Result<StoredMinecraftSession> {
+    let account_id = account_id.trim();
+    ensure!(!account_id.is_empty(), "Minecraft account id is required");
+    let mut document = load_minecraft_accounts_document_from_path(accounts_path)?
+        .ok_or_else(|| anyhow!("no stored Minecraft accounts are available"))?;
+    let session = document
+        .accounts
+        .iter()
+        .find(|session| stored_session_account_id(session) == account_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Minecraft account '{account_id}' was not found"))?;
+    document.active_account_id = Some(account_id.to_owned());
+    save_minecraft_accounts_document_to_path(accounts_path, &document)?;
+    save_minecraft_session_to_path(session_path, session.clone())?;
+    Ok(session)
+}
+
+fn remove_minecraft_account_at_paths(
+    session_path: &Path,
+    accounts_path: &Path,
+    account_id: &str,
+) -> Result<Option<StoredMinecraftSession>> {
+    let account_id = account_id.trim();
+    ensure!(!account_id.is_empty(), "Minecraft account id is required");
+    let mut document = load_minecraft_accounts_document_from_path(accounts_path)?
+        .or_else(|| {
+            load_minecraft_session_from_path(session_path)
+                .ok()
+                .flatten()
+                .map(|session| StoredMinecraftAccountsDocument {
+                    active_account_id: Some(stored_session_account_id(&session)),
+                    accounts: vec![session],
+                })
+        })
+        .ok_or_else(|| anyhow!("no stored Minecraft accounts are available"))?;
+    let original_len = document.accounts.len();
+    document
+        .accounts
+        .retain(|session| stored_session_account_id(session) != account_id);
+    ensure!(
+        document.accounts.len() != original_len,
+        "Minecraft account '{account_id}' was not found"
+    );
+
+    if document.accounts.is_empty() {
+        if accounts_path.exists() {
+            fs::remove_file(accounts_path)?;
+        }
+        clear_minecraft_session_at_path(session_path)?;
+        return Ok(None);
+    }
+
+    let active_removed = document.active_account_id.as_deref() == Some(account_id);
+    if active_removed
+        || document
+            .active_account_id
+            .as_deref()
+            .is_none_or(|active_id| {
+                !document
+                    .accounts
+                    .iter()
+                    .any(|session| stored_session_account_id(session) == active_id)
+            })
+    {
+        document.active_account_id = document.accounts.first().map(stored_session_account_id);
+    }
+    let active_session = document
+        .active_account_id
+        .as_deref()
+        .and_then(|active_id| {
+            document
+                .accounts
+                .iter()
+                .find(|session| stored_session_account_id(session) == active_id)
+        })
+        .cloned()
+        .or_else(|| document.accounts.first().cloned());
+    save_minecraft_accounts_document_to_path(accounts_path, &document)?;
+    if let Some(session) = active_session {
+        save_minecraft_session_to_path(session_path, session.clone())?;
+        Ok(Some(session))
+    } else {
+        clear_minecraft_session_at_path(session_path)?;
+        Ok(None)
+    }
+}
+
+fn save_minecraft_session_to_path(
+    path: &Path,
+    mut session: StoredMinecraftSession,
+) -> Result<StoredMinecraftSession> {
+    if session.stored_at_unix_seconds == 0 {
+        session.stored_at_unix_seconds = current_unix_seconds();
+    }
+    validate_stored_minecraft_session(&session)?;
+    let mut persisted_session = session.clone();
+    protect_stored_minecraft_session_secrets(&mut persisted_session)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_private_file_atomic(path, &serde_json::to_vec_pretty(&persisted_session)?)?;
+    Ok(session)
+}
+
+fn clear_minecraft_session_at_path(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn protect_stored_minecraft_session_secrets(session: &mut StoredMinecraftSession) -> Result<()> {
+    if !stored_secret_is_protected(&session.session.access_token) {
+        session.session.access_token = protect_stored_secret(&session.session.access_token)?;
+    }
+    if let Some(refresh_token) = session.microsoft_refresh_token.as_deref() {
+        if !stored_secret_is_protected(refresh_token) {
+            session.microsoft_refresh_token = Some(protect_stored_secret(refresh_token)?);
+        }
+    }
+    Ok(())
+}
+
+fn unprotect_stored_minecraft_session_secrets(session: &mut StoredMinecraftSession) -> Result<()> {
+    if let Some(protected) = stored_secret_protected_payload(&session.session.access_token) {
+        session.session.access_token = unprotect_stored_secret(protected)?;
+    }
+    if let Some(refresh_token) = session.microsoft_refresh_token.as_deref() {
+        if let Some(protected) = stored_secret_protected_payload(refresh_token) {
+            session.microsoft_refresh_token = Some(unprotect_stored_secret(protected)?);
+        }
+    }
+    Ok(())
+}
+
+fn stored_secret_is_protected(secret: &str) -> bool {
+    stored_secret_protected_payload(secret).is_some()
+}
+
+fn stored_secret_protected_payload(secret: &str) -> Option<&str> {
+    secret.strip_prefix("dpapi:v1:")
+}
+
+#[cfg(windows)]
+fn protect_stored_secret(secret: &str) -> Result<String> {
+    Ok(format!(
+        "dpapi:v1:{}",
+        URL_SAFE_NO_PAD.encode(dpapi_protect_bytes(secret.as_bytes())?)
+    ))
+}
+
+#[cfg(not(windows))]
+fn protect_stored_secret(secret: &str) -> Result<String> {
+    Ok(secret.to_owned())
+}
+
+#[cfg(windows)]
+fn unprotect_stored_secret(protected_payload: &str) -> Result<String> {
+    let encrypted = URL_SAFE_NO_PAD.decode(protected_payload)?;
+    let decrypted = dpapi_unprotect_bytes(&encrypted)?;
+    String::from_utf8(decrypted).map_err(|_| anyhow!("DPAPI session secret is not valid UTF-8"))
+}
+
+#[cfg(not(windows))]
+fn unprotect_stored_secret(protected_payload: &str) -> Result<String> {
+    Err(anyhow!(
+        "DPAPI-protected Minecraft session secrets can only be read on Windows: {}",
+        protected_payload
+    ))
+}
+
+fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("secure file path must include a parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("secure file path must include a valid file name"))?;
+    let temporary_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary_path, bytes)?;
+    set_private_file_permissions(&temporary_path)?;
+    replace_file_with_temporary(&temporary_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary_path);
+        error
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    set_windows_owner_only_file_dacl(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    let _ = fs::metadata(path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_windows_owner_only_file_dacl(path: &Path) -> Result<()> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, LocalFree},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR,
+        },
+    };
+
+    let mut path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut sddl_wide = OsStr::new("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_mut_ptr(),
+            SDDL_REVISION_1,
+            &mut security_descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(anyhow!(
+            "failed to build private Windows file security descriptor: {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let result = unsafe {
+        SetFileSecurityW(
+            path_wide.as_mut_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            security_descriptor,
+        )
+    };
+    let last_error = unsafe { GetLastError() };
+    unsafe {
+        LocalFree(security_descriptor);
+    }
+    ensure!(
+        result != 0,
+        "failed to apply private Windows file permissions to {}: {}",
+        display_path(path),
+        last_error
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn dpapi_protect_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, LocalFree},
+        Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
+    };
+
+    ensure!(!bytes.is_empty(), "refresh token cannot be empty");
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let result = unsafe {
+        CryptProtectData(
+            &mut input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if result == 0 {
+        return Err(anyhow!(
+            "failed to protect Microsoft refresh token with Windows DPAPI: {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let protected =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(protected)
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, LocalFree},
+        Security::Cryptography::{
+            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+        },
+    };
+
+    ensure!(!bytes.is_empty(), "protected refresh token cannot be empty");
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let result = unsafe {
+        CryptUnprotectData(
+            &mut input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if result == 0 {
+        return Err(anyhow!(
+            "failed to unprotect Microsoft refresh token with Windows DPAPI: {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let unprotected =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(unprotected)
+}
+
+#[cfg(windows)]
+fn replace_file_with_temporary(temporary_path: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    fs::rename(temporary_path, destination)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_with_temporary(temporary_path: &Path, destination: &Path) -> Result<()> {
+    fs::rename(temporary_path, destination)?;
+    Ok(())
+}
+
+fn save_profiles_to_path(path: &Path, profiles: &[ProfileSummary]) -> Result<Vec<ProfileSummary>> {
+    validate_profiles(profiles)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(profiles)?)?;
+    Ok(profiles.to_vec())
+}
+
+fn create_profile_at_path(path: &Path, request: CreateProfileRequest) -> Result<ProfileSummary> {
+    validate_create_profile_request(&request)?;
+    let mut profiles = load_profiles_from_path(path)?;
+    let id = profile_id_from_name(&request.name);
+    ensure!(
+        !profiles.iter().any(|profile| profile.id == id),
+        "profile '{}' already exists",
+        request.name
+    );
+
+    let profile = ProfileSummary {
+        id,
+        name: request.name.trim().to_owned(),
+        loader: request.loader,
+        game_version: request.game_version.trim().to_owned(),
+        installed_pack_version: None,
+        last_played: None,
+        memory_mb: request.memory_mb,
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    };
+    profiles.push(profile.clone());
+    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    save_profiles_to_path(path, &profiles)?;
+    Ok(profile)
+}
+
+fn update_profile_at_path(path: &Path, request: UpdateProfileRequest) -> Result<ProfileSummary> {
+    validate_update_profile_request(&request)?;
+    let mut profiles = load_profiles_from_path(path)?;
+    let profile = profiles
+        .iter_mut()
+        .find(|profile| profile.id == request.id)
+        .ok_or_else(|| anyhow!("profile '{}' was not found", request.id))?;
+
+    if let Some(name) = request.name {
+        profile.name = name.trim().to_owned();
+    }
+    if let Some(loader) = request.loader {
+        profile.loader = loader;
+    }
+    if let Some(game_version) = request.game_version {
+        profile.game_version = game_version.trim().to_owned();
+    }
+    if let Some(memory_mb) = request.memory_mb {
+        profile.memory_mb = memory_mb;
+    }
+    if let Some(jvm_args) = request.jvm_args {
+        profile.jvm_args = normalize_jvm_args(jvm_args);
+    }
+    if request.clear_resolution {
+        profile.resolution = None;
+    } else if let Some(resolution) = request.resolution {
+        profile.resolution = Some(resolution);
+    }
+    if request.clear_default_server {
+        profile.default_server = None;
+    } else if let Some(default_server) = request.default_server {
+        profile.default_server = Some(default_server);
+    }
+    if request.clear_java_runtime_override {
+        profile.java_runtime_override_path = None;
+    } else if let Some(java_runtime_override_path) = request.java_runtime_override_path {
+        profile.java_runtime_override_path = normalize_optional_string(java_runtime_override_path);
+    }
+
+    validate_profiles(&profiles)?;
+    profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    let updated = profiles
+        .iter()
+        .find(|profile| profile.id == request.id)
+        .cloned()
+        .expect("updated profile should remain present");
+    save_profiles_to_path(path, &profiles)?;
+    Ok(updated)
+}
+
+fn mark_profile_launched_at_path(
+    path: &Path,
+    profile_id: &str,
+    last_played: &str,
+) -> Result<ProfileSummary> {
+    ensure!(!profile_id.trim().is_empty(), "profile_id is required");
+    ensure!(!last_played.trim().is_empty(), "last_played is required");
+    let mut profiles = load_profiles_from_path(path)?;
+    let profile = profiles
+        .iter_mut()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))?;
+    profile.last_played = Some(last_played.trim().to_owned());
+    let updated = profile.clone();
+
+    validate_profiles(&profiles)?;
+    save_profiles_to_path(path, &profiles)?;
+    Ok(updated)
+}
+
+fn archive_profile_at_path(path: &Path, request: ArchiveProfileRequest) -> Result<ProfileSummary> {
+    validate_archive_profile_request(&request)?;
+    let mut profiles = load_profiles_from_path(path)?;
+    let index = profiles
+        .iter()
+        .position(|profile| profile.id == request.id)
+        .ok_or_else(|| anyhow!("profile '{}' was not found", request.id))?;
+    let archived = profiles.remove(index);
+
+    validate_profiles(&profiles)?;
+    save_profiles_to_path(path, &profiles)?;
+    Ok(archived)
+}
+
+fn delete_profile_at_path(
+    path: &Path,
+    request: DeleteProfileRequest,
+    directories: &LauncherDirectories,
+) -> Result<ProfileSummary> {
+    validate_delete_profile_request(&request)?;
+    let mut profiles = load_profiles_from_path(path)?;
+    let index = profiles
+        .iter()
+        .position(|profile| profile.id == request.id)
+        .ok_or_else(|| anyhow!("profile '{}' was not found", request.id))?;
+    let deleted = profiles.remove(index);
+    remove_profile_data_dir(directories, &deleted.id)?;
+
+    validate_profiles(&profiles)?;
+    save_profiles_to_path(path, &profiles)?;
+    Ok(deleted)
+}
+
+fn remove_profile_data_dir(directories: &LauncherDirectories, profile_id: &str) -> Result<bool> {
+    let profile_dir = profile_data_dir(directories, profile_id)?;
+    if !profile_dir.exists() {
+        return Ok(false);
+    }
+    ensure!(
+        profile_dir.is_dir(),
+        "profile data path is not a directory: {}",
+        display_path(&profile_dir)
+    );
+    let profile_root = profile_data_root(directories);
+    let canonical_profile_root = profile_root.canonicalize().with_context(|| {
+        format!(
+            "profile data root is missing: {}",
+            display_path(&profile_root)
+        )
+    })?;
+    let canonical_profile_dir = profile_dir.canonicalize().with_context(|| {
+        format!(
+            "profile data directory could not be resolved safely: {}",
+            display_path(&profile_dir)
+        )
+    })?;
+    ensure!(
+        canonical_profile_dir != canonical_profile_root
+            && path_starts_with(&canonical_profile_dir, &canonical_profile_root),
+        "profile data directory is outside the managed profiles root"
+    );
+    fs::remove_dir_all(&canonical_profile_dir)?;
+    Ok(true)
+}
+
+fn profile_data_dir(directories: &LauncherDirectories, profile_id: &str) -> Result<PathBuf> {
+    ensure_safe_path_segment(profile_id, "profile id")?;
+    let profile_root = profile_data_root(directories);
+    let profile_dir = profile_root.join(profile_id);
+    ensure!(
+        path_starts_with(&profile_dir, &profile_root),
+        "profile data directory is outside the managed profiles root"
+    );
+    Ok(profile_dir)
+}
+
+fn profile_data_root(directories: &LauncherDirectories) -> PathBuf {
+    PathBuf::from(&directories.data_dir).join("profiles")
+}
+
+fn persist_imported_profile_at_path(path: &Path, plan: &ImportPlan) -> Result<ProfileSummary> {
+    ensure!(!plan.profile_id.trim().is_empty(), "profile_id is required");
+    ensure!(
+        !plan.profile_name.trim().is_empty(),
+        "profile name is required"
+    );
+    let mut profiles = load_profiles_from_path(path)?;
+    let profile = imported_profile_from_plan(plan);
+
+    if let Some(existing) = profiles
+        .iter_mut()
+        .find(|existing| existing.id == profile.id)
+    {
+        existing.name = profile.name.clone();
+        existing.loader = profile.loader.clone();
+        existing.game_version = profile.game_version.clone();
+        existing.installed_pack_version = profile.installed_pack_version.clone();
+        existing.memory_mb = profile.memory_mb;
+        existing.java_runtime_override_path = profile.java_runtime_override_path.clone();
+    } else {
+        profiles.push(profile.clone());
+    }
+
+    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    save_profiles_to_path(path, &profiles)?;
+    Ok(profile)
+}
+
+fn persist_installed_pack_profile_at_path(
+    path: &Path,
+    profile: ProfileSummary,
+) -> Result<ProfileSummary> {
+    validate_profiles(std::slice::from_ref(&profile))?;
+    let mut profiles = load_profiles_from_path(path)?;
+    let saved_profile;
+
+    if let Some(existing) = profiles
+        .iter_mut()
+        .find(|existing| existing.id == profile.id)
+    {
+        existing.name = profile.name.clone();
+        existing.loader = profile.loader.clone();
+        existing.game_version = profile.game_version.clone();
+        existing.installed_pack_version = profile.installed_pack_version.clone();
+        existing.memory_mb = profile.memory_mb;
+        existing.java_runtime_override_path = existing
+            .java_runtime_override_path
+            .clone()
+            .or_else(|| profile.java_runtime_override_path.clone());
+        saved_profile = existing.clone();
+    } else {
+        profiles.push(profile.clone());
+        saved_profile = profile.clone();
+    }
+
+    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    save_profiles_to_path(path, &profiles)?;
+    Ok(saved_profile)
+}
+
+fn imported_profile_from_plan(plan: &ImportPlan) -> ProfileSummary {
+    ProfileSummary {
+        id: plan.profile_id.trim().to_owned(),
+        name: plan.profile_name.trim().to_owned(),
+        loader: plan.detected_loader.clone().unwrap_or(ModLoader::Vanilla),
+        game_version: plan
+            .detected_game_version
+            .as_deref()
+            .filter(|version| !version.trim().is_empty())
+            .unwrap_or("1.21.8")
+            .to_owned(),
+        installed_pack_version: None,
+        last_played: None,
+        memory_mb: default_settings().max_memory_mb,
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    }
+}
+
+fn validate_profiles(profiles: &[ProfileSummary]) -> Result<()> {
+    let mut ids = BTreeMap::new();
+    for profile in profiles {
+        ensure!(!profile.id.trim().is_empty(), "profile id is required");
+        ensure_safe_path_segment(&profile.id, "profile id")?;
+        ensure!(!profile.name.trim().is_empty(), "profile name is required");
+        ensure!(
+            !profile.game_version.trim().is_empty(),
+            "profile game version is required"
+        );
+        ensure!(
+            profile.memory_mb >= 512,
+            "profile memory must be at least 512 MB"
+        );
+        ensure!(
+            profile.memory_mb <= 32768,
+            "profile memory must be 32768 MB or lower"
+        );
+        validate_jvm_args(&profile.jvm_args)?;
+        if let Some(resolution) = profile.resolution.as_ref() {
+            validate_profile_resolution(resolution)?;
+        }
+        if let Some(default_server) = profile.default_server.as_ref() {
+            server_launch_arguments(default_server)?;
+        }
+        if let Some(path) = profile.java_runtime_override_path.as_deref() {
+            ensure!(
+                !path.trim().is_empty(),
+                "profile Java runtime override path must not be empty"
+            );
+        }
+        ensure!(
+            ids.insert(profile.id.as_str(), true).is_none(),
+            "duplicate profile id '{}'",
+            profile.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_create_profile_request(request: &CreateProfileRequest) -> Result<()> {
+    ensure!(!request.name.trim().is_empty(), "profile name is required");
+    ensure!(
+        !request.game_version.trim().is_empty(),
+        "profile game version is required"
+    );
+    ensure!(
+        request.memory_mb >= 512,
+        "profile memory must be at least 512 MB"
+    );
+    ensure!(
+        request.memory_mb <= 32768,
+        "profile memory must be 32768 MB or lower"
+    );
+    Ok(())
+}
+
+fn validate_update_profile_request(request: &UpdateProfileRequest) -> Result<()> {
+    ensure!(!request.id.trim().is_empty(), "profile id is required");
+    ensure!(
+        request.name.is_some()
+            || request.loader.is_some()
+            || request.game_version.is_some()
+            || request.memory_mb.is_some()
+            || request.jvm_args.is_some()
+            || request.resolution.is_some()
+            || request.clear_resolution
+            || request.default_server.is_some()
+            || request.clear_default_server
+            || request.java_runtime_override_path.is_some()
+            || request.clear_java_runtime_override,
+        "profile update must include at least one change"
+    );
+    if let Some(name) = request.name.as_ref() {
+        ensure!(!name.trim().is_empty(), "profile name is required");
+    }
+    if let Some(game_version) = request.game_version.as_ref() {
+        ensure!(
+            !game_version.trim().is_empty(),
+            "profile game version is required"
+        );
+    }
+    if let Some(memory_mb) = request.memory_mb {
+        ensure!(memory_mb >= 512, "profile memory must be at least 512 MB");
+        ensure!(
+            memory_mb <= 32768,
+            "profile memory must be 32768 MB or lower"
+        );
+    }
+    if let Some(jvm_args) = request.jvm_args.as_ref() {
+        validate_jvm_args(jvm_args)?;
+    }
+    if let Some(resolution) = request.resolution.as_ref() {
+        ensure!(
+            !request.clear_resolution,
+            "profile resolution cannot be set and cleared in the same update"
+        );
+        validate_profile_resolution(resolution)?;
+    }
+    if let Some(default_server) = request.default_server.as_ref() {
+        ensure!(
+            !request.clear_default_server,
+            "profile default server cannot be set and cleared in the same update"
+        );
+        server_launch_arguments(default_server)?;
+    }
+    if let Some(path) = request.java_runtime_override_path.as_ref() {
+        ensure!(
+            !request.clear_java_runtime_override,
+            "profile Java runtime override cannot be set and cleared in the same update"
+        );
+        ensure!(
+            !path.trim().is_empty(),
+            "profile Java runtime override path must not be empty"
+        );
+    }
+    Ok(())
+}
+
+fn validate_archive_profile_request(request: &ArchiveProfileRequest) -> Result<()> {
+    ensure!(!request.id.trim().is_empty(), "profile id is required");
+    ensure_safe_path_segment(&request.id, "profile id")?;
+    Ok(())
+}
+
+fn validate_delete_profile_request(request: &DeleteProfileRequest) -> Result<()> {
+    ensure!(!request.id.trim().is_empty(), "profile id is required");
+    ensure_safe_path_segment(&request.id, "profile id")?;
+    Ok(())
+}
+
+fn normalize_jvm_args(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .map(|argument| argument.trim().to_owned())
+        .filter(|argument| !argument.is_empty())
+        .collect()
+}
+
+fn normalize_optional_string(value: String) -> Option<String> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn validate_jvm_args(args: &[String]) -> Result<()> {
+    ensure!(
+        args.len() <= 32,
+        "profile JVM args are limited to 32 entries"
+    );
+    for argument in args {
+        let trimmed = argument.trim();
+        ensure!(!trimmed.is_empty(), "profile JVM args cannot be blank");
+        ensure!(
+            !trimmed.contains('\0'),
+            "profile JVM args cannot contain null bytes"
+        );
+        ensure!(
+            !trimmed.starts_with("-Xmx") && !trimmed.starts_with("-Xms"),
+            "profile JVM args cannot override launcher memory flags"
+        );
+    }
+    Ok(())
+}
+
+fn validate_profile_resolution(resolution: &ProfileResolution) -> Result<()> {
+    ensure!(
+        resolution.width >= 320,
+        "profile resolution width must be at least 320"
+    );
+    ensure!(
+        resolution.height >= 240,
+        "profile resolution height must be at least 240"
+    );
+    ensure!(
+        resolution.width <= 7680,
+        "profile resolution width must be 7680 or lower"
+    );
+    ensure!(
+        resolution.height <= 4320,
+        "profile resolution height must be 4320 or lower"
+    );
+    Ok(())
+}
+
+fn save_settings_to_path(path: &Path, settings: &LauncherSettings) -> Result<LauncherSettings> {
+    validate_settings(settings)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(settings)?)?;
+    Ok(settings.clone())
+}
+
+fn validate_settings(settings: &LauncherSettings) -> Result<()> {
+    ensure!(
+        settings.min_memory_mb >= 512,
+        "minimum memory must be at least 512 MB"
+    );
+    ensure!(
+        settings.max_memory_mb >= settings.min_memory_mb,
+        "maximum memory must be greater than or equal to minimum memory"
+    );
+    ensure!(
+        settings.max_memory_mb <= 32768,
+        "maximum memory must be 32768 MB or lower"
+    );
+    ensure!(
+        !settings.offline_username.trim().is_empty(),
+        "offline username is required"
+    );
+    if let Some(path) = settings.java_runtime_override_path.as_deref() {
+        ensure!(
+            !path.trim().is_empty(),
+            "global Java runtime override path must not be empty"
+        );
+    }
+    Ok(())
+}
+
+fn default_import_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        roots.push(PathBuf::from(home));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        roots.push(PathBuf::from(appdata));
+    }
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local_appdata));
+    }
+
+    roots
+}
+
+fn java_candidate_paths() -> Vec<(PathBuf, JavaRuntimeSource)> {
+    let mut candidates = Vec::new();
+
+    candidates.extend(managed_java_candidate_paths());
+
+    if let Some(java_home) = env::var_os("JAVA_HOME") {
+        candidates.push((
+            PathBuf::from(java_home)
+                .join("bin")
+                .join(java_executable_name()),
+            JavaRuntimeSource::JavaHome,
+        ));
+    }
+
+    if let Some(path_var) = env::var_os("PATH") {
+        for path in env::split_paths(&path_var) {
+            candidates.push((path.join(java_executable_name()), JavaRuntimeSource::Path));
+        }
+    }
+
+    candidates
+}
+
+fn managed_java_candidate_paths() -> Vec<(PathBuf, JavaRuntimeSource)> {
+    prepare_launcher_directories()
+        .map(|directories| {
+            managed_java_candidate_paths_from_root(
+                Path::new(&directories.data_dir).join("runtimes"),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn managed_java_candidate_paths_from_root(root: PathBuf) -> Vec<(PathBuf, JavaRuntimeSource)> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        candidates.push((
+            path.join("bin").join(java_executable_name()),
+            JavaRuntimeSource::Bundled,
+        ));
+        candidates.push((
+            path.join(java_executable_name()),
+            JavaRuntimeSource::Bundled,
+        ));
+        if let Ok(children) = fs::read_dir(&path) {
+            for child in children.flatten() {
+                let child_path = child.path();
+                if !child_path.is_dir() {
+                    continue;
+                }
+                candidates.push((
+                    child_path.join("bin").join(java_executable_name()),
+                    JavaRuntimeSource::Bundled,
+                ));
+            }
+        }
+    }
+    candidates
+}
+
+fn java_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "java.exe"
+    } else {
+        "java"
+    }
+}
+
+fn java_major_from_version(version: &str) -> Option<u32> {
+    let mut parts = version.split('.');
+    let first = parts.next()?.parse::<u32>().ok()?;
+    if first == 1 {
+        parts.next()?.parse::<u32>().ok()
+    } else {
+        Some(first)
+    }
+}
+
+fn scan_prism_like_instances(
+    instances_dir: &Path,
+    kind: ImportKind,
+    source: &str,
+    candidates: &mut BTreeMap<String, ImportCandidate>,
+) -> Result<()> {
+    if !instances_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(instances_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if has_import_marker(&path) {
+            let id = import_id(&kind, &path);
+            let detected_loader = detect_import_loader(&path);
+            let detected_game_version = detect_import_game_version(&path);
+            let metadata = inspect_import_candidate_metadata(&path);
+            let identity = detect_import_identity(&path);
+            candidates.insert(
+                id.clone(),
+                ImportCandidate {
+                    id,
+                    source: source.to_owned(),
+                    name: name.to_owned(),
+                    path: display_path(&path),
+                    kind: kind.clone(),
+                    detected_loader,
+                    detected_game_version,
+                    detected_name: identity.name,
+                    detected_summary: identity.summary,
+                    detected_icon_path: identity.icon_path,
+                    importable_file_count: metadata.file_count,
+                    importable_total_bytes: metadata.total_bytes,
+                    last_modified_unix_seconds: metadata.last_modified_unix_seconds,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn has_import_marker(path: &Path) -> bool {
+    [
+        "instance.cfg",
+        "mmc-pack.json",
+        "manifest.json",
+        "minecraftinstance.json",
+    ]
+    .iter()
+    .any(|marker| path.join(marker).is_file())
+}
+
+fn scan_official_minecraft(
+    minecraft_dir: &Path,
+    candidates: &mut BTreeMap<String, ImportCandidate>,
+) -> Result<()> {
+    if !minecraft_dir.join("launcher_profiles.json").is_file() {
+        return Ok(());
+    }
+
+    let id = import_id(&ImportKind::Minecraft, minecraft_dir);
+    let metadata = inspect_import_candidate_metadata(minecraft_dir);
+    let identity = detect_official_minecraft_identity(minecraft_dir);
+    candidates.insert(
+        id.clone(),
+        ImportCandidate {
+            id,
+            source: "Minecraft Launcher".to_owned(),
+            name: "Official Minecraft".to_owned(),
+            path: display_path(minecraft_dir),
+            kind: ImportKind::Minecraft,
+            detected_loader: Some(ModLoader::Vanilla),
+            detected_game_version: identity.game_version,
+            detected_name: identity.name,
+            detected_summary: identity.summary,
+            detected_icon_path: find_import_icon_path(minecraft_dir),
+            importable_file_count: metadata.file_count,
+            importable_total_bytes: metadata.total_bytes,
+            last_modified_unix_seconds: metadata.last_modified_unix_seconds,
+        },
+    );
+    Ok(())
+}
+
+fn import_id(kind: &ImportKind, path: &Path) -> String {
+    let kind = match kind {
+        ImportKind::Prism => "prism",
+        ImportKind::Multimc => "multimc",
+        ImportKind::Minecraft => "minecraft",
+        ImportKind::Gdlauncher => "gdlauncher",
+        ImportKind::Atlauncher => "atlauncher",
+    };
+    let path = display_path(path).to_ascii_lowercase();
+    let slug = path
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("{kind}-{slug}")
+}
+
+fn detect_import_loader(source_path: &Path) -> Option<ModLoader> {
+    if let Some(loader) = detect_import_loader_from_mmc_pack(source_path) {
+        return Some(loader);
+    }
+    detect_import_loader_from_json_metadata(source_path)
+}
+
+fn detect_import_loader_from_mmc_pack(source_path: &Path) -> Option<ModLoader> {
+    let pack = read_mmc_pack(source_path)?;
+    let components = pack.get("components")?.as_array()?;
+    let mut loader = ModLoader::Vanilla;
+
+    for component in components {
+        let uid = component
+            .get("uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        loader = match uid {
+            "net.fabricmc.fabric-loader" => ModLoader::Fabric,
+            "org.quiltmc.quilt-loader" => ModLoader::Quilt,
+            "net.minecraftforge" => ModLoader::Forge,
+            "net.neoforged" => ModLoader::Neoforge,
+            _ => loader,
+        };
+    }
+
+    Some(loader)
+}
+
+fn detect_import_game_version(source_path: &Path) -> Option<String> {
+    detect_import_game_version_from_mmc_pack(source_path)
+        .or_else(|| detect_import_game_version_from_json_metadata(source_path))
+}
+
+fn detect_import_game_version_from_mmc_pack(source_path: &Path) -> Option<String> {
+    let pack = read_mmc_pack(source_path)?;
+    let components = pack.get("components")?.as_array()?;
+
+    components.iter().find_map(|component| {
+        let uid = component.get("uid").and_then(Value::as_str)?;
+        if uid == "net.minecraft" {
+            component
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+
+fn detect_import_loader_from_json_metadata(source_path: &Path) -> Option<ModLoader> {
+    for metadata in read_import_json_metadata(source_path) {
+        for key in ["loader", "modLoader", "modloader", "loaderType"] {
+            if let Some(loader) = metadata.get(key).and_then(Value::as_str) {
+                if let Some(loader) = parse_mod_loader(loader) {
+                    return Some(loader);
+                }
+            }
+        }
+        if let Some(loader) = detect_import_loader_from_nested_minecraft_metadata(&metadata) {
+            return Some(loader);
+        }
+    }
+    None
+}
+
+fn detect_import_game_version_from_json_metadata(source_path: &Path) -> Option<String> {
+    for metadata in read_import_json_metadata(source_path) {
+        for key in ["gameVersion", "minecraftVersion", "version"] {
+            if let Some(version) = metadata.get(key).and_then(Value::as_str) {
+                if looks_like_minecraft_version(version) {
+                    return Some(version.to_owned());
+                }
+            }
+        }
+        if let Some(version) = metadata
+            .get("minecraft")
+            .and_then(|minecraft| minecraft.get("version"))
+            .and_then(Value::as_str)
+            .filter(|version| looks_like_minecraft_version(version))
+        {
+            return Some(version.to_owned());
+        }
+    }
+    None
+}
+
+fn detect_import_loader_from_nested_minecraft_metadata(metadata: &Value) -> Option<ModLoader> {
+    let mod_loaders = metadata
+        .get("minecraft")
+        .and_then(|minecraft| minecraft.get("modLoaders"))
+        .and_then(Value::as_array)?;
+
+    mod_loaders
+        .iter()
+        .filter(|loader| {
+            loader
+                .get("primary")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .chain(mod_loaders.iter())
+        .find_map(|loader| {
+            loader
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(parse_mod_loader)
+        })
+}
+
+fn parse_mod_loader(loader: &str) -> Option<ModLoader> {
+    let loader = loader.trim().to_ascii_lowercase();
+    match loader.as_str() {
+        "vanilla" | "minecraft" => Some(ModLoader::Vanilla),
+        "fabric" | "fabric-loader" => Some(ModLoader::Fabric),
+        "quilt" | "quilt-loader" => Some(ModLoader::Quilt),
+        "forge" | "minecraftforge" => Some(ModLoader::Forge),
+        "neoforge" | "neo_forge" | "neo-forge" => Some(ModLoader::Neoforge),
+        _ if loader.starts_with("fabric-") => Some(ModLoader::Fabric),
+        _ if loader.starts_with("quilt-") => Some(ModLoader::Quilt),
+        _ if loader.starts_with("neoforge-") || loader.starts_with("neo-forge-") => {
+            Some(ModLoader::Neoforge)
+        }
+        _ if loader.starts_with("forge-") => Some(ModLoader::Forge),
+        _ => None,
+    }
+}
+
+fn read_import_json_metadata(source_path: &Path) -> Vec<Value> {
+    ["manifest.json", "minecraftinstance.json"]
+        .into_iter()
+        .filter_map(|relative_path| {
+            serde_json::from_slice(&fs::read(source_path.join(relative_path)).ok()?).ok()
+        })
+        .collect()
+}
+
+fn read_mmc_pack(source_path: &Path) -> Option<Value> {
+    let path = source_path.join("mmc-pack.json");
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+struct OfficialMinecraftIdentity {
+    name: Option<String>,
+    game_version: Option<String>,
+    summary: Option<String>,
+}
+
+fn detect_official_minecraft_identity(minecraft_dir: &Path) -> OfficialMinecraftIdentity {
+    let mut identity = OfficialMinecraftIdentity {
+        name: None,
+        game_version: None,
+        summary: None,
+    };
+    let path = minecraft_dir.join("launcher_profiles.json");
+    let Ok(value) = serde_json::from_slice::<Value>(&fs::read(path).unwrap_or_default()) else {
+        return identity;
+    };
+    let Some(profiles) = value.get("profiles").and_then(Value::as_object) else {
+        return identity;
+    };
+
+    let selected_profile_id = value.get("selectedProfile").and_then(Value::as_str);
+    let selected_profile = selected_profile_id
+        .and_then(|id| profiles.get(id))
+        .or_else(|| profiles.values().next());
+
+    if let Some(profile) = selected_profile {
+        identity.name = profile
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        identity.game_version = profile
+            .get("lastVersionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|version| looks_like_minecraft_version(version))
+            .map(str::to_owned);
+    }
+
+    let profile_count = profiles.len();
+    if profile_count > 0 {
+        identity.summary = Some(if profile_count == 1 {
+            "1 launcher profile detected".to_owned()
+        } else {
+            format!("{profile_count} launcher profiles detected")
+        });
+    }
+
+    identity
+}
+
+struct ImportIdentityMetadata {
+    name: Option<String>,
+    summary: Option<String>,
+    icon_path: Option<String>,
+}
+
+fn detect_import_identity(source_path: &Path) -> ImportIdentityMetadata {
+    let mut identity = ImportIdentityMetadata {
+        name: None,
+        summary: None,
+        icon_path: None,
+    };
+
+    apply_instance_cfg_identity(source_path, &mut identity);
+    apply_json_identity(source_path, "manifest.json", &mut identity);
+    apply_json_identity(source_path, "minecraftinstance.json", &mut identity);
+    if identity.icon_path.is_none() {
+        identity.icon_path = find_import_icon_path(source_path);
+    }
+    identity
+}
+
+fn apply_instance_cfg_identity(source_path: &Path, identity: &mut ImportIdentityMetadata) {
+    let Ok(content) = fs::read_to_string(source_path.join("instance.cfg")) else {
+        return;
+    };
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "name" | "Name" => set_if_empty(&mut identity.name, value),
+            "notes" | "Notes" | "description" | "Description" => {
+                set_if_empty(&mut identity.summary, value)
+            }
+            "iconKey" | "icon" | "Icon" => {
+                if identity.icon_path.is_none() {
+                    identity.icon_path = resolve_import_icon_reference(source_path, value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_json_identity(
+    source_path: &Path,
+    relative_path: &str,
+    identity: &mut ImportIdentityMetadata,
+) {
+    let Ok(bytes) = fs::read(source_path.join(relative_path)) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    for key in ["name", "displayName", "title"] {
+        if let Some(name) = value.get(key).and_then(Value::as_str) {
+            set_if_empty(&mut identity.name, name);
+        }
+    }
+    for key in ["summary", "description", "notes"] {
+        if let Some(summary) = value.get(key).and_then(Value::as_str) {
+            set_if_empty(&mut identity.summary, summary);
+        }
+    }
+    for key in ["icon", "iconPath", "logo", "image"] {
+        if let Some(icon) = value.get(key).and_then(Value::as_str) {
+            if identity.icon_path.is_none() {
+                identity.icon_path = resolve_import_icon_reference(source_path, icon);
+            }
+        }
+    }
+}
+
+fn set_if_empty(target: &mut Option<String>, value: &str) {
+    let value = value.trim();
+    if target.is_none() && !value.is_empty() {
+        *target = Some(value.to_owned());
+    }
+}
+
+fn resolve_import_icon_reference(source_path: &Path, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with("http://") || value.starts_with("https://") {
+        return None;
+    }
+    let direct = source_path.join(value);
+    if direct.is_file() {
+        return Some(display_path(&direct));
+    }
+    for extension in ["png", "jpg", "jpeg", "ico"] {
+        let candidate = source_path.join(format!("{value}.{extension}"));
+        if candidate.is_file() {
+            return Some(display_path(&candidate));
+        }
+    }
+    None
+}
+
+fn find_import_icon_path(source_path: &Path) -> Option<String> {
+    for relative_path in [
+        "icon.png",
+        "icon.jpg",
+        "icon.jpeg",
+        "icon.ico",
+        "instance.png",
+        "logo.png",
+    ] {
+        let path = source_path.join(relative_path);
+        if path.is_file() {
+            return Some(display_path(&path));
+        }
+    }
+    None
+}
+
+struct ImportCandidateMetadata {
+    file_count: Option<u64>,
+    total_bytes: Option<u64>,
+    last_modified_unix_seconds: Option<u64>,
+}
+
+fn inspect_import_candidate_metadata(source_path: &Path) -> ImportCandidateMetadata {
+    let mut file_count = 0;
+    let mut total_bytes = 0;
+    let mut newest = None;
+
+    for (_, relative_path) in IMPORTABLE_PROFILE_PATHS {
+        collect_import_path_metadata(
+            &source_path.join(relative_path),
+            &mut file_count,
+            &mut total_bytes,
+            &mut newest,
+        );
+    }
+
+    ImportCandidateMetadata {
+        file_count: Some(file_count),
+        total_bytes: Some(total_bytes),
+        last_modified_unix_seconds: newest,
+    }
+}
+
+fn collect_import_path_metadata(
+    path: &Path,
+    file_count: &mut u64,
+    total_bytes: &mut u64,
+    newest: &mut Option<u64>,
+) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    update_newest_modified(metadata.modified().ok(), newest);
+    if metadata.is_file() {
+        *file_count += 1;
+        *total_bytes += metadata.len();
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        collect_import_path_metadata(&entry.path(), file_count, total_bytes, newest);
+    }
+}
+
+#[derive(Default)]
+struct PathStats {
+    file_count: u64,
+    total_bytes: u64,
+}
+
+fn collect_path_stats(path: &Path) -> PathStats {
+    let Ok(metadata) = fs::metadata(path) else {
+        return PathStats::default();
+    };
+    if metadata.is_file() {
+        return PathStats {
+            file_count: 1,
+            total_bytes: metadata.len(),
+        };
+    }
+    if !metadata.is_dir() {
+        return PathStats::default();
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return PathStats::default();
+    };
+    let mut stats = PathStats::default();
+    for entry in entries.flatten() {
+        let child_stats = collect_path_stats(&entry.path());
+        stats.file_count += child_stats.file_count;
+        stats.total_bytes += child_stats.total_bytes;
+    }
+    stats
+}
+
+fn update_newest_modified(modified: Option<SystemTime>, newest: &mut Option<u64>) {
+    let Some(modified) = modified else {
+        return;
+    };
+    let Ok(seconds) = modified.duration_since(SystemTime::UNIX_EPOCH) else {
+        return;
+    };
+    let seconds = seconds.as_secs();
+    if newest.map(|current| seconds > current).unwrap_or(true) {
+        *newest = Some(seconds);
+    }
+}
+
+fn copy_path_recursively(source: &Path, destination: &Path) -> Result<()> {
+    if source.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+        return Ok(());
+    }
+
+    ensure!(source.is_dir(), "import source item does not exist");
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let child_source = entry.path();
+        let child_destination = destination.join(entry.file_name());
+        copy_path_recursively(&child_source, &child_destination)?;
+    }
+    Ok(())
+}
+
+fn remove_existing_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn next_available_import_destination(destination: &Path) -> Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("import destination must have a parent directory"))?;
+    let stem = destination
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow!("import destination must have a file name"))?;
+    let extension = destination
+        .extension()
+        .and_then(|extension| extension.to_str());
+
+    for index in 1..=1000 {
+        let suffix = if index == 1 {
+            "-imported".to_owned()
+        } else {
+            format!("-imported-{index}")
+        };
+        let file_name = match extension {
+            Some(extension) => format!("{stem}{suffix}.{extension}"),
+            None => format!("{stem}{suffix}"),
+        };
+        let candidate = parent.join(file_name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "could not find an available renamed import destination for {}",
+        display_path(destination)
+    ))
+}
+
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    path.components()
+        .zip(root.components())
+        .all(|(left, right)| left == right)
+        && path.components().count() >= root.components().count()
+}
+
+fn ensure_safe_path_segment(value: &str, label: &str) -> Result<()> {
+    ensure!(
+        !value.trim().is_empty()
+            && value == value.trim()
+            && !value.contains('/')
+            && !value.contains('\\')
+            && !value.contains(':')
+            && value != "."
+            && value != "..",
+        "{label} must be a safe path segment"
+    );
+    Ok(())
+}
+
+fn ensure_safe_relative_path(value: &str, label: &str) -> Result<()> {
+    ensure!(
+        value.split('/').all(|part| {
+            !part.is_empty()
+                && part == part.trim()
+                && part != "."
+                && part != ".."
+                && !part.contains('\\')
+                && !part.contains(':')
+        }),
+        "{label} must be a safe relative path"
+    );
+    Ok(())
+}
+
+fn import_plan_item_label(kind: &ImportPlanItemKind) -> &'static str {
+    match kind {
+        ImportPlanItemKind::Saves => "saves",
+        ImportPlanItemKind::Options => "options",
+        ImportPlanItemKind::ResourcePacks => "resource packs",
+        ImportPlanItemKind::ShaderPacks => "shader packs",
+        ImportPlanItemKind::Screenshots => "screenshots",
+        ImportPlanItemKind::Config => "config",
+        ImportPlanItemKind::Mods => "mods",
+    }
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn looks_like_minecraft_version(version: &str) -> bool {
+    let version = version.trim();
+    if looks_like_minecraft_snapshot_version(version) {
+        return true;
+    }
+    let mut parts = version.split('.');
+    if !matches!(parts.next(), Some("1")) {
+        return false;
+    }
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let (minor, suffix) = minor
+        .split_once('-')
+        .map(|(minor, suffix)| (minor, Some(suffix)))
+        .unwrap_or((minor, None));
+    let valid_release_suffix = match suffix {
+        None => true,
+        Some(suffix) => {
+            let digits = suffix
+                .chars()
+                .skip_while(|ch| ch.is_ascii_alphabetic())
+                .collect::<String>();
+            (suffix.starts_with("pre") || suffix.starts_with("rc"))
+                && !digits.is_empty()
+                && digits.chars().all(|ch| ch.is_ascii_digit())
+        }
+    };
+    minor.parse::<u32>().ok().is_some_and(|minor| minor >= 6) && valid_release_suffix
+}
+
+fn looks_like_minecraft_snapshot_version(version: &str) -> bool {
+    let mut chars = version.chars();
+    chars.by_ref().take(2).all(|ch| ch.is_ascii_digit())
+        && matches!(chars.next(), Some('w'))
+        && chars.by_ref().take(2).all(|ch| ch.is_ascii_digit())
+        && matches!(chars.next(), Some(ch) if ch.is_ascii_lowercase())
+        && chars.next().is_none()
+}
+
+fn offline_uuid_seed(username: &str) -> String {
+    let seed = format!("OfflinePlayer:{}", username.trim());
+    let mut digest: [u8; 16] = Md5::digest(seed.as_bytes()).into();
+    digest[6] = (digest[6] & 0x0f) | 0x30;
+    digest[8] = (digest[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(digest).simple().to_string()
+}
+
+fn profile_id_from_name(name: &str) -> String {
+    let slug = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if slug.is_empty() {
+        "profile".to_owned()
+    } else {
+        slug
+    }
+}
+
+fn receipt(
+    action: LauncherAction,
+    subject_id: Option<String>,
+    message: impl Into<String>,
+) -> ActionReceipt {
+    ActionReceipt {
+        id: Uuid::new_v4(),
+        action,
+        subject_id,
+        status: ActionStatus::Queued,
+        message: message.into(),
+    }
+}
+
+fn operation_event(
+    operation_id: Uuid,
+    kind: LauncherEventKind,
+    message: impl Into<String>,
+    progress_percent: Option<u8>,
+) -> LauncherEvent {
+    LauncherEvent {
+        id: Uuid::new_v4(),
+        operation_id,
+        operation: None,
+        subject_id: None,
+        kind,
+        message: message.into(),
+        progress_percent,
+        occurred_at_unix_seconds: current_unix_seconds(),
+    }
+}
+
+fn default_settings() -> LauncherSettings {
+    LauncherSettings {
+        max_memory_mb: 6144,
+        min_memory_mb: 2048,
+        offline_username: "Player".to_owned(),
+        telemetry_enabled: false,
+        java_runtime_override_path: None,
+    }
+}
+
+fn demo_packs() -> Vec<PackSummary> {
+    bundled_pack_summaries()
+}
+
+fn pack_summaries_from_catalog(catalog: Vec<ModpackCatalogEntry>) -> Vec<PackSummary> {
+    catalog
+        .into_iter()
+        .map(pack_summary_from_catalog_entry)
+        .collect()
+}
+
+async fn pack_summaries_from_catalog_with_packwiz_versions(
+    catalog: Vec<ModpackCatalogEntry>,
+) -> Vec<PackSummary> {
+    let mut summaries = Vec::with_capacity(catalog.len());
+    for entry in catalog {
+        let mut summary = pack_summary_from_catalog_entry(entry.clone());
+        if let Ok(info) = fetch_packwiz_pack_info(&entry.pack_url).await {
+            if !info.pack_version.trim().is_empty() {
+                summary.version = info.pack_version;
+            }
+        }
+        summaries.push(summary);
+    }
+    summaries
+}
+
+fn pack_summaries_with_profile_status(
+    packs: Vec<PackSummary>,
+    profiles: &[ProfileSummary],
+) -> Vec<PackSummary> {
+    packs
+        .into_iter()
+        .map(|mut pack| {
+            pack.status = profiles
+                .iter()
+                .find(|profile| profile.id == pack.id)
+                .map(|profile| {
+                    if profile.installed_pack_version.as_deref() == Some(pack.version.as_str()) {
+                        PackStatus::Installed
+                    } else if profile.installed_pack_version.is_some() {
+                        PackStatus::UpdateAvailable
+                    } else {
+                        PackStatus::Installed
+                    }
+                })
+                .unwrap_or(PackStatus::NotInstalled);
+            pack
+        })
+        .collect()
+}
+
+fn trimmed_optional(value: Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn modpack_catalog_entry(pack_id: &str) -> Result<ModpackCatalogEntry> {
+    bundled_modpack_catalog()
+        .into_iter()
+        .find(|pack| pack.id == pack_id)
+        .ok_or_else(|| anyhow!("pack '{pack_id}' was not found"))
+}
+
+fn pack_profile_from_catalog_entry_and_pack_info(
+    entry: &ModpackCatalogEntry,
+    info: &PackwizPackInfo,
+) -> Result<ProfileSummary> {
+    ensure!(!entry.id.trim().is_empty(), "catalog pack id is required");
+    ensure!(
+        looks_like_minecraft_version(&info.minecraft_version),
+        "pack.toml declares unsupported Minecraft version '{}'",
+        info.minecraft_version
+    );
+
+    let name = entry
+        .display_name
+        .as_deref()
+        .or_else(|| info.name.as_deref())
+        .unwrap_or(entry.instance_name.as_str())
+        .trim()
+        .to_owned();
+    let memory_mb = entry
+        .recommended_ram
+        .unwrap_or(default_settings().max_memory_mb);
+
+    let profile = ProfileSummary {
+        id: entry.id.trim().to_owned(),
+        name,
+        loader: info.loader.clone(),
+        game_version: info.minecraft_version.clone(),
+        installed_pack_version: Some(info.pack_version.clone()),
+        last_played: None,
+        memory_mb,
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    };
+    validate_profiles(std::slice::from_ref(&profile))?;
+    Ok(profile)
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct PackwizPackToml {
+    name: Option<String>,
+    author: Option<String>,
+    version: String,
+    #[serde(rename = "pack-format")]
+    pack_format: Option<String>,
+    index: Option<PackwizIndexToml>,
+    versions: PackwizVersionsToml,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct PackwizIndexToml {
+    file: String,
+    #[serde(rename = "hash-format")]
+    hash_format: String,
+    hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizIndexFileToml {
+    hash_format: String,
+    #[serde(default)]
+    files: Vec<PackwizIndexFileEntryToml>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizIndexFileEntryToml {
+    file: String,
+    hash: String,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    metafile: bool,
+    #[serde(default)]
+    preserve: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizMetafileToml {
+    #[serde(default)]
+    name: Option<String>,
+    filename: String,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    download: Option<PackwizMetafileDownloadToml>,
+    #[serde(default)]
+    update: Option<PackwizMetafileUpdateToml>,
+    #[serde(default)]
+    option: Option<PackwizMetafileOptionToml>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizMetafileDownloadToml {
+    #[serde(default)]
+    url: Option<String>,
+    hash_format: String,
+    hash: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizMetafileUpdateToml {
+    #[serde(default)]
+    curseforge: Option<PackwizMetafileCurseForgeUpdateToml>,
+    #[serde(default)]
+    modrinth: Option<PackwizMetafileModrinthUpdateToml>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizMetafileCurseForgeUpdateToml {
+    project_id: u64,
+    file_id: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizMetafileModrinthUpdateToml {
+    #[serde(default)]
+    mod_id: Option<String>,
+    version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ModrinthVersionResponse {
+    id: String,
+    #[serde(default)]
+    files: Vec<ModrinthVersionFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ModrinthVersionFile {
+    url: String,
+    filename: String,
+    #[serde(default)]
+    primary: bool,
+    #[serde(default)]
+    size: Option<u64>,
+    hashes: ModrinthVersionFileHashes,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct ModrinthVersionFileHashes {
+    #[serde(default)]
+    sha1: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+struct PackwizMetafileOptionToml {
+    #[serde(default)]
+    optional: bool,
+    #[serde(default)]
+    default: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct PackwizVersionsToml {
+    minecraft: String,
+    forge: Option<String>,
+    fabric: Option<String>,
+    quilt: Option<String>,
+    neoforge: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackwizPackInfo {
+    pub name: Option<String>,
+    pub author: Option<String>,
+    pub pack_version: String,
+    pub pack_format: Option<String>,
+    pub minecraft_version: String,
+    pub loader: ModLoader,
+    pub loader_version: Option<String>,
+    pub index_file: Option<String>,
+    pub index_hash_format: Option<String>,
+    pub index_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PackwizIndexInfo {
+    hash_format: String,
+    files: Vec<PackwizIndexEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PackwizIndexEntry {
+    file: String,
+    hash: String,
+    alias: Option<String>,
+    metafile: bool,
+    preserve: bool,
+}
+
+fn parse_packwiz_pack_toml(toml_text: &str) -> Result<PackwizPackInfo> {
+    let config = toml::from_str::<PackwizPackToml>(toml_text)?;
+    ensure!(
+        !config.version.trim().is_empty(),
+        "pack.toml version is required"
+    );
+    ensure!(
+        !config.versions.minecraft.trim().is_empty(),
+        "pack.toml versions.minecraft is required"
+    );
+
+    let loader_versions = [
+        (ModLoader::Forge, config.versions.forge),
+        (ModLoader::Fabric, config.versions.fabric),
+        (ModLoader::Quilt, config.versions.quilt),
+        (ModLoader::Neoforge, config.versions.neoforge),
+    ];
+    let selected_loaders = loader_versions
+        .into_iter()
+        .filter_map(|(loader, version)| {
+            version
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| (loader, value.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        selected_loaders.len() <= 1,
+        "pack.toml declares multiple supported modloaders"
+    );
+    let (loader, loader_version) = selected_loaders
+        .into_iter()
+        .next()
+        .map(|(loader, version)| (loader, Some(version)))
+        .unwrap_or((ModLoader::Vanilla, None));
+
+    let index = config.index;
+    if let Some(index) = index.as_ref() {
+        let index_file = index.file.trim();
+        ensure!(!index_file.is_empty(), "pack.toml index file is required");
+        ensure_safe_relative_path(index_file, "pack.toml index file")?;
+        packwiz_download_hashes(&index.hash_format, &index.hash)?;
+    }
+    Ok(PackwizPackInfo {
+        name: trimmed_optional(config.name),
+        author: trimmed_optional(config.author),
+        pack_version: config.version.trim().to_owned(),
+        pack_format: trimmed_optional(config.pack_format),
+        minecraft_version: config.versions.minecraft.trim().to_owned(),
+        loader,
+        loader_version,
+        index_file: index
+            .as_ref()
+            .and_then(|value| trimmed_optional(Some(value.file.clone()))),
+        index_hash_format: index
+            .as_ref()
+            .and_then(|value| trimmed_optional(Some(value.hash_format.clone()))),
+        index_hash: index.and_then(|value| trimmed_optional(Some(value.hash))),
+    })
+}
+
+pub async fn fetch_packwiz_pack_info(pack_url: &str) -> Result<PackwizPackInfo> {
+    validate_http_download_url(pack_url)?;
+    let response = metadata_http_client()
+        .get(pack_url.trim())
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(status == 200, "pack.toml request failed with HTTP {status}");
+    parse_packwiz_pack_toml(&body)
+}
+
+fn parse_packwiz_index_toml(toml_text: &str) -> Result<PackwizIndexInfo> {
+    let index = toml::from_str::<PackwizIndexFileToml>(toml_text)?;
+    let hash_format = index.hash_format.trim().to_ascii_lowercase();
+    ensure!(
+        matches!(
+            hash_format.as_str(),
+            "md5" | "murmur2" | "sha1" | "sha256" | "sha512"
+        ),
+        "unsupported packwiz index hash-format '{hash_format}'"
+    );
+
+    let mut files = Vec::with_capacity(index.files.len());
+    for raw in index.files {
+        let file = raw.file.trim().to_owned();
+        let hash = raw.hash.trim().to_ascii_lowercase();
+        ensure_safe_relative_path(&file, "packwiz index file path")?;
+        packwiz_download_hashes(&hash_format, &hash)?;
+        let alias = trimmed_optional(raw.alias);
+        if let Some(alias) = alias.as_deref() {
+            ensure_safe_relative_path(alias, "packwiz index file alias")?;
+        }
+        files.push(PackwizIndexEntry {
+            file,
+            hash,
+            alias,
+            metafile: raw.metafile,
+            preserve: raw.preserve,
+        });
+    }
+
+    Ok(PackwizIndexInfo { hash_format, files })
+}
+
+fn packwiz_download_hashes(
+    hash_format: &str,
+    hash: &str,
+) -> Result<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    let hash_format = hash_format.trim().to_ascii_lowercase();
+    let hash = hash.trim().to_ascii_lowercase();
+    if hash_format == "murmur2" {
+        return Ok((None, None, None, None, Some(validate_murmur2_hash(&hash)?)));
+    }
+    let expected_hash_len = match hash_format.as_str() {
+        "md5" => 32,
+        "sha1" => 40,
+        "sha256" => 64,
+        "sha512" => 128,
+        _ => return Err(anyhow!("unsupported packwiz hash-format '{hash_format}'")),
+    };
+    ensure!(
+        hash.len() == expected_hash_len
+            && hash.chars().all(|character| character.is_ascii_hexdigit()),
+        "packwiz {hash_format} hash must be a {expected_hash_len}-character hex value"
+    );
+    Ok(match hash_format.as_str() {
+        "md5" => (None, None, None, Some(hash), None),
+        "sha1" => (Some(hash), None, None, None, None),
+        "sha256" => (None, Some(hash), None, None, None),
+        "sha512" => (None, None, Some(hash), None, None),
+        _ => unreachable!("hash-format was validated above"),
+    })
+}
+
+fn validate_murmur2_hash(hash: &str) -> Result<String> {
+    let hash = hash.trim();
+    ensure!(!hash.is_empty(), "packwiz murmur2 hash is required");
+    hash.parse::<u32>().map_err(|error| {
+        anyhow!("packwiz murmur2 hash must be an unsigned 32-bit decimal value: {error}")
+    })?;
+    Ok(hash.to_owned())
+}
+
+fn parse_packwiz_metafile_toml(toml_text: &str) -> Result<PackwizMetafileToml> {
+    let mut metafile = toml::from_str::<PackwizMetafileToml>(toml_text)?;
+    metafile.name = trimmed_optional(metafile.name);
+    metafile.filename = metafile.filename.trim().to_owned();
+    ensure!(
+        !metafile.filename.is_empty(),
+        "packwiz metafile filename is required"
+    );
+    ensure_safe_relative_path(&metafile.filename, "packwiz metafile filename")?;
+
+    metafile.side = trimmed_optional(metafile.side).map(|side| side.to_ascii_lowercase());
+    if let Some(side) = metafile.side.as_deref() {
+        ensure!(
+            matches!(side, "client" | "server" | "both"),
+            "unsupported packwiz metafile side '{side}'"
+        );
+    }
+
+    if let Some(download) = metafile.download.as_mut() {
+        download.url = trimmed_optional(download.url.take());
+        if let Some(url) = download.url.as_deref() {
+            validate_http_download_url(url)?;
+        }
+        download.mode =
+            trimmed_optional(download.mode.take()).map(|mode| mode.to_ascii_lowercase());
+        if let Some(mode) = download.mode.as_deref() {
+            ensure!(
+                matches!(mode, "metadata:curseforge" | "metadata:modrinth"),
+                "unsupported packwiz metafile download mode '{mode}'"
+            );
+        }
+        download.hash_format = download.hash_format.trim().to_ascii_lowercase();
+        ensure!(
+            matches!(
+                download.hash_format.as_str(),
+                "md5" | "murmur2" | "sha1" | "sha256" | "sha512"
+            ),
+            "unsupported packwiz metafile hash-format '{}'",
+            download.hash_format
+        );
+        download.hash = download.hash.trim().to_ascii_lowercase();
+        ensure!(
+            !download.hash.is_empty(),
+            "packwiz metafile download hash is required"
+        );
+        if download.hash_format == "murmur2" {
+            download.hash = validate_murmur2_hash(&download.hash)?;
+        } else {
+            let expected_hash_len = match download.hash_format.as_str() {
+                "md5" => 32,
+                "sha1" => 40,
+                "sha256" => 64,
+                "sha512" => 128,
+                _ => unreachable!("hash-format was validated above"),
+            };
+            ensure!(
+                download.hash.len() == expected_hash_len
+                    && download
+                        .hash
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit()),
+                "packwiz metafile download hash must be a {}-character hex {} value",
+                expected_hash_len,
+                download.hash_format
+            );
+        }
+    }
+    if let Some(curseforge) = metafile
+        .update
+        .as_ref()
+        .and_then(|update| update.curseforge.as_ref())
+    {
+        ensure!(
+            curseforge.project_id > 0,
+            "CurseForge project id is required"
+        );
+        ensure!(curseforge.file_id > 0, "CurseForge file id is required");
+        ensure!(
+            metafile.download.is_some(),
+            "CurseForge packwiz metafile requires [download] hash metadata"
+        );
+    }
+    if let Some(modrinth) = metafile
+        .update
+        .as_mut()
+        .and_then(|update| update.modrinth.as_mut())
+    {
+        modrinth.mod_id = trimmed_optional(modrinth.mod_id.take());
+        if let Some(mod_id) = modrinth.mod_id.as_deref() {
+            ensure_modrinth_identifier(mod_id, "Modrinth project id")?;
+        }
+        modrinth.version = modrinth.version.trim().to_owned();
+        ensure_modrinth_identifier(&modrinth.version, "Modrinth version id")?;
+    }
+    ensure!(
+        metafile.download.is_some()
+            || metafile
+                .update
+                .as_ref()
+                .and_then(|update| update.curseforge.as_ref())
+                .is_some()
+            || metafile
+                .update
+                .as_ref()
+                .and_then(|update| update.modrinth.as_ref())
+                .is_some(),
+        "packwiz metafile requires either [download], [update.curseforge], or [update.modrinth]"
+    );
+    Ok(metafile)
+}
+
+fn ensure_modrinth_identifier(value: &str, label: &str) -> Result<()> {
+    ensure!(!value.trim().is_empty(), "{label} is required");
+    ensure!(
+        value
+            .trim()
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')),
+        "{label} contains unsupported characters"
+    );
+    Ok(())
+}
+
+fn resolve_packwiz_relative_url(pack_url: &str, relative_path: &str) -> Result<String> {
+    validate_http_download_url(pack_url)?;
+    ensure_safe_relative_path(relative_path, "packwiz relative URL path")?;
+    let base = reqwest::Url::parse(pack_url.trim())?;
+    let resolved = base.join(relative_path)?;
+    Ok(resolved.to_string())
+}
+
+async fn fetch_packwiz_index(
+    pack_url: &str,
+    pack_info: &PackwizPackInfo,
+) -> Result<PackwizIndexInfo> {
+    let index_file = pack_info
+        .index_file
+        .as_deref()
+        .ok_or_else(|| anyhow!("pack.toml does not declare an index file"))?;
+    let index_url = resolve_packwiz_relative_url(pack_url, index_file)?;
+    let response = metadata_http_client()
+        .get(&index_url)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.bytes().await?;
+    ensure!(
+        status == 200,
+        "packwiz index request failed with HTTP {status}"
+    );
+    if let (Some(hash_format), Some(hash)) = (
+        pack_info.index_hash_format.as_deref(),
+        pack_info.index_hash.as_deref(),
+    ) {
+        let (sha1, sha256, sha512, md5, murmur2) = packwiz_download_hashes(hash_format, hash)?;
+        let index_item = DownloadItem {
+            id: "packwiz-index".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: index_url,
+            sha1,
+            sha256,
+            sha512,
+            md5,
+            murmur2,
+            size: None,
+            destination: "index.toml".to_owned(),
+        };
+        validate_download_bytes(&index_item, &body)?;
+    }
+    let body = String::from_utf8(body.to_vec())
+        .map_err(|error| anyhow!("packwiz index response is not valid UTF-8: {error}"))?;
+    parse_packwiz_index_toml(&body)
+}
+
+pub async fn fetch_remote_modpack_catalog() -> Result<Vec<ModpackCatalogEntry>> {
+    let response = metadata_http_client()
+        .get(REMOTE_MODPACK_CATALOG_URL)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "modpack catalog request failed with HTTP {status}"
+    );
+    Ok(parse_modpack_catalog_json(&body)?)
+}
+
+pub async fn fetch_modpack_catalog_with_fallback() -> Vec<ModpackCatalogEntry> {
+    match fetch_remote_modpack_catalog().await {
+        Ok(catalog) if !catalog.is_empty() => catalog,
+        _ => bundled_modpack_catalog(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CuratedPackFile {
+    id: String,
+    url: String,
+    sha1: Option<String>,
+    sha256: Option<String>,
+    sha512: Option<String>,
+    md5: Option<String>,
+    murmur2: Option<String>,
+    size: Option<u64>,
+    target_path: String,
+    preserve: bool,
+}
+
+fn curated_pack_files_for_entry(entry: &ModpackCatalogEntry) -> Result<Vec<CuratedPackFile>> {
+    Ok(vec![CuratedPackFile {
+        id: format!("{}-packwiz-manifest", entry.id),
+        url: entry.pack_url.clone(),
+        sha1: None,
+        sha256: None,
+        sha512: None,
+        md5: None,
+        murmur2: None,
+        size: None,
+        target_path: "pack.toml".to_owned(),
+        preserve: false,
+    }])
+}
+
+fn pack_file_download_item(profile_root: &Path, file: CuratedPackFile) -> Result<DownloadItem> {
+    ensure!(!file.id.trim().is_empty(), "pack file id is required");
+    validate_http_download_url(&file.url)?;
+    ensure_safe_relative_path(&file.target_path, "pack file target path")?;
+    let destination = profile_root.join(&file.target_path);
+    ensure!(
+        path_starts_with(&destination, profile_root),
+        "pack file destination is outside the profile directory"
+    );
+
+    Ok(DownloadItem {
+        id: file.id,
+        kind: if file.preserve {
+            DownloadKind::PreservedPackFile
+        } else {
+            DownloadKind::PackFile
+        },
+        url: file.url,
+        sha1: file.sha1,
+        sha256: file.sha256,
+        sha512: file.sha512,
+        md5: file.md5,
+        murmur2: file.murmur2,
+        size: file.size,
+        destination: display_path(&destination),
+    })
+}
+
+fn build_modloader_download_plan_for_profile(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    build_modloader_download_plan_for_profile_and_version(profile, None, directories)
+}
+
+fn build_modloader_download_plan_for_profile_and_version(
+    profile: &ProfileSummary,
+    loader_version_override: Option<&str>,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    ensure!(
+        profile.loader != ModLoader::Vanilla,
+        "vanilla profiles do not require a modloader download plan"
+    );
+    ensure!(
+        looks_like_minecraft_version(&profile.game_version),
+        "profile '{}' has an unsupported Minecraft version '{}'",
+        profile.id,
+        profile.game_version
+    );
+
+    let item = match profile.loader {
+        ModLoader::Fabric => modloader_metadata_item(
+            profile,
+            "fabric-loader",
+            "https://meta.fabricmc.net/v2/versions/loader",
+            directories,
+        )?,
+        ModLoader::Quilt => modloader_metadata_item(
+            profile,
+            "quilt-loader",
+            "https://meta.quiltmc.org/v3/versions/loader",
+            directories,
+        )?,
+        ModLoader::Forge => {
+            let loader_version = modloader_version_or_seed(loader_version_override, || {
+                forge_installer_version_for_minecraft(&profile.game_version)
+            })?;
+            modloader_installer_item(
+                profile,
+                "forge",
+                &loader_version,
+                "https://maven.minecraftforge.net/net/minecraftforge/forge",
+                ModloaderInstallerCoordinate::MinecraftAndLoaderVersion,
+                directories,
+            )?
+        }
+        ModLoader::Neoforge => {
+            let loader_version = modloader_version_or_seed(loader_version_override, || {
+                neoforge_installer_version_for_minecraft(&profile.game_version)
+            })?;
+            modloader_installer_item(
+                profile,
+                "neoforge",
+                &loader_version,
+                "https://maven.neoforged.net/releases/net/neoforged/neoforge",
+                ModloaderInstallerCoordinate::LoaderVersionOnly,
+                directories,
+            )?
+        }
+        ModLoader::Vanilla => unreachable!("vanilla rejected above"),
+    };
+
+    Ok(DownloadPlan {
+        version_id: format!("{}-{}", profile.id, modloader_slug(&profile.loader)),
+        items: vec![item],
+    })
+}
+
+fn modloader_version_or_seed(
+    override_version: Option<&str>,
+    seed_version: impl FnOnce() -> Result<&'static str>,
+) -> Result<String> {
+    if let Some(version) = override_version
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    {
+        ensure_safe_path_segment(version, "modloader version")?;
+        return Ok(version.to_owned());
+    }
+    seed_version().map(str::to_owned)
+}
+
+fn modloader_metadata_item(
+    profile: &ProfileSummary,
+    loader_id: &str,
+    base_url: &str,
+    directories: &LauncherDirectories,
+) -> Result<DownloadItem> {
+    validate_http_download_url(base_url)?;
+    ensure_safe_path_segment(loader_id, "modloader id")?;
+    ensure_safe_path_segment(&profile.game_version, "modloader Minecraft version")?;
+    let url = format!("{base_url}/{}", profile.game_version);
+    validate_http_download_url(&url)?;
+
+    Ok(DownloadItem {
+        id: format!("{}-metadata-{}", loader_id, profile.game_version),
+        kind: DownloadKind::ModLoaderMetadata,
+        url,
+        sha1: None,
+        sha256: None,
+        sha512: None,
+        md5: None,
+        murmur2: None,
+        size: None,
+        destination: format!(
+            "{}/modloaders/{}/{}/metadata.json",
+            directories.cache_dir, loader_id, profile.game_version
+        ),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModloaderInstallerCoordinate {
+    MinecraftAndLoaderVersion,
+    LoaderVersionOnly,
+}
+
+fn modloader_installer_item(
+    profile: &ProfileSummary,
+    loader_id: &str,
+    loader_version: &str,
+    base_url: &str,
+    coordinate: ModloaderInstallerCoordinate,
+    directories: &LauncherDirectories,
+) -> Result<DownloadItem> {
+    validate_http_download_url(base_url)?;
+    ensure_safe_path_segment(loader_id, "modloader id")?;
+    ensure_safe_path_segment(loader_version, "modloader version")?;
+    ensure_safe_path_segment(&profile.game_version, "modloader Minecraft version")?;
+
+    let artifact_version = match coordinate {
+        ModloaderInstallerCoordinate::MinecraftAndLoaderVersion => {
+            format!("{}-{loader_version}", profile.game_version)
+        }
+        ModloaderInstallerCoordinate::LoaderVersionOnly => loader_version.to_owned(),
+    };
+    let url = format!("{base_url}/{artifact_version}/{loader_id}-{artifact_version}-installer.jar");
+    validate_http_download_url(&url)?;
+
+    Ok(DownloadItem {
+        id: format!("{loader_id}-installer-{artifact_version}"),
+        kind: DownloadKind::ModLoaderInstaller,
+        url,
+        sha1: None,
+        sha256: None,
+        sha512: None,
+        md5: None,
+        murmur2: None,
+        size: None,
+        destination: format!(
+            "{}/modloaders/{loader_id}/{artifact_version}/{loader_id}-installer.jar",
+            directories.cache_dir
+        ),
+    })
+}
+
+fn forge_installer_version_for_minecraft(minecraft_version: &str) -> Result<&'static str> {
+    match minecraft_version {
+        "1.20.1" => Ok("47.4.10"),
+        _ => Err(anyhow!(
+            "Forge installer version for Minecraft '{minecraft_version}' is not in the seed catalog"
+        )),
+    }
+}
+
+fn neoforge_installer_version_for_minecraft(minecraft_version: &str) -> Result<&'static str> {
+    match minecraft_version {
+        "1.21.1" => Ok("21.1.1"),
+        _ => Err(anyhow!(
+            "NeoForge installer version for Minecraft '{minecraft_version}' is not in the seed catalog"
+        )),
+    }
+}
+
+fn modloader_slug(loader: &ModLoader) -> &'static str {
+    match loader {
+        ModLoader::Vanilla => "vanilla",
+        ModLoader::Fabric => "fabric",
+        ModLoader::Quilt => "quilt",
+        ModLoader::Forge => "forge",
+        ModLoader::Neoforge => "neoforge",
+    }
+}
+
+fn demo_profiles() -> Vec<ProfileSummary> {
+    vec![ProfileSummary {
+        id: "latest-release".to_owned(),
+        name: "Latest Release".to_owned(),
+        loader: ModLoader::Vanilla,
+        game_version: "1.21.8".to_owned(),
+        installed_pack_version: None,
+        last_played: None,
+        memory_mb: 4096,
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::PackStatus;
+    use std::{
+        ffi::OsString,
+        io::Write,
+        sync::{Mutex as TestMutex, MutexGuard as TestMutexGuard},
+        thread,
+        time::Duration,
+    };
+
+    static ENV_LOCK: TestMutex<()> = TestMutex::new(());
+    const LAUNCHER_DIR_ENV_KEYS: [&str; 5] = [
+        "THEBOYS_LAUNCHER_ROOT_DIR",
+        "THEBOYS_LAUNCHER_DATA_DIR",
+        "THEBOYS_LAUNCHER_CONFIG_DIR",
+        "THEBOYS_LAUNCHER_CACHE_DIR",
+        "THEBOYS_LAUNCHER_LOG_DIR",
+    ];
+
+    struct LauncherDirEnvGuard {
+        _lock: TestMutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl LauncherDirEnvGuard {
+        fn isolated() -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock should be available");
+            let previous = LAUNCHER_DIR_ENV_KEYS
+                .iter()
+                .map(|key| (*key, env::var_os(key)))
+                .collect::<Vec<_>>();
+            for key in LAUNCHER_DIR_ENV_KEYS {
+                env::remove_var(key);
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for LauncherDirEnvGuard {
+        fn drop(&mut self) {
+            for key in LAUNCHER_DIR_ENV_KEYS {
+                env::remove_var(key);
+            }
+            for (key, value) in &self.previous {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                }
+            }
+        }
+    }
+
+    struct LiveSmokeRoot {
+        _env: LauncherDirEnvGuard,
+        _temp: Option<tempfile::TempDir>,
+    }
+
+    impl LiveSmokeRoot {
+        fn new() -> Self {
+            let requested_root = env::var_os("THEBOYS_LAUNCHER_LIVE_TEST_ROOT").map(PathBuf::from);
+            let env = LauncherDirEnvGuard::isolated();
+            let (root, temp) = if let Some(root) = requested_root {
+                fs::create_dir_all(&root).expect("live smoke root should create");
+                (root, None)
+            } else {
+                let temp = tempfile::tempdir().expect("tempdir should be available");
+                (temp.path().to_path_buf(), Some(temp))
+            };
+            env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", &root);
+            Self {
+                _env: env,
+                _temp: temp,
+            }
+        }
+    }
+
+    struct JavaRuntimeDiscoveryGuard {
+        previous: Option<Vec<JavaRuntimeSummary>>,
+    }
+
+    impl JavaRuntimeDiscoveryGuard {
+        fn java_8() -> Self {
+            Self::with_runtime(8, "1.8.0_402")
+        }
+
+        fn java_21() -> Self {
+            Self::with_runtime(21, "21.0.4")
+        }
+
+        fn with_runtime(major_version: u32, version: &str) -> Self {
+            let mut override_slot = JAVA_RUNTIME_DISCOVERY_OVERRIDE
+                .lock()
+                .expect("Java runtime override lock should be available");
+            let previous = override_slot.clone();
+            *override_slot = Some(vec![JavaRuntimeSummary {
+                id: format!("java-{major_version}-test"),
+                path: format!("C:/TheBoysLauncher/runtimes/java-{major_version}/bin/java.exe"),
+                version: version.to_owned(),
+                major_version,
+                source: JavaRuntimeSource::Bundled,
+            }]);
+            Self { previous }
+        }
+    }
+
+    impl Drop for JavaRuntimeDiscoveryGuard {
+        fn drop(&mut self) {
+            let mut override_slot = JAVA_RUNTIME_DISCOVERY_OVERRIDE
+                .lock()
+                .expect("Java runtime override lock should be available");
+            *override_slot = self.previous.clone();
+        }
+    }
+
+    fn write_zip_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("zip parent should create");
+        }
+        let file = fs::File::create(path).expect("zip fixture should create");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, contents) in entries {
+            zip.start_file(*name, options)
+                .expect("zip entry should start");
+            zip.write_all(contents).expect("zip entry should write");
+        }
+        zip.finish().expect("zip fixture should finish");
+    }
+
+    fn write_jar_with_main_class(path: &Path, main_class: &str) {
+        let manifest = format!("Manifest-Version: 1.0\r\nMain-Class: {main_class}\r\n\r\n");
+        write_zip_archive(path, &[("META-INF/MANIFEST.MF", manifest.as_bytes())]);
+    }
+
+    fn write_tar_gz_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("tar.gz parent should create");
+        }
+        let file = fs::File::create(path).expect("tar.gz fixture should create");
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (name, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, *name, *contents)
+                .expect("tar.gz entry should append");
+        }
+        archive.finish().expect("tar.gz fixture should finish");
+    }
+
+    fn write_raw_tar_gz_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("raw tar.gz parent should create");
+        }
+        let file = fs::File::create(path).expect("raw tar.gz fixture should create");
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        for (name, contents) in entries {
+            let mut header = [0u8; 512];
+            let name_bytes = name.as_bytes();
+            header[..name_bytes.len().min(100)]
+                .copy_from_slice(&name_bytes[..name_bytes.len().min(100)]);
+            write_tar_octal(&mut header[100..108], 0o644);
+            write_tar_octal(&mut header[108..116], 0);
+            write_tar_octal(&mut header[116..124], 0);
+            write_tar_octal(&mut header[124..136], contents.len() as u64);
+            write_tar_octal(&mut header[136..148], 0);
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum = header.iter().map(|byte| *byte as u32).sum::<u32>();
+            write_tar_checksum(&mut header[148..156], checksum);
+            encoder
+                .write_all(&header)
+                .expect("raw tar header should write");
+            encoder
+                .write_all(contents)
+                .expect("raw tar contents should write");
+            let padding = (512 - (contents.len() % 512)) % 512;
+            if padding > 0 {
+                encoder
+                    .write_all(&vec![0u8; padding])
+                    .expect("raw tar padding should write");
+            }
+        }
+        encoder
+            .write_all(&[0u8; 1024])
+            .expect("raw tar terminator should write");
+        encoder.finish().expect("raw tar.gz should finish");
+    }
+
+    fn write_tar_octal(field: &mut [u8], value: u64) {
+        field.fill(0);
+        let value = format!("{value:0width$o}", width = field.len() - 1);
+        field[..value.len()].copy_from_slice(value.as_bytes());
+    }
+
+    fn write_tar_checksum(field: &mut [u8], value: u32) {
+        field.fill(b' ');
+        let value = format!("{value:06o}\0 ");
+        field[..value.len()].copy_from_slice(value.as_bytes());
+    }
+
+    fn exit_command_spec(root: &Path, code: i32) -> ProcessCommandSpec {
+        #[cfg(windows)]
+        let (executable, args) = (
+            "cmd".to_owned(),
+            vec!["/C".to_owned(), format!("exit {code}")],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            "sh".to_owned(),
+            vec!["-c".to_owned(), format!("exit {code}")],
+        );
+
+        ProcessCommandSpec {
+            executable,
+            args,
+            working_dir: display_path(root),
+            env: Vec::new(),
+        }
+    }
+
+    fn sleep_command_spec(root: &Path) -> ProcessCommandSpec {
+        #[cfg(windows)]
+        let (executable, args) = (
+            "cmd".to_owned(),
+            vec!["/C".to_owned(), "ping -n 6 127.0.0.1 >NUL".to_owned()],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = ("sh".to_owned(), vec!["-c".to_owned(), "sleep 5".to_owned()]);
+
+        ProcessCommandSpec {
+            executable,
+            args,
+            working_dir: display_path(root),
+            env: Vec::new(),
+        }
+    }
+
+    fn output_command_spec(root: &Path) -> ProcessCommandSpec {
+        #[cfg(windows)]
+        let (executable, args) = (
+            "cmd".to_owned(),
+            vec![
+                "/C".to_owned(),
+                "echo hello stdout && echo hello stderr 1>&2".to_owned(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            "sh".to_owned(),
+            vec![
+                "-c".to_owned(),
+                "echo hello stdout && echo hello stderr >&2".to_owned(),
+            ],
+        );
+
+        ProcessCommandSpec {
+            executable,
+            args,
+            working_dir: display_path(root),
+            env: Vec::new(),
+        }
+    }
+
+    fn live_output_command_spec(root: &Path) -> ProcessCommandSpec {
+        #[cfg(windows)]
+        let (executable, args) = (
+            "cmd".to_owned(),
+            vec![
+                "/C".to_owned(),
+                "echo live stdout && ping -n 4 127.0.0.1 >NUL".to_owned(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            "sh".to_owned(),
+            vec!["-c".to_owned(), "echo live stdout; sleep 3".to_owned()],
+        );
+
+        ProcessCommandSpec {
+            executable,
+            args,
+            working_dir: display_path(root),
+            env: Vec::new(),
+        }
+    }
+
+    fn noisy_output_command_spec(root: &Path, lines: usize) -> ProcessCommandSpec {
+        #[cfg(windows)]
+        let (executable, args) = (
+            "cmd".to_owned(),
+            vec![
+                "/C".to_owned(),
+                format!("for /L %i in (1,1,{lines}) do @echo line-%i"),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (executable, args) = (
+            "sh".to_owned(),
+            vec![
+                "-c".to_owned(),
+                format!("for i in $(seq 1 {lines}); do echo line-$i; done"),
+            ],
+        );
+
+        ProcessCommandSpec {
+            executable,
+            args,
+            working_dir: display_path(root),
+            env: Vec::new(),
+        }
+    }
+
+    fn wait_for_managed_process<F>(
+        registry: &ProcessRegistry,
+        id: Uuid,
+        attempts: usize,
+        delay: Duration,
+        mut predicate: F,
+    ) -> ManagedProcessSummary
+    where
+        F: FnMut(&ManagedProcessSummary) -> bool,
+    {
+        let mut latest = None;
+        for _ in 0..attempts {
+            let summary = registry
+                .list()
+                .expect("registry should list")
+                .into_iter()
+                .find(|process| process.id == id)
+                .expect("process should remain tracked");
+            if predicate(&summary) {
+                return summary;
+            }
+            latest = Some(summary);
+            thread::sleep(delay);
+        }
+        latest.expect("process should be observed")
+    }
+
+    #[test]
+    fn snapshot_contains_local_launcher_data_without_demo_friends() {
+        let snapshot = bootstrap_snapshot().expect("snapshot should build");
+
+        assert_eq!(snapshot.settings.max_memory_mb, 6144);
+        assert!(snapshot.directories.data_dir.contains("TheBoysLauncher"));
+        assert!(snapshot.friends.is_empty());
+        assert!(snapshot.packs.iter().any(|pack| pack.id == "winterpack"));
+        assert!(snapshot
+            .profiles
+            .iter()
+            .any(|profile| profile.loader == ModLoader::Fabric));
+    }
+
+    #[test]
+    fn launcher_root_env_override_is_used_for_all_local_directories() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+
+        let directories = prepare_launcher_directories().expect("directories should prepare");
+
+        assert_eq!(
+            directories.data_dir,
+            display_path(&root.path().join("data"))
+        );
+        assert_eq!(
+            directories.config_dir,
+            display_path(&root.path().join("config"))
+        );
+        assert_eq!(
+            directories.cache_dir,
+            display_path(&root.path().join("cache"))
+        );
+        assert_eq!(directories.log_dir, display_path(&root.path().join("logs")));
+        assert!(root.path().join("data").is_dir());
+        assert!(root.path().join("config").is_dir());
+        assert!(root.path().join("cache").is_dir());
+        assert!(root.path().join("logs").is_dir());
+
+        save_settings(&default_settings()).expect("settings should save under override");
+        assert!(root.path().join("config/settings.json").is_file());
+
+        load_profiles().expect("profiles should load under override");
+        assert!(root.path().join("config/profiles.json").is_file());
+
+        clear_minecraft_session().expect("session clear should use override");
+        assert_eq!(
+            minecraft_session_path().expect("session path should resolve"),
+            root.path().join("config/minecraft-session.json")
+        );
+    }
+
+    #[test]
+    fn launcher_specific_directory_env_overrides_win_over_root() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let explicit = tempfile::tempdir().expect("tempdir should be available");
+        let data = explicit.path().join("portable-data");
+        let config = explicit.path().join("portable-config");
+        let cache = explicit.path().join("portable-cache");
+        let logs = explicit.path().join("portable-logs");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        env::set_var("THEBOYS_LAUNCHER_DATA_DIR", &data);
+        env::set_var("THEBOYS_LAUNCHER_CONFIG_DIR", &config);
+        env::set_var("THEBOYS_LAUNCHER_CACHE_DIR", &cache);
+        env::set_var("THEBOYS_LAUNCHER_LOG_DIR", &logs);
+
+        let directories = prepare_launcher_directories().expect("directories should prepare");
+
+        assert_eq!(directories.data_dir, display_path(&data));
+        assert_eq!(directories.config_dir, display_path(&config));
+        assert_eq!(directories.cache_dir, display_path(&cache));
+        assert_eq!(directories.log_dir, display_path(&logs));
+        assert!(data.is_dir());
+        assert!(config.is_dir());
+        assert!(cache.is_dir());
+        assert!(logs.is_dir());
+    }
+
+    #[test]
+    fn snapshot_from_catalog_uses_supplied_pack_metadata() {
+        let catalog = vec![ModpackCatalogEntry {
+            id: "remote-winterpack".to_owned(),
+            display_name: Some("Remote WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/remote-winterpack/pack.toml".to_owned(),
+            instance_name: "Remote WinterPack".to_owned(),
+            description: Some("Fresh remote metadata".to_owned()),
+            author: Some("Dylan".to_owned()),
+            tags: vec!["featured".to_owned()],
+            last_updated: Some("10/30/2025".to_owned()),
+            category: Some("themed".to_owned()),
+            min_ram: Some(4096),
+            recommended_ram: Some(6144),
+            default_server: None,
+            changelog: Some("Version 2.0.2".to_owned()),
+            default: true,
+        }];
+        let snapshot = snapshot_from_parts(
+            default_settings(),
+            LauncherDirectories {
+                data_dir: "C:/data".to_owned(),
+                config_dir: "C:/config".to_owned(),
+                cache_dir: "C:/cache".to_owned(),
+                log_dir: "C:/logs".to_owned(),
+            },
+            None,
+            pack_summaries_from_catalog(catalog),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("snapshot should build");
+
+        assert_eq!(snapshot.packs.len(), 1);
+        assert_eq!(snapshot.packs[0].id, "remote-winterpack");
+        assert_eq!(snapshot.packs[0].name, "Remote WinterPack");
+        assert_eq!(snapshot.packs[0].version, "10/30/2025");
+        assert_eq!(snapshot.packs[0].status, PackStatus::NotInstalled);
+    }
+
+    #[test]
+    fn native_actions_validate_required_subjects() {
+        assert!(launch_profile("").is_err());
+        assert!(install_pack("winterpack").is_ok());
+        assert!(repair_profile("winterpack").is_ok());
+    }
+
+    #[test]
+    fn install_pack_plan_has_ordered_progress_events() {
+        let plan = plan_install_pack("winterpack").expect("install plan should build");
+
+        assert_eq!(plan.operation, LauncherOperation::InstallPack);
+        assert_eq!(plan.subject_id, "winterpack");
+        assert_eq!(plan.events.len(), 5);
+        assert_eq!(
+            plan.events.first().map(|event| &event.kind),
+            Some(&LauncherEventKind::Queued)
+        );
+        assert_eq!(
+            plan.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+        assert!(plan.events.windows(2).all(|pair| {
+            pair[0].progress_percent.unwrap_or(0) <= pair[1].progress_percent.unwrap_or(0)
+        }));
+    }
+
+    #[test]
+    fn install_pack_plan_can_use_remote_only_catalog_entry() {
+        let catalog = vec![ModpackCatalogEntry {
+            id: "remote-pack".to_owned(),
+            display_name: Some("Remote Pack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/remote-pack/pack.toml".to_owned(),
+            instance_name: "Remote Pack".to_owned(),
+            description: Some("Remote-only pack".to_owned()),
+            author: Some("Dylan".to_owned()),
+            tags: vec!["featured".to_owned()],
+            last_updated: Some("11/01/2025".to_owned()),
+            category: Some("testing".to_owned()),
+            min_ram: Some(2048),
+            recommended_ram: Some(4096),
+            default_server: None,
+            changelog: Some("Remote pack release".to_owned()),
+            default: false,
+        }];
+
+        let plan = plan_install_pack_from_catalog("remote-pack", &catalog)
+            .expect("remote-only pack should plan");
+
+        assert_eq!(plan.operation, LauncherOperation::InstallPack);
+        assert_eq!(plan.subject_id, "remote-pack");
+        assert!(plan
+            .events
+            .iter()
+            .any(|event| event.message.contains("Remote Pack")));
+    }
+
+    #[test]
+    fn install_pack_plan_reports_update_for_outdated_installed_profile() {
+        let catalog = vec![ModpackCatalogEntry {
+            id: "remote-pack".to_owned(),
+            display_name: Some("Remote Pack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/remote-pack/pack.toml".to_owned(),
+            instance_name: "Remote Pack".to_owned(),
+            description: Some("Remote-only pack".to_owned()),
+            author: Some("Dylan".to_owned()),
+            tags: vec!["featured".to_owned()],
+            last_updated: Some("11/01/2025".to_owned()),
+            category: Some("testing".to_owned()),
+            min_ram: Some(2048),
+            recommended_ram: Some(4096),
+            default_server: None,
+            changelog: Some("Remote pack release".to_owned()),
+            default: false,
+        }];
+        let profiles = vec![ProfileSummary {
+            id: "remote-pack".to_owned(),
+            name: "Remote Pack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: Some("10/01/2025".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: vec!["-Dcustom=true".to_owned()],
+            resolution: Some(ProfileResolution {
+                width: 1600,
+                height: 900,
+            }),
+            default_server: Some(ServerLaunchTarget {
+                name: Some("The Cabin".to_owned()),
+                address: "play.theboys.example".to_owned(),
+                port: Some(25565),
+            }),
+            java_runtime_override_path: None,
+        }];
+
+        let plan = plan_install_pack_from_catalog_with_profiles("remote-pack", &catalog, &profiles)
+            .expect("outdated pack should plan as update");
+
+        assert_eq!(plan.operation, LauncherOperation::InstallPack);
+        assert_eq!(plan.subject_id, "remote-pack");
+        assert!(plan
+            .events
+            .first()
+            .expect("plan has first event")
+            .message
+            .contains("Update queued for Remote Pack"));
+        assert!(plan
+            .events
+            .last()
+            .expect("plan has final event")
+            .message
+            .contains("Update plan is ready to execute"));
+    }
+
+    #[test]
+    fn install_pack_plan_reports_reinstall_for_current_installed_profile() {
+        let catalog = vec![ModpackCatalogEntry {
+            id: "remote-pack".to_owned(),
+            display_name: Some("Remote Pack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/remote-pack/pack.toml".to_owned(),
+            instance_name: "Remote Pack".to_owned(),
+            description: Some("Remote-only pack".to_owned()),
+            author: Some("Dylan".to_owned()),
+            tags: vec!["featured".to_owned()],
+            last_updated: Some("11/01/2025".to_owned()),
+            category: Some("testing".to_owned()),
+            min_ram: Some(2048),
+            recommended_ram: Some(4096),
+            default_server: None,
+            changelog: Some("Remote pack release".to_owned()),
+            default: false,
+        }];
+        let profiles = vec![ProfileSummary {
+            id: "remote-pack".to_owned(),
+            name: "Remote Pack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: Some("11/01/2025".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        }];
+
+        let plan = plan_install_pack_from_catalog_with_profiles("remote-pack", &catalog, &profiles)
+            .expect("current pack should plan as reinstall");
+
+        assert!(plan
+            .events
+            .first()
+            .expect("plan has first event")
+            .message
+            .contains("Reinstall queued for Remote Pack"));
+    }
+
+    #[test]
+    fn curated_pack_file_plan_can_use_remote_only_catalog_entry() {
+        let entry = ModpackCatalogEntry {
+            id: "remote-pack".to_owned(),
+            display_name: Some("Remote Pack".to_owned()),
+            pack_url: "https://cdn.example/remote-pack/pack.toml".to_owned(),
+            instance_name: "Remote Pack".to_owned(),
+            description: None,
+            author: Some("Dylan".to_owned()),
+            tags: Vec::new(),
+            last_updated: Some("11/01/2025".to_owned()),
+            category: Some("testing".to_owned()),
+            min_ram: Some(2048),
+            recommended_ram: Some(4096),
+            default_server: None,
+            changelog: None,
+            default: false,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        let plan = build_curated_pack_file_download_plan_from_entry(&entry, &directories)
+            .expect("remote-only curated pack file plan should build");
+
+        assert_eq!(plan.version_id, "remote-pack");
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].url,
+            "https://cdn.example/remote-pack/pack.toml"
+        );
+        assert_eq!(
+            plan.items[0].destination,
+            "C:/data/profiles/remote-pack/pack.toml"
+        );
+    }
+
+    #[test]
+    fn pack_summaries_mark_missing_profiles_not_installed() {
+        let packs = vec![PackSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            tagline: "Curated pack".to_owned(),
+            version: "2026-01-01".to_owned(),
+            status: PackStatus::UpdateAvailable,
+            accent: "#67e8b9".to_owned(),
+            installed_players: 4,
+            default_server: Some("The Cabin".to_owned()),
+        }];
+
+        let packs = pack_summaries_with_profile_status(packs, &[]);
+
+        assert_eq!(packs[0].status, PackStatus::NotInstalled);
+    }
+
+    #[test]
+    fn pack_summaries_mark_matching_installed_pack_version_ready() {
+        let packs = vec![PackSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            tagline: "Curated pack".to_owned(),
+            version: "2026-01-01".to_owned(),
+            status: PackStatus::NotInstalled,
+            accent: "#67e8b9".to_owned(),
+            installed_players: 4,
+            default_server: Some("The Cabin".to_owned()),
+        }];
+        let profiles = vec![ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: Some("2026-01-01".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        }];
+
+        let packs = pack_summaries_with_profile_status(packs, &profiles);
+
+        assert_eq!(packs[0].status, PackStatus::Installed);
+    }
+
+    #[test]
+    fn pack_summaries_mark_mismatched_installed_pack_version_update_available() {
+        let packs = vec![PackSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            tagline: "Curated pack".to_owned(),
+            version: "2026-01-01".to_owned(),
+            status: PackStatus::NotInstalled,
+            accent: "#67e8b9".to_owned(),
+            installed_players: 4,
+            default_server: Some("The Cabin".to_owned()),
+        }];
+        let profiles = vec![ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: Some("2025-12-01".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        }];
+
+        let packs = pack_summaries_with_profile_status(packs, &profiles);
+
+        assert_eq!(packs[0].status, PackStatus::UpdateAvailable);
+    }
+
+    #[test]
+    fn pack_summaries_treat_legacy_installed_profile_as_ready() {
+        let packs = vec![PackSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            tagline: "Curated pack".to_owned(),
+            version: "2026-01-01".to_owned(),
+            status: PackStatus::NotInstalled,
+            accent: "#67e8b9".to_owned(),
+            installed_players: 4,
+            default_server: Some("The Cabin".to_owned()),
+        }];
+        let profiles = vec![ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        }];
+
+        let packs = pack_summaries_with_profile_status(packs, &profiles);
+
+        assert_eq!(packs[0].status, PackStatus::Installed);
+    }
+
+    #[test]
+    fn pack_install_version_prefers_matching_profile_game_version() {
+        let packs = vec![PackSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            tagline: "Curated pack".to_owned(),
+            version: "1.0.3".to_owned(),
+            status: PackStatus::UpdateAvailable,
+            accent: "#67e8b9".to_owned(),
+            installed_players: 4,
+            default_server: Some("The Cabin".to_owned()),
+        }];
+        let profiles = vec![ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        }];
+
+        let version =
+            pack_install_game_version_from_catalog("winterpack", &packs, &profiles).unwrap();
+
+        assert_eq!(version, "1.21.1");
+    }
+
+    #[test]
+    fn pack_install_version_can_fall_back_to_minecraft_versioned_pack() {
+        let packs = vec![PackSummary {
+            id: "vanilla-plus".to_owned(),
+            name: "Vanilla Plus".to_owned(),
+            tagline: "Curated pack".to_owned(),
+            version: "1.21.8".to_owned(),
+            status: PackStatus::Installed,
+            accent: "#7dd3fc".to_owned(),
+            installed_players: 2,
+            default_server: Some("Survival".to_owned()),
+        }];
+
+        let version = pack_install_game_version_from_catalog("vanilla-plus", &packs, &[]).unwrap();
+
+        assert_eq!(version, "1.21.8");
+    }
+
+    #[test]
+    fn pack_install_version_rejects_unknown_game_version() {
+        let packs = vec![PackSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            tagline: "Curated pack".to_owned(),
+            version: "1.0.3".to_owned(),
+            status: PackStatus::UpdateAvailable,
+            accent: "#67e8b9".to_owned(),
+            installed_players: 4,
+            default_server: Some("The Cabin".to_owned()),
+        }];
+
+        assert!(pack_install_game_version_from_catalog("winterpack", &packs, &[]).is_err());
+    }
+
+    #[test]
+    fn modpack_catalog_parses_legacy_remote_shape() {
+        let catalog = parse_modpack_catalog_json(
+            r#"[
+              {
+                "id": " winterpack ",
+                "displayName": " WinterPack ",
+                "packUrl": " https://modpacks.dylan.lol/winterpack-modpack/pack.toml ",
+                "instanceName": " WinterPack ",
+                "description": " Official WinterPack release ",
+                "author": " Dylan ",
+                "tags": [" winter ", "", "featured"],
+                "lastUpdated": "10/30/2025",
+                "category": "themed",
+                "default": true,
+                "minRam": 4096,
+                "recommendedRam": 6144,
+                "changelog": "Version 2.0.2"
+              }
+            ]"#,
+        )
+        .expect("catalog should parse");
+
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "winterpack");
+        assert_eq!(catalog[0].display_name.as_deref(), Some("WinterPack"));
+        assert_eq!(
+            catalog[0].pack_url,
+            "https://modpacks.dylan.lol/winterpack-modpack/pack.toml"
+        );
+        assert_eq!(catalog[0].tags, vec!["winter", "featured"]);
+        assert_eq!(catalog[0].recommended_ram, Some(6144));
+        assert!(catalog[0].default);
+    }
+
+    #[tokio::test]
+    #[ignore = "hits live modpacks.dylan.lol and packwiz metadata endpoints"]
+    async fn live_dylan_catalog_and_winterpack_packwiz_metadata_parse() {
+        let catalog = fetch_remote_modpack_catalog()
+            .await
+            .expect("live catalog should fetch");
+        assert!(catalog.iter().any(|entry| entry.id == "winterpack"));
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let plan = fetch_packwiz_pack_file_download_plan("winterpack", &directories)
+            .await
+            .expect("live winterpack packwiz plan should build");
+
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.destination == "C:/data/profiles/winterpack/pack.toml"));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/index.toml"
+            && item.sha256.is_some()));
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.destination.ends_with(".pw.toml")));
+    }
+
+    #[tokio::test]
+    #[ignore = "hits live modpacks.dylan.lol, packwiz metadata, and modloader metadata endpoints"]
+    async fn live_remote_winterpack_install_planning_uses_packwiz_and_forge_metadata() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        let profile = fetch_pack_install_profile_with_remote_catalog("winterpack")
+            .await
+            .expect("live winterpack profile should derive from remote pack.toml");
+        assert_eq!(profile.id, "winterpack");
+        assert_eq!(profile.name, "WinterPack");
+        assert_eq!(profile.loader, ModLoader::Forge);
+        assert_eq!(profile.game_version, "1.20.1");
+        assert_eq!(profile.installed_pack_version.as_deref(), Some("2.3.7"));
+
+        let plan =
+            fetch_packwiz_pack_file_download_plan_with_remote_catalog("winterpack", &directories)
+                .await
+                .expect("live winterpack remote-catalog packwiz plan should build");
+        assert!(plan.items.len() > 100);
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.destination == "C:/data/profiles/winterpack/pack.toml"));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/index.toml"
+            && item.sha256.is_some()));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/mods/mouse-tweaks.pw.toml"
+            && item.sha256.is_some()));
+
+        let auxiliary_plan =
+            fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog(
+                &profile,
+                &directories,
+            )
+            .await
+            .expect("live winterpack auxiliary plan should combine packwiz and Forge artifacts");
+        assert!(auxiliary_plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::ModLoaderInstaller));
+        assert!(auxiliary_plan.items.iter().any(|item| item.destination
+            == "C:/cache/modloaders/forge/1.20.1-47.4.0/forge-installer.jar"
+            && item.url.ends_with("/forge-1.20.1-47.4.0-installer.jar")));
+        assert!(auxiliary_plan
+            .items
+            .iter()
+            .any(|item| item.destination.ends_with(".pw.toml")));
+    }
+
+    #[tokio::test]
+    #[ignore = "hits a public GitHub-hosted packwiz Fabric pack plus Fabric metadata planning"]
+    async fn live_public_fabric_packwiz_install_planning_uses_standard_pack_metadata() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let entry = public_fabric_smoke_catalog_entry();
+
+        let profile = fetch_pack_install_profile_from_catalog_entry(&entry)
+            .await
+            .expect("live Fabric pack profile should derive from standard pack.toml");
+        assert_eq!(profile.id, "more-mod-variants");
+        assert_eq!(profile.name, "More Mod Variants");
+        assert_eq!(profile.loader, ModLoader::Fabric);
+        assert_eq!(profile.game_version, "1.21.1");
+        assert_eq!(profile.installed_pack_version.as_deref(), Some("0.1.0"));
+
+        let plan = fetch_install_auxiliary_download_plan_for_catalog_entry_profile(
+            &entry,
+            &profile,
+            &directories,
+        )
+        .await
+        .expect("live Fabric auxiliary plan should combine packwiz files and Fabric metadata");
+
+        assert_eq!(plan.version_id, "more-mod-variants");
+        assert!(plan.items.iter().any(|item| {
+            item.kind == DownloadKind::PackFile
+                && item.destination == "C:/data/profiles/more-mod-variants/pack.toml"
+        }));
+        assert!(plan.items.iter().any(|item| {
+            item.kind == DownloadKind::PackFile
+                && item.destination.ends_with("mods/fabric-api.pw.toml")
+                && item.sha256.is_some()
+        }));
+        assert!(plan.items.iter().any(|item| {
+            item.kind == DownloadKind::ModLoaderMetadata
+                && item.url == "https://meta.fabricmc.net/v2/versions/loader/1.21.1"
+        }));
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads live public Fabric packwiz, Fabric loader, and vanilla artifacts before launch preflight"]
+    async fn live_public_fabric_packwiz_install_artifacts_pass_launch_preflight() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_public_fabric_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live Fabric artifacts should install");
+
+        let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+            .expect("installed Fabric launch plan should build");
+        let command = build_process_command_spec(&launch_plan)
+            .expect("installed Fabric artifacts should preflight");
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "net.fabricmc.loader.impl.launch.knot.KnotClient"));
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads live public Fabric packwiz artifacts, starts the real Minecraft Java process, verifies it survives startup, and stops it"]
+    async fn live_public_fabric_packwiz_launch_process_survives_startup_and_can_stop() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_public_fabric_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live Fabric artifacts should install");
+
+        let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+            .expect("installed Fabric launch plan should build");
+        let command = build_process_command_spec(&launch_plan)
+            .expect("installed Fabric artifacts should preflight");
+        let registry = ProcessRegistry::new();
+        let process = registry
+            .spawn(command)
+            .expect("installed Fabric Java process should spawn");
+        let startup = registry
+            .wait_for_startup(process.id, Duration::from_secs(20))
+            .expect("startup wait should complete");
+
+        if startup.state == ManagedProcessState::Exited {
+            let output_tail = startup
+                .output
+                .iter()
+                .rev()
+                .take(120)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| format!("{:?}: {}", line.stream, line.line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "Fabric smoke process exited during startup with {:?}; output tail:\n{}",
+                startup.exit_code, output_tail
+            );
+        }
+        assert_eq!(startup.state, ManagedProcessState::Running);
+
+        let stopped = registry
+            .stop(startup.id)
+            .expect("Fabric process should stop cleanly after smoke");
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+    }
+
+    async fn install_live_public_fabric_artifacts_for_preflight(
+        settings: &LauncherSettings,
+        directories: &LauncherDirectories,
+    ) -> Result<ProfileSummary> {
+        let entry = public_fabric_smoke_catalog_entry();
+        let profile = fetch_pack_install_profile_from_catalog_entry(&entry).await?;
+        ensure!(
+            profile.id == "more-mod-variants",
+            "unexpected Fabric smoke profile id"
+        );
+        ensure!(
+            profile.loader == ModLoader::Fabric,
+            "Fabric smoke profile should use Fabric"
+        );
+        persist_installed_pack_profile(profile.clone())?;
+        ensure_live_managed_java_for_profile(&profile, directories).await?;
+
+        let vanilla_plan =
+            build_vanilla_download_plan(Some(&profile.game_version), directories).await?;
+        execute_download_plan(&vanilla_plan).await?;
+        extract_native_libraries_from_download_plan(&vanilla_plan)?;
+
+        let auxiliary_plan = fetch_install_auxiliary_download_plan_for_catalog_entry_profile(
+            &entry,
+            &profile,
+            directories,
+        )
+        .await?;
+        execute_live_winterpack_auxiliary_artifacts(
+            &profile,
+            settings,
+            directories,
+            &auxiliary_plan,
+        )
+        .await?;
+
+        Ok(profile)
+    }
+
+    fn public_fabric_smoke_catalog_entry() -> ModpackCatalogEntry {
+        ModpackCatalogEntry {
+            id: "more-mod-variants".to_owned(),
+            display_name: Some("More Mod Variants".to_owned()),
+            pack_url: "https://raw.githubusercontent.com/LieOnStudios/more_mod_variants/refs/heads/main/pack.toml".to_owned(),
+            instance_name: "More Mod Variants".to_owned(),
+            description: Some("Public packwiz Fabric smoke fixture.".to_owned()),
+            author: Some("LieOnLion, Pnku".to_owned()),
+            tags: vec!["fabric".to_owned(), "packwiz".to_owned()],
+            last_updated: Some("live".to_owned()),
+            category: Some("external-smoke".to_owned()),
+            min_ram: Some(2048),
+            recommended_ram: Some(4096),
+            default_server: None,
+            changelog: None,
+            default: false,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the live Forge installer declared by the current WinterPack pack.toml"]
+    async fn live_winterpack_forge_installer_extracts_launch_metadata_and_dependencies() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let profile = fetch_pack_install_profile_with_remote_catalog("winterpack")
+            .await
+            .expect("live winterpack profile should derive from remote pack.toml");
+        assert_eq!(profile.loader, ModLoader::Forge);
+        assert_eq!(profile.game_version, "1.20.1");
+
+        let auxiliary_plan =
+            fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog(
+                &profile,
+                &directories,
+            )
+            .await
+            .expect("live winterpack auxiliary plan should include Forge installer");
+        let installer_items = auxiliary_plan
+            .items
+            .iter()
+            .filter(|item| item.kind == DownloadKind::ModLoaderInstaller)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(installer_items.len(), 1);
+        assert!(installer_items[0]
+            .url
+            .ends_with("/forge-1.20.1-47.4.0-installer.jar"));
+
+        let installer_plan = DownloadPlan {
+            version_id: "winterpack-live-forge-installer".to_owned(),
+            items: installer_items,
+        };
+        let download_operation = execute_download_plan(&installer_plan)
+            .await
+            .expect("live Forge installer should download");
+        assert!(download_operation
+            .events
+            .iter()
+            .any(|event| event.kind == LauncherEventKind::Completed));
+
+        let extraction = extract_modloader_installer_metadata_for_profile(
+            &profile,
+            &installer_plan,
+            &directories,
+        )
+        .expect("live Forge installer metadata should extract")
+        .expect("Forge installer should produce metadata operation");
+        assert!(extraction
+            .events
+            .iter()
+            .any(|event| event.message.contains("Cached forge launch metadata")));
+        let launch_metadata = load_cached_modloader_launch_metadata(&profile, &directories)
+            .expect("cached live Forge metadata should be readable")
+            .expect("live Forge metadata should be cached");
+        assert_eq!(
+            launch_metadata.main_class,
+            "cpw.mods.bootstraplauncher.BootstrapLauncher"
+        );
+        assert!(launch_metadata
+            .classpath_entries
+            .iter()
+            .any(|entry| entry.ends_with("fmlloader/1.20.1-47.4.0/fmlloader-1.20.1-47.4.0.jar")));
+        assert!(launch_metadata
+            .classpath_entries
+            .iter()
+            .any(|entry| entry.ends_with("bootstraplauncher/1.1.2/bootstraplauncher-1.1.2.jar")));
+
+        let dependency_plan =
+            build_modloader_dependency_download_plan_for_profile(&profile, &directories)
+                .expect("dependency plan should build from live Forge metadata")
+                .expect("live Forge metadata should produce dependencies");
+        let dependency_urls = dependency_plan
+            .items
+            .iter()
+            .map(|item| item.url.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            dependency_urls
+                .iter()
+                .any(|url| url.ends_with("/fmlloader-1.20.1-47.4.0.jar")),
+            "live Forge dependency plan did not include fmlloader; urls: {dependency_urls:#?}"
+        );
+        assert!(dependency_urls
+            .iter()
+            .any(|url| url.ends_with("/fmlearlydisplay-1.20.1-47.4.0.jar")));
+        assert!(dependency_urls
+            .iter()
+            .any(|url| url.ends_with("/bootstraplauncher-1.1.2.jar")));
+        assert!(dependency_urls
+            .iter()
+            .any(|url| url.ends_with("/fmlcore-1.20.1-47.4.0.jar")));
+        assert!(dependency_urls
+            .iter()
+            .any(|url| url.ends_with("/forge-1.20.1-47.4.0-universal.jar")));
+        assert!(dependency_urls
+            .iter()
+            .any(|url| url.contains("/net/minecraftforge/")));
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads the live NeoForge seed-catalog installer and verifies extracted launch dependencies"]
+    async fn live_neoforge_installer_extracts_launch_metadata_and_dependencies() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let profile = ProfileSummary {
+            id: "neoforge-live".to_owned(),
+            name: "NeoForge Live".to_owned(),
+            loader: ModLoader::Neoforge,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let installer_plan = build_modloader_download_plan_for_profile(&profile, &directories)
+            .expect("live NeoForge installer plan should build from the seed catalog");
+        assert_eq!(installer_plan.items.len(), 1);
+        assert_eq!(
+            installer_plan.items[0].kind,
+            DownloadKind::ModLoaderInstaller
+        );
+        assert!(installer_plan.items[0]
+            .url
+            .ends_with("/neoforge-21.1.1-installer.jar"));
+
+        let download_operation = execute_download_plan(&installer_plan)
+            .await
+            .expect("live NeoForge installer should download");
+        assert!(download_operation
+            .events
+            .iter()
+            .any(|event| event.kind == LauncherEventKind::Completed));
+
+        let extraction = extract_modloader_installer_metadata_for_profile(
+            &profile,
+            &installer_plan,
+            &directories,
+        )
+        .expect("live NeoForge installer metadata should extract")
+        .expect("NeoForge installer should produce metadata operation");
+        assert!(extraction
+            .events
+            .iter()
+            .any(|event| event.message.contains("Cached neoforge launch metadata")));
+        let launch_metadata = load_cached_modloader_launch_metadata(&profile, &directories)
+            .expect("cached live NeoForge metadata should be readable")
+            .expect("live NeoForge metadata should be cached");
+        assert_eq!(
+            launch_metadata.main_class,
+            "cpw.mods.bootstraplauncher.BootstrapLauncher"
+        );
+        assert!(launch_metadata
+            .classpath_entries
+            .iter()
+            .any(|entry| entry.contains("bootstraplauncher")));
+        assert!(launch_metadata.game_arguments.iter().any(|arg| {
+            matches!(
+                arg,
+                MinecraftArgument::String(value) if value == "--fml.neoForgeVersion"
+            )
+        }));
+        assert!(launch_metadata.game_arguments.iter().any(|arg| {
+            matches!(
+                arg,
+                MinecraftArgument::String(value) if value == "21.1.1"
+            )
+        }));
+
+        let dependency_plan =
+            build_modloader_dependency_download_plan_for_profile(&profile, &directories)
+                .expect("dependency plan should build from live NeoForge metadata")
+                .expect("live NeoForge metadata should produce dependencies");
+        let dependency_urls = dependency_plan
+            .items
+            .iter()
+            .map(|item| item.url.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            dependency_urls
+                .iter()
+                .any(|url| url.contains("maven.neoforged.net")
+                    && url.ends_with("/neoforge-21.1.1-universal.jar")),
+            "live NeoForge dependency plan did not include the universal jar; urls: {dependency_urls:#?}"
+        );
+        assert!(dependency_urls.iter().any(|url| {
+            url.contains("maven.neoforged.net") && url.contains("/net/neoforged/neoforge/21.1.1/")
+        }));
+        assert!(dependency_urls
+            .iter()
+            .any(|url| url.ends_with("/bootstraplauncher-2.0.2.jar")));
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads real NeoForge installer dependencies and resolves client processor Java command specs"]
+    async fn live_neoforge_installer_processors_resolve_command_specs_from_real_jars() {
+        let _smoke_root = LiveSmokeRoot::new();
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let profile = ProfileSummary {
+            id: "neoforge-live".to_owned(),
+            name: "NeoForge Live".to_owned(),
+            loader: ModLoader::Neoforge,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let installer_plan = build_modloader_download_plan_for_profile(&profile, &directories)
+            .expect("live NeoForge installer plan should build from the seed catalog");
+        execute_download_plan(&installer_plan)
+            .await
+            .expect("live NeoForge installer should download");
+        extract_modloader_installer_metadata_for_profile(&profile, &installer_plan, &directories)
+            .expect("live NeoForge installer metadata should extract")
+            .expect("NeoForge installer should produce metadata operation");
+
+        let dependency_plan =
+            build_modloader_dependency_download_plan_for_profile(&profile, &directories)
+                .expect("dependency plan should build from live NeoForge metadata")
+                .expect("live NeoForge metadata should produce dependencies");
+        assert!(dependency_plan.items.iter().any(|item| {
+            item.url
+                == "https://maven.neoforged.net/releases/net/neoforged/installertools/jarsplitter/2.1.2/jarsplitter-2.1.2.jar"
+        }));
+        execute_download_plan(&dependency_plan)
+            .await
+            .expect("live NeoForge processor dependencies should download");
+
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        ensure_live_managed_java_for_profile(&profile, &directories)
+            .await
+            .expect("managed Java should be available for live NeoForge processors");
+        let processors =
+            build_modloader_installer_processor_plan_for_profile(&profile, &settings, &directories)
+                .expect("live NeoForge processor plans should build")
+                .expect("live NeoForge metadata should include client processors");
+        assert!(
+            processors.len() >= 3,
+            "expected several live NeoForge client processors, got {}",
+            processors.len()
+        );
+        assert!(
+            processors
+                .iter()
+                .all(|processor| processor.expected_outputs.is_empty()),
+            "live NeoForge 21.1.1 processors route generated artifacts through installer data instead of output hashes"
+        );
+        let processor_args = processors
+            .iter()
+            .flat_map(|processor| processor.args.iter())
+            .collect::<Vec<_>>();
+        assert!(processor_args.iter().any(|arg| {
+            arg.contains("cache")
+                && arg.contains("libraries")
+                && arg.contains("net/minecraft/client/1.21.1-20240808.144430/client-1.21.1-20240808.144430-slim.jar")
+        }));
+        assert!(processor_args.iter().any(|arg| {
+            arg.contains("cache")
+                && arg.contains("libraries")
+                && arg.contains("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-client.jar")
+        }));
+        let installer_data_inputs = processors
+            .iter()
+            .flat_map(|processor| processor.args.iter())
+            .filter(|arg| arg.contains("installer-data"))
+            .collect::<Vec<_>>();
+        assert!(
+            !installer_data_inputs.is_empty(),
+            "live NeoForge processor plans should reference installer data extracted from the jar"
+        );
+        assert!(installer_data_inputs
+            .iter()
+            .all(|arg| Path::new(arg).is_file()));
+        let specs = build_modloader_installer_processor_command_specs_for_profile(
+            &profile,
+            &settings,
+            &directories,
+        )
+        .expect("live NeoForge processor command specs should build")
+        .expect("live NeoForge metadata should include client processors");
+
+        assert_eq!(specs.len(), processors.len());
+        assert!(specs.iter().any(|spec| {
+            spec.args
+                .iter()
+                .any(|arg| arg == "net.neoforged.jarsplitter.ConsoleTool")
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.args
+                .iter()
+                .any(|arg| arg == "net.neoforged.binarypatcher.ConsoleTool")
+        }));
+        assert!(specs.iter().all(|spec| {
+            spec.args
+                .iter()
+                .all(|arg| !arg.contains('{') && !arg.contains('}'))
+        }));
+        assert!(specs.iter().all(|spec| spec
+            .env
+            .iter()
+            .any(|env| env.key == "THEBOYSLAUNCHER_MODLOADER_PROCESSOR")));
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads live NeoForge, vanilla, and processor artifacts before launch preflight"]
+    async fn live_neoforge_install_artifacts_pass_launch_preflight() {
+        let _smoke_root = LiveSmokeRoot::new();
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_neoforge_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live NeoForge artifacts should install");
+
+        let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+            .expect("installed NeoForge launch plan should build");
+        assert!(launch_plan
+            .arguments
+            .iter()
+            .any(|arg| arg == "cpw.mods.bootstraplauncher.BootstrapLauncher"));
+        let command = build_process_command_spec(&launch_plan)
+            .expect("installed NeoForge artifacts should pass launch preflight");
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "cpw.mods.bootstraplauncher.BootstrapLauncher"));
+        let classpath = launch_plan_argument_value(&launch_plan.arguments, "-cp")
+            .expect("NeoForge launch plan should include a classpath");
+        assert!(
+            classpath.contains("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar"),
+            "NeoForge launch plan should reference the NeoForge universal jar"
+        );
+        let module_path = launch_plan_argument_value(&launch_plan.arguments, "-p")
+            .expect("NeoForge launch plan should include a module path");
+        assert!(
+            module_path.contains("cpw/mods/bootstraplauncher/2.0.2/bootstraplauncher-2.0.2.jar")
+                && module_path
+                    .contains("cpw/mods/securejarhandler/3.0.8/securejarhandler-3.0.8.jar"),
+            "NeoForge launch plan should reference BootstrapLauncher module-path artifacts"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads live NeoForge artifacts, starts the real Minecraft Java process, verifies it survives startup, and stops it"]
+    async fn live_neoforge_launch_process_survives_startup_and_can_stop() {
+        let _smoke_root = LiveSmokeRoot::new();
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_neoforge_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live NeoForge artifacts should install");
+
+        let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+            .expect("installed NeoForge launch plan should build");
+        let command = build_process_command_spec(&launch_plan)
+            .expect("installed NeoForge artifacts should pass launch preflight");
+        let registry = ProcessRegistry::new();
+        let process = registry
+            .spawn(command)
+            .expect("installed NeoForge Java process should spawn");
+        let startup = registry
+            .wait_for_startup(process.id, Duration::from_secs(20))
+            .expect("startup wait should complete");
+
+        if startup.state == ManagedProcessState::Exited {
+            let output_tail = startup
+                .output
+                .iter()
+                .rev()
+                .take(120)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| format!("{:?}: {}", line.stream, line.line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "NeoForge smoke process exited during startup with {:?}; output tail:\n{}",
+                startup.exit_code, output_tail
+            );
+        }
+        assert_eq!(startup.state, ManagedProcessState::Running);
+
+        let stopped = registry
+            .stop(startup.id)
+            .expect("NeoForge process should stop cleanly after smoke");
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+    }
+
+    async fn install_live_neoforge_artifacts_for_preflight(
+        settings: &LauncherSettings,
+        directories: &LauncherDirectories,
+    ) -> Result<ProfileSummary> {
+        let profile = ProfileSummary {
+            id: "neoforge-live".to_owned(),
+            name: "NeoForge Live".to_owned(),
+            loader: ModLoader::Neoforge,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: Some(ProfileResolution {
+                width: 1280,
+                height: 720,
+            }),
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        persist_installed_pack_profile(profile.clone())?;
+        ensure_live_managed_java_for_profile(&profile, directories).await?;
+
+        let vanilla_plan =
+            build_vanilla_download_plan(Some(&profile.game_version), directories).await?;
+        execute_download_plan(&vanilla_plan).await?;
+        extract_native_libraries_from_download_plan(&vanilla_plan)?;
+
+        let installer_plan = build_modloader_download_plan_for_profile(&profile, directories)?;
+        execute_download_plan(&installer_plan).await?;
+        extract_modloader_installer_metadata_for_profile(&profile, &installer_plan, directories)?;
+        if let Some(dependency_plan) =
+            build_modloader_dependency_download_plan_for_profile(&profile, directories)?
+        {
+            execute_download_plan(&dependency_plan).await?;
+        }
+        execute_modloader_installer_processors_for_profile(&profile, settings, directories)?;
+
+        Ok(profile)
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads live vanilla Minecraft artifacts, starts the real Java process, verifies it survives startup, and stops it"]
+    async fn live_vanilla_launch_process_survives_startup_and_can_stop() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_vanilla_artifacts_for_preflight(&directories, "1.21.8")
+            .await
+            .expect("live vanilla artifacts should install");
+
+        let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+            .expect("installed vanilla launch plan should build");
+        let command = build_process_command_spec(&launch_plan)
+            .expect("installed vanilla artifacts should preflight");
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "net.minecraft.client.main.Main"));
+
+        let registry = ProcessRegistry::new();
+        let process = registry
+            .spawn(command)
+            .expect("installed vanilla Java process should spawn");
+        let startup = registry
+            .wait_for_startup(process.id, Duration::from_secs(20))
+            .expect("startup wait should complete");
+
+        if startup.state == ManagedProcessState::Exited {
+            let output_tail = startup
+                .output
+                .iter()
+                .rev()
+                .take(120)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| format!("{:?}: {}", line.stream, line.line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "Vanilla smoke process exited during startup with {:?}; output tail:\n{}",
+                startup.exit_code, output_tail
+            );
+        }
+        assert_eq!(startup.state, ManagedProcessState::Running);
+
+        let stopped = registry
+            .stop(startup.id)
+            .expect("vanilla process should stop cleanly after smoke");
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads and launches the vanilla Minecraft version from THEBOYS_VANILLA_COMPAT_VERSION, then stops it"]
+    async fn live_vanilla_compat_version_launch_process_survives_startup_and_can_stop() {
+        let _smoke_root = LiveSmokeRoot::new();
+        let version = env::var("THEBOYS_VANILLA_COMPAT_VERSION")
+            .expect("THEBOYS_VANILLA_COMPAT_VERSION must be set");
+        assert!(
+            !version.trim().is_empty(),
+            "THEBOYS_VANILLA_COMPAT_VERSION must not be blank"
+        );
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_vanilla_artifacts_for_preflight(&directories, version.trim())
+            .await
+            .expect("live vanilla compatibility artifacts should install");
+
+        let launch_plan = if env::var("THEBOYS_VANILLA_COMPAT_AUTH").as_deref() == Ok("stored") {
+            let stored_session = load_minecraft_session()
+                .expect("stored Minecraft session should load")
+                .expect(
+                    "stored Minecraft session should exist for stored-auth compatibility smoke",
+                );
+            build_stored_authenticated_launch_plan(
+                &profile.id,
+                &settings,
+                &directories,
+                &stored_session,
+                None,
+            )
+            .expect("installed vanilla compatibility stored-auth launch plan should build")
+        } else {
+            build_offline_launch_plan(&profile.id, &settings, &directories)
+                .expect("installed vanilla compatibility launch plan should build")
+        };
+        let command = build_process_command_spec(&launch_plan)
+            .expect("installed vanilla compatibility artifacts should preflight");
+
+        let registry = ProcessRegistry::new();
+        let process = registry
+            .spawn(command)
+            .expect("installed vanilla compatibility Java process should spawn");
+        let startup = registry
+            .wait_for_startup(process.id, Duration::from_secs(20))
+            .expect("startup wait should complete");
+
+        if startup.state == ManagedProcessState::Exited {
+            let output_tail = startup
+                .output
+                .iter()
+                .rev()
+                .take(120)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| format!("{:?}: {}", line.stream, line.line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "Vanilla compatibility smoke for {} exited during startup with {:?}; output tail:\n{}",
+                version, startup.exit_code, output_tail
+            );
+        }
+        assert_eq!(startup.state, ManagedProcessState::Running);
+
+        let stopped = registry
+            .stop(startup.id)
+            .expect("vanilla compatibility process should stop cleanly after smoke");
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+    }
+
+    async fn install_live_vanilla_artifacts_for_preflight(
+        directories: &LauncherDirectories,
+        game_version: &str,
+    ) -> Result<ProfileSummary> {
+        let safe_profile_id = game_version
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_owned();
+        let profile = ProfileSummary {
+            id: format!("vanilla-{safe_profile_id}"),
+            name: format!("Vanilla {game_version}"),
+            loader: ModLoader::Vanilla,
+            game_version: game_version.to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: Some(ProfileResolution {
+                width: 1280,
+                height: 720,
+            }),
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        persist_installed_pack_profile(profile.clone())?;
+
+        let vanilla_plan =
+            build_vanilla_download_plan(Some(&profile.game_version), directories).await?;
+        execute_download_plan(&vanilla_plan).await?;
+        extract_native_libraries_from_download_plan(&vanilla_plan)?;
+        ensure_live_managed_java_for_profile(&profile, directories).await?;
+
+        Ok(profile)
+    }
+
+    async fn ensure_live_managed_java_for_profile(
+        profile: &ProfileSummary,
+        directories: &LauncherDirectories,
+    ) -> Result<()> {
+        let cached_version_details =
+            load_cached_minecraft_version_details(&profile.game_version, directories)?;
+        let required_java = required_java_major_for_profile_version(
+            &profile.game_version,
+            cached_version_details.as_ref(),
+        );
+        if select_java_runtime(&discover_java_runtimes(), required_java).is_some() {
+            return Ok(());
+        }
+
+        let manifest = fetch_recommended_java_runtime_manifest().await?;
+        let runtime = manifest
+            .iter()
+            .filter(|entry| entry.major_version >= required_java)
+            .min_by_key(|entry| entry.major_version)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no recommended Java runtime satisfies Minecraft {} requirement Java {}",
+                    profile.game_version,
+                    required_java
+                )
+            })?;
+        let request = java_runtime_request_from_manifest_entry(runtime);
+        let plan = build_managed_java_runtime_download_plan(request, directories)?;
+        execute_download_plan(&plan).await?;
+        execute_managed_java_runtime_install(&plan)?;
+
+        ensure!(
+            select_java_runtime(&discover_java_runtimes(), required_java).is_some(),
+            "managed Java runtime install did not produce a Java {}+ executable",
+            required_java
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads full live WinterPack vanilla, packwiz, Forge, and mod artifacts before launch preflight"]
+    async fn live_winterpack_install_artifacts_pass_launch_preflight() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        install_live_winterpack_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live WinterPack artifacts should install");
+
+        let launch_plan = build_offline_launch_plan("winterpack", &settings, &directories)
+            .expect("installed WinterPack launch plan should build");
+        let command =
+            build_process_command_spec(&launch_plan).expect("installed artifacts should preflight");
+
+        assert_eq!(command.executable, launch_plan.java_executable);
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "cpw.mods.bootstraplauncher.BootstrapLauncher"));
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads full live WinterPack artifacts, deletes a Forge dependency, repairs it, and verifies launch preflight"]
+    async fn live_winterpack_repair_restores_deleted_launch_dependency() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_winterpack_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live WinterPack artifacts should install");
+        let launch_plan = build_offline_launch_plan("winterpack", &settings, &directories)
+            .expect("installed WinterPack launch plan should build");
+        build_process_command_spec(&launch_plan).expect("installed artifacts should preflight");
+
+        let deleted_dependency =
+            live_winterpack_fmlloader_classpath_entry(&launch_plan).expect("fmlloader is required");
+        fs::remove_file(&deleted_dependency).expect("dependency should be removable");
+        let missing_error = build_process_command_spec(&launch_plan)
+            .expect_err("deleted dependency should fail launch preflight");
+        assert!(
+            missing_error.to_string().contains("fmlloader"),
+            "missing dependency error should mention fmlloader: {missing_error}"
+        );
+
+        let vanilla_plan = build_vanilla_download_plan(Some(&profile.game_version), &directories)
+            .await
+            .expect("repair vanilla download plan should build");
+        execute_download_plan(&vanilla_plan)
+            .await
+            .expect("repair vanilla artifacts should download");
+        extract_native_libraries_from_download_plan(&vanilla_plan)
+            .expect("repair native libraries should extract");
+        let auxiliary_plan = fetch_repair_auxiliary_download_plan_for_profile_with_remote_catalog(
+            &profile,
+            &directories,
+        )
+        .await
+        .expect("WinterPack repair auxiliary plan should build");
+        execute_live_winterpack_auxiliary_artifacts(
+            &profile,
+            &settings,
+            &directories,
+            &auxiliary_plan,
+        )
+        .await
+        .expect("repair auxiliary artifacts should download and process");
+
+        let repaired_launch_plan = build_offline_launch_plan("winterpack", &settings, &directories)
+            .expect("repaired WinterPack launch plan should build");
+        build_process_command_spec(&repaired_launch_plan)
+            .expect("repair should restore deleted launch dependency");
+    }
+
+    #[test]
+    #[ignore = "requires an existing live smoke root with installed WinterPack artifacts and a stored Microsoft/Minecraft session"]
+    fn live_winterpack_stored_authenticated_command_uses_saved_session() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let stored_session = load_minecraft_session()
+            .expect("stored Minecraft session should load")
+            .expect("stored Minecraft session should exist");
+        let server = ServerLaunchTarget {
+            name: Some("The Cabin".to_owned()),
+            address: "play.theboys.example".to_owned(),
+            port: Some(25565),
+        };
+
+        let launch_plan = build_stored_authenticated_launch_plan(
+            "winterpack",
+            &settings,
+            &directories,
+            &stored_session,
+            Some(&server),
+        )
+        .expect("stored authenticated WinterPack launch plan should build");
+        let command =
+            build_process_command_spec(&launch_plan).expect("installed artifacts should preflight");
+
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--username" && pair[1] == stored_session.session.username));
+        assert!(command.args.windows(2).any(|pair| pair[0] == "--uuid"
+            && pair[1] == stored_session.session.uuid.simple().to_string()));
+        assert!(command.args.windows(2).any(|pair| {
+            pair[0] == "--accessToken"
+                && pair[1] == stored_session.session.access_token
+                && !pair[1].starts_with("dpapi:")
+        }));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--server" && pair[1] == "play.theboys.example"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--port" && pair[1] == "25565"));
+    }
+
+    #[test]
+    #[ignore = "requires an existing live smoke root with installed WinterPack artifacts and a stored Microsoft/Minecraft session, then starts real Java"]
+    fn live_winterpack_stored_authenticated_launch_process_survives_startup_and_can_stop() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let stored_session = load_minecraft_session()
+            .expect("stored Minecraft session should load")
+            .expect("stored Minecraft session should exist");
+        let server = ServerLaunchTarget {
+            name: Some("The Cabin".to_owned()),
+            address: "play.theboys.example".to_owned(),
+            port: Some(25565),
+        };
+
+        let launch_plan = build_stored_authenticated_launch_plan(
+            "winterpack",
+            &settings,
+            &directories,
+            &stored_session,
+            Some(&server),
+        )
+        .expect("stored authenticated WinterPack launch plan should build");
+        let command =
+            build_process_command_spec(&launch_plan).expect("installed artifacts should preflight");
+        assert!(command.args.windows(2).any(|pair| {
+            pair[0] == "--accessToken"
+                && pair[1] == stored_session.session.access_token
+                && !pair[1].starts_with("dpapi:")
+        }));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--server" && pair[1] == "play.theboys.example"));
+
+        let registry = ProcessRegistry::new();
+        let process = registry
+            .spawn(command)
+            .expect("stored authenticated WinterPack Java process should spawn");
+        let startup = registry
+            .wait_for_startup(process.id, Duration::from_secs(20))
+            .expect("startup wait should complete");
+
+        if startup.state == ManagedProcessState::Exited {
+            let output_tail = startup
+                .output
+                .iter()
+                .rev()
+                .take(120)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| format!("{:?}: {}", line.stream, line.line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "stored authenticated WinterPack process exited during startup with {:?}; output tail:\n{}",
+                startup.exit_code, output_tail
+            );
+        }
+        assert_eq!(startup.state, ManagedProcessState::Running);
+
+        let stopped = registry
+            .stop(startup.id)
+            .expect("stored authenticated WinterPack process should stop cleanly after smoke");
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads full live WinterPack artifacts, starts the real Minecraft Java process, verifies it survives startup, and stops it"]
+    async fn live_winterpack_launch_process_survives_startup_and_can_stop() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        install_live_winterpack_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live WinterPack artifacts should install");
+
+        let launch_plan = build_offline_launch_plan("winterpack", &settings, &directories)
+            .expect("installed WinterPack launch plan should build");
+        let command =
+            build_process_command_spec(&launch_plan).expect("installed artifacts should preflight");
+        let registry = ProcessRegistry::new();
+        let process = registry
+            .spawn(command)
+            .expect("installed WinterPack Java process should spawn");
+        let startup = registry
+            .wait_for_startup(process.id, Duration::from_secs(20))
+            .expect("startup wait should complete");
+
+        if startup.state == ManagedProcessState::Exited {
+            let output_tail = startup
+                .output
+                .iter()
+                .rev()
+                .take(120)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| format!("{:?}: {}", line.stream, line.line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "WinterPack process exited during startup with {:?}; output tail:\n{}",
+                startup.exit_code, output_tail
+            );
+        }
+        assert_eq!(startup.state, ManagedProcessState::Running);
+
+        let stopped = registry
+            .stop(startup.id)
+            .expect("WinterPack process should stop cleanly after smoke");
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads full live WinterPack artifacts, deletes the managed profile instance, and verifies shared cache is retained"]
+    async fn live_winterpack_delete_removes_profile_data_but_keeps_shared_cache() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        install_live_winterpack_artifacts_for_preflight(&settings, &directories)
+            .await
+            .expect("live WinterPack artifacts should install");
+
+        let launch_plan = build_offline_launch_plan("winterpack", &settings, &directories)
+            .expect("installed WinterPack launch plan should build");
+        build_process_command_spec(&launch_plan).expect("installed artifacts should preflight");
+
+        let profile_dir = PathBuf::from(&directories.data_dir).join("profiles/winterpack");
+        let pack_manifest = profile_dir.join("pack.toml");
+        assert!(pack_manifest.is_file());
+
+        let assets_dir = launch_plan_argument_value(&launch_plan.arguments, "--assetsDir")
+            .expect("launch plan should include assets directory");
+        let asset_index = launch_plan_argument_value(&launch_plan.arguments, "--assetIndex")
+            .expect("launch plan should include asset index");
+        let shared_asset_index = PathBuf::from(assets_dir)
+            .join("indexes")
+            .join(format!("{asset_index}.json"));
+        assert!(shared_asset_index.is_file());
+        let cache_dir = PathBuf::from(&directories.cache_dir);
+
+        let deleted = delete_profile(DeleteProfileRequest {
+            id: "winterpack".to_owned(),
+        })
+        .expect("live WinterPack profile should delete");
+        let profiles = load_profiles().expect("profiles should reload after delete");
+
+        assert_eq!(deleted.id, "winterpack");
+        assert!(!profiles.iter().any(|profile| profile.id == "winterpack"));
+        assert!(!profile_dir.exists());
+        assert!(shared_asset_index.is_file());
+        assert!(cache_dir.join("versions").is_dir());
+    }
+
+    async fn install_live_winterpack_artifacts_for_preflight(
+        settings: &LauncherSettings,
+        directories: &LauncherDirectories,
+    ) -> Result<ProfileSummary> {
+        let profile = fetch_pack_install_profile_with_remote_catalog("winterpack").await?;
+        persist_installed_pack_profile(profile.clone())?;
+
+        let vanilla_plan =
+            build_vanilla_download_plan(Some(&profile.game_version), directories).await?;
+        execute_download_plan(&vanilla_plan).await?;
+        extract_native_libraries_from_download_plan(&vanilla_plan)?;
+
+        let auxiliary_plan =
+            fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog(
+                &profile,
+                directories,
+            )
+            .await?;
+        execute_live_winterpack_auxiliary_artifacts(
+            &profile,
+            settings,
+            directories,
+            &auxiliary_plan,
+        )
+        .await?;
+
+        Ok(profile)
+    }
+
+    async fn execute_live_winterpack_auxiliary_artifacts(
+        profile: &ProfileSummary,
+        settings: &LauncherSettings,
+        directories: &LauncherDirectories,
+        auxiliary_plan: &DownloadPlan,
+    ) -> Result<()> {
+        if let Some(direct_pack_plan) = direct_pack_file_download_plan(auxiliary_plan)? {
+            execute_download_plan(&direct_pack_plan).await?;
+        }
+        if let Some(metafile_plan) = fetch_packwiz_metafile_download_plan(auxiliary_plan).await? {
+            execute_download_plan(&metafile_plan).await?;
+        }
+
+        let metadata_plan = DownloadPlan {
+            version_id: format!("{}-modloader-artifacts", profile.id),
+            items: auxiliary_plan
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.kind,
+                        DownloadKind::ModLoaderMetadata | DownloadKind::ModLoaderInstaller
+                    )
+                })
+                .cloned()
+                .collect(),
+        };
+        execute_download_plan(&metadata_plan).await?;
+        extract_modloader_installer_metadata_for_profile(profile, &metadata_plan, directories)?;
+        if let Some(dependency_plan) =
+            build_modloader_dependency_download_plan_for_profile(profile, directories)?
+        {
+            execute_download_plan(&dependency_plan).await?;
+        }
+        execute_modloader_installer_processors_for_profile(profile, settings, directories)?;
+        Ok(())
+    }
+
+    fn live_winterpack_fmlloader_classpath_entry(launch_plan: &LaunchPlan) -> Option<PathBuf> {
+        let classpath = launch_plan_argument_value(&launch_plan.arguments, "-cp")?;
+        classpath_entries(&classpath)
+            .into_iter()
+            .find(|entry| entry.contains("fmlloader") && entry.ends_with(".jar"))
+            .map(PathBuf::from)
+    }
+
+    #[test]
+    fn packwiz_pack_toml_parses_standard_manifest_versions() {
+        let pack = parse_packwiz_pack_toml(
+            r#"name = "WinterPack"
+author = "Dylan"
+version = "2.3.7"
+pack-format = "packwiz:1.1.0"
+
+[index]
+file = "index.toml"
+hash-format = "sha256"
+hash = "e2094593a8e660f9157ceb54bec8f3cf8194f833f3e31fd55a77324fb84fe701"
+
+[versions]
+forge = "47.4.0"
+minecraft = "1.20.1"
+"#,
+        )
+        .expect("pack.toml should parse");
+
+        assert_eq!(pack.name.as_deref(), Some("WinterPack"));
+        assert_eq!(pack.author.as_deref(), Some("Dylan"));
+        assert_eq!(pack.pack_version, "2.3.7");
+        assert_eq!(pack.pack_format.as_deref(), Some("packwiz:1.1.0"));
+        assert_eq!(pack.minecraft_version, "1.20.1");
+        assert_eq!(pack.loader, ModLoader::Forge);
+        assert_eq!(pack.loader_version.as_deref(), Some("47.4.0"));
+        assert_eq!(pack.index_file.as_deref(), Some("index.toml"));
+        assert_eq!(pack.index_hash_format.as_deref(), Some("sha256"));
+    }
+
+    #[test]
+    fn packwiz_pack_toml_rejects_multiple_modloaders() {
+        assert!(parse_packwiz_pack_toml(
+            r#"version = "1.0.0"
+
+[versions]
+minecraft = "1.20.1"
+forge = "47.4.0"
+fabric = "0.16.10"
+"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn packwiz_index_toml_parses_file_entries() {
+        let index = parse_packwiz_index_toml(
+            r#"hash-format = "sha256"
+
+[[files]]
+file = "config/example.toml"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[files]]
+file = "mods/example.pw.toml"
+hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+alias = "mods/example.jar"
+metafile = true
+preserve = true
+"#,
+        )
+        .expect("index should parse");
+
+        assert_eq!(index.hash_format, "sha256");
+        assert_eq!(index.files.len(), 2);
+        assert_eq!(index.files[0].file, "config/example.toml");
+        assert_eq!(index.files[1].alias.as_deref(), Some("mods/example.jar"));
+        assert!(index.files[1].metafile);
+        assert!(index.files[1].preserve);
+    }
+
+    #[test]
+    fn packwiz_index_toml_rejects_escaping_file_paths() {
+        assert!(parse_packwiz_index_toml(
+            r#"hash-format = "sha256"
+
+[[files]]
+file = "../escape.toml"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn packwiz_index_fetch_rejects_pack_manifest_hash_mismatch() {
+        let index_body = r#"hash-format = "sha256"
+
+[[files]]
+file = "config/example.toml"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+        let (pack_url, request_count) =
+            serve_http_responses(vec![http_response("200 OK", index_body)]);
+        let pack_info = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("sha256".to_owned()),
+            index_hash: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            ),
+        };
+
+        let error = fetch_packwiz_index(&format!("{pack_url}/pack.toml"), &pack_info)
+            .await
+            .expect_err("index hash mismatch should fail before parsing plan files");
+
+        assert!(
+            error.to_string().contains("sha256 mismatch"),
+            "expected index hash mismatch error, got {error:#}"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn packwiz_index_download_plan_resolves_manifest_index_and_files() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let catalog = ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            last_updated: None,
+            category: None,
+            min_ram: None,
+            recommended_ram: None,
+            default_server: None,
+            changelog: None,
+            default: false,
+        };
+        let pack = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("sha256".to_owned()),
+            index_hash: Some(
+                "e2094593a8e660f9157ceb54bec8f3cf8194f833f3e31fd55a77324fb84fe701".to_owned(),
+            ),
+        };
+        let index = parse_packwiz_index_toml(
+            r#"hash-format = "sha256"
+
+[[files]]
+file = "config/example.toml"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[files]]
+file = "mods/example.pw.toml"
+hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+alias = "mods/example.jar"
+metafile = true
+"#,
+        )
+        .expect("index should parse");
+
+        let plan =
+            build_packwiz_pack_file_download_plan_from_index(&catalog, &pack, &index, &directories)
+                .expect("download plan should build");
+
+        assert_eq!(plan.version_id, "winterpack");
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/pack.toml"
+            && item.url == "https://modpacks.dylan.lol/winterpack-modpack/pack.toml"));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/index.toml"
+            && item.url == "https://modpacks.dylan.lol/winterpack-modpack/index.toml"
+            && item.sha256.as_deref()
+                == Some("e2094593a8e660f9157ceb54bec8f3cf8194f833f3e31fd55a77324fb84fe701")));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/config/example.toml"
+            && item.url == "https://modpacks.dylan.lol/winterpack-modpack/config/example.toml"
+            && item.sha256.as_deref()
+                == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/mods/example.jar"
+            && item.url == "https://modpacks.dylan.lol/winterpack-modpack/mods/example.pw.toml"));
+    }
+
+    #[test]
+    fn packwiz_index_download_plan_marks_preserved_files() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let catalog = ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            last_updated: None,
+            category: None,
+            min_ram: None,
+            recommended_ram: None,
+            default_server: None,
+            changelog: None,
+            default: false,
+        };
+        let pack = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("sha256".to_owned()),
+            index_hash: Some(
+                "e2094593a8e660f9157ceb54bec8f3cf8194f833f3e31fd55a77324fb84fe701".to_owned(),
+            ),
+        };
+        let index = parse_packwiz_index_toml(
+            r#"hash-format = "sha256"
+
+[[files]]
+file = "config/user-options.txt"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+preserve = true
+"#,
+        )
+        .expect("index should parse");
+
+        let plan =
+            build_packwiz_pack_file_download_plan_from_index(&catalog, &pack, &index, &directories)
+                .expect("download plan should build");
+
+        let preserved = plan
+            .items
+            .iter()
+            .find(|item| item.destination == "C:/data/profiles/winterpack/config/user-options.txt")
+            .expect("preserved config should be planned");
+        assert_eq!(preserved.kind, DownloadKind::PreservedPackFile);
+        assert_eq!(
+            preserved.sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn packwiz_index_download_plan_preserves_sha1_hashes() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let catalog = ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            last_updated: None,
+            category: None,
+            min_ram: None,
+            recommended_ram: None,
+            default_server: None,
+            changelog: None,
+            default: false,
+        };
+        let pack = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("sha1".to_owned()),
+            index_hash: Some("1111111111111111111111111111111111111111".to_owned()),
+        };
+        let index = parse_packwiz_index_toml(
+            r#"hash-format = "sha1"
+
+[[files]]
+file = "config/example.toml"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )
+        .expect("sha1 index should parse");
+
+        let plan =
+            build_packwiz_pack_file_download_plan_from_index(&catalog, &pack, &index, &directories)
+                .expect("download plan should build");
+
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/index.toml"
+            && item.sha1.as_deref() == Some("1111111111111111111111111111111111111111")
+            && item.sha256.is_none()));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/config/example.toml"
+            && item.sha1.as_deref() == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            && item.sha256.is_none()));
+    }
+
+    #[test]
+    fn packwiz_index_download_plan_preserves_sha512_and_md5_hashes() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let catalog = ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            last_updated: None,
+            category: None,
+            min_ram: None,
+            recommended_ram: None,
+            default_server: None,
+            changelog: None,
+            default: false,
+        };
+        let pack = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("md5".to_owned()),
+            index_hash: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        };
+        let index = parse_packwiz_index_toml(
+            r#"hash-format = "sha512"
+
+[[files]]
+file = "config/example.toml"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )
+        .expect("sha512 index should parse");
+
+        let plan =
+            build_packwiz_pack_file_download_plan_from_index(&catalog, &pack, &index, &directories)
+                .expect("download plan should build");
+
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/index.toml"
+            && item.md5.as_deref() == Some("0123456789abcdef0123456789abcdef")
+            && item.sha1.is_none()
+            && item.sha256.is_none()
+            && item.sha512.is_none()));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/config/example.toml"
+            && item.sha512.as_deref()
+                == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            && item.sha1.is_none()
+            && item.sha256.is_none()
+            && item.md5.is_none()));
+    }
+
+    #[test]
+    fn packwiz_index_download_plan_preserves_murmur2_hashes() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let catalog = ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            last_updated: None,
+            category: None,
+            min_ram: None,
+            recommended_ram: None,
+            default_server: None,
+            changelog: None,
+            default: false,
+        };
+        let pack = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("murmur2".to_owned()),
+            index_hash: Some("1234567890".to_owned()),
+        };
+        let index = parse_packwiz_index_toml(
+            r#"hash-format = "murmur2"
+
+[[files]]
+file = "mods/example.jar"
+hash = "987654321"
+"#,
+        )
+        .expect("murmur2 index should parse");
+
+        let plan =
+            build_packwiz_pack_file_download_plan_from_index(&catalog, &pack, &index, &directories)
+                .expect("download plan should build");
+
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/index.toml"
+            && item.murmur2.as_deref() == Some("1234567890")
+            && item.sha1.is_none()
+            && item.sha256.is_none()
+            && item.sha512.is_none()
+            && item.md5.is_none()));
+        assert!(plan.items.iter().any(|item| item.destination
+            == "C:/data/profiles/winterpack/mods/example.jar"
+            && item.murmur2.as_deref() == Some("987654321")
+            && item.sha1.is_none()
+            && item.sha256.is_none()
+            && item.sha512.is_none()
+            && item.md5.is_none()));
+    }
+
+    #[test]
+    fn pack_profile_uses_catalog_and_packwiz_metadata() {
+        let catalog = ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: Some("Official WinterPack release".to_owned()),
+            author: Some("Dylan".to_owned()),
+            tags: vec!["featured".to_owned()],
+            last_updated: Some("10/30/2025".to_owned()),
+            category: Some("themed".to_owned()),
+            min_ram: Some(4096),
+            recommended_ram: Some(6144),
+            default_server: None,
+            changelog: Some("Version 2.0.2".to_owned()),
+            default: true,
+        };
+        let pack = PackwizPackInfo {
+            name: Some("Pack TOML Name".to_owned()),
+            author: Some("Dylan".to_owned()),
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("sha256".to_owned()),
+            index_hash: Some(
+                "e2094593a8e660f9157ceb54bec8f3cf8194f833f3e31fd55a77324fb84fe701".to_owned(),
+            ),
+        };
+
+        let profile = pack_profile_from_catalog_entry_and_pack_info(&catalog, &pack)
+            .expect("profile should build");
+
+        assert_eq!(profile.id, "winterpack");
+        assert_eq!(profile.name, "WinterPack");
+        assert_eq!(profile.loader, ModLoader::Forge);
+        assert_eq!(profile.game_version, "1.20.1");
+        assert_eq!(profile.installed_pack_version.as_deref(), Some("2.3.7"));
+        assert_eq!(profile.memory_mb, 6144);
+    }
+
+    #[test]
+    fn pack_profile_rejects_invalid_packwiz_minecraft_version() {
+        let catalog = ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            last_updated: None,
+            category: None,
+            min_ram: None,
+            recommended_ram: None,
+            default_server: None,
+            changelog: None,
+            default: false,
+        };
+        let pack = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "not-a-version".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: None,
+            index_hash_format: None,
+            index_hash: None,
+        };
+
+        assert!(pack_profile_from_catalog_entry_and_pack_info(&catalog, &pack).is_err());
+    }
+
+    #[test]
+    fn profile_repair_version_comes_from_profile_catalog() {
+        let profiles = vec![ProfileSummary {
+            id: "latest-release".to_owned(),
+            name: "Latest Release".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        }];
+
+        let version = profile_game_version_from_profiles("latest-release", &profiles).unwrap();
+
+        assert_eq!(version, "1.21.8");
+    }
+
+    #[test]
+    fn install_pack_rejects_unknown_packs() {
+        assert!(plan_install_pack("missing-pack").is_err());
+        assert!(install_pack("missing-pack").is_err());
+    }
+
+    #[test]
+    fn offline_launch_plan_uses_profile_settings_and_directories() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/Users/test/AppData/Roaming/TheBoysLauncher".to_owned(),
+            config_dir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config".to_owned(),
+            cache_dir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache".to_owned(),
+            log_dir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/logs".to_owned(),
+        };
+
+        let plan =
+            build_offline_launch_plan("winterpack", &settings, &directories).expect("plan builds");
+
+        assert_eq!(plan.profile_name, "WinterPack");
+        assert_eq!(plan.memory_mb, 6144);
+        assert!(plan.arguments.contains(&"--username".to_owned()));
+        assert!(plan.arguments.contains(&"Builder".to_owned()));
+        assert!(plan.working_dir.ends_with("/profiles/winterpack"));
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--gameDir").as_deref(),
+            Some("C:/Users/test/AppData/Roaming/TheBoysLauncher/profiles/winterpack")
+        );
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--assetsDir").as_deref(),
+            Some("C:/Users/test/AppData/Local/TheBoysLauncher/cache/assets")
+        );
+        let classpath = launch_argument_value(&plan.arguments, "-cp").expect("classpath exists");
+        assert!(classpath.contains(
+            "C:/Users/test/AppData/Local/TheBoysLauncher/cache/versions/1.21.1/client.jar"
+        ));
+        assert!(classpath.contains("C:/Users/test/AppData/Local/TheBoysLauncher/cache/libraries/*"));
+    }
+
+    #[test]
+    fn launch_plan_uses_profile_jvm_args_resolution_and_default_server() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: Some("Yesterday".to_owned()),
+            memory_mb: 6144,
+            jvm_args: vec!["-Dtheboyslauncher.pack=winterpack".to_owned()],
+            resolution: Some(ProfileResolution {
+                width: 1280,
+                height: 720,
+            }),
+            default_server: Some(ServerLaunchTarget {
+                name: Some("The Cabin".to_owned()),
+                address: "play.theboys.example".to_owned(),
+                port: Some(25565),
+            }),
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_launch_plan_for_profile(&profile, &settings, &directories, None, None)
+            .expect("plan builds");
+
+        assert!(plan
+            .arguments
+            .contains(&"-Dtheboyslauncher.pack=winterpack".to_owned()));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--width" && pair[1] == "1280"));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--height" && pair[1] == "720"));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--server" && pair[1] == "play.theboys.example"));
+    }
+
+    #[test]
+    fn launch_plan_can_use_minecraft_version_json_arguments_and_main_class() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "vanilla-1218".to_owned(),
+            name: "Vanilla 1.21.8".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: vec!["-Dcustom=true".to_owned()],
+            resolution: Some(ProfileResolution {
+                width: 1280,
+                height: 720,
+            }),
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let details = minecraft_details_fixture();
+
+        let plan = build_launch_plan_for_profile_with_version_details(
+            &profile,
+            &settings,
+            &directories,
+            None,
+            None,
+            Some(&details),
+        )
+        .expect("metadata launch plan should build");
+
+        assert!(plan.arguments.contains(&"-Dcustom=true".to_owned()));
+        assert!(plan
+            .arguments
+            .contains(&"com.example.minecraft.Main".to_owned()));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--username" && pair[1] == "Builder"));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--gameDir" && pair[1] == "C:/data/profiles/vanilla-1218"));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--width" && pair[1] == "1280"));
+        let classpath = launch_argument_value(&plan.arguments, "-cp").expect("classpath exists");
+        assert!(classpath.contains("C:/cache/libraries/com/example/core/1.0.0/core-1.0.0.jar"));
+        assert!(!classpath.contains("lwjgl-glfw-3.3.1-natives-windows.jar"));
+        assert!(classpath.contains("C:/cache/versions/1.21.8/client.jar"));
+        assert!(!classpath.contains("libraries/*"));
+        assert!(plan
+            .arguments
+            .iter()
+            .any(|argument| argument == "-Djava.library.path=C:/cache/natives/1.21.8"));
+    }
+
+    #[test]
+    fn launch_plan_uses_legacy_minecraft_arguments_string() {
+        let _java = JavaRuntimeDiscoveryGuard::java_8();
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "legacy-vanilla".to_owned(),
+            name: "Legacy Vanilla".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.7.10".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 2048,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let mut details = minecraft_details_fixture();
+        details.id = "1.7.10".to_owned();
+        details.arguments = None;
+        details.minecraft_arguments = Some(
+            "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --gameAssets ${game_assets} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --accessToken ${auth_access_token} --session ${auth_session} --userProperties ${user_properties} --userType ${user_type}".to_owned(),
+        );
+        details.asset_index.id = "1.7.10".to_owned();
+
+        let plan = build_launch_plan_for_profile_with_version_details(
+            &profile,
+            &settings,
+            &directories,
+            None,
+            None,
+            Some(&details),
+        )
+        .expect("legacy launch plan should build");
+
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--assetsDir").as_deref(),
+            Some("C:/cache/assets")
+        );
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--assetIndex").as_deref(),
+            Some("1.7.10")
+        );
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--gameAssets").as_deref(),
+            Some("C:/cache/assets/virtual/legacy")
+        );
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--userProperties").as_deref(),
+            Some("{}")
+        );
+        assert_eq!(
+            launch_argument_value(&plan.arguments, "--session").as_deref(),
+            Some("0")
+        );
+        assert!(plan
+            .arguments
+            .iter()
+            .any(|argument| argument == "-Djava.library.path=C:/cache/natives/1.7.10"));
+    }
+
+    #[test]
+    fn launch_plan_honors_minecraft_argument_feature_rules() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "vanilla-1218".to_owned(),
+            name: "Vanilla 1.21.8".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let details = minecraft_details_fixture();
+
+        let plan = build_launch_plan_for_profile_with_version_details(
+            &profile,
+            &settings,
+            &directories,
+            None,
+            None,
+            Some(&details),
+        )
+        .expect("metadata launch plan should build");
+
+        assert!(!plan.arguments.contains(&"--width".to_owned()));
+        assert!(!plan.arguments.contains(&"--height".to_owned()));
+    }
+
+    #[test]
+    fn launch_plan_substitutes_minecraft_version_type_from_metadata() {
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "snapshot".to_owned(),
+            name: "Snapshot".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "25w31a".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let mut details = minecraft_details_fixture();
+        details.id = "25w31a".to_owned();
+        details.version_type = Some("snapshot".to_owned());
+        details
+            .arguments
+            .as_mut()
+            .expect("fixture has arguments")
+            .game
+            .extend([
+                MinecraftArgument::String("--versionType".to_owned()),
+                MinecraftArgument::String("${version_type}".to_owned()),
+            ]);
+
+        let plan = build_launch_plan_for_profile_with_version_details(
+            &profile,
+            &settings,
+            &directories,
+            None,
+            None,
+            Some(&details),
+        )
+        .expect("snapshot metadata launch plan should build");
+
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--versionType" && pair[1] == "snapshot"));
+    }
+
+    #[test]
+    fn launch_plan_uses_cached_minecraft_version_details_when_available() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let version_path = cached_minecraft_version_details_path("1.21.8", &directories)
+            .expect("version path should build");
+        fs::create_dir_all(version_path.parent().expect("version path has parent"))
+            .expect("version dir should create");
+        fs::write(
+            &version_path,
+            serde_json::to_vec_pretty(&minecraft_details_fixture()).expect("fixture serializes"),
+        )
+        .expect("cached version details should write");
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let profile = ProfileSummary {
+            id: "cached-vanilla".to_owned(),
+            name: "Cached Vanilla".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_launch_plan_for_profile(&profile, &settings, &directories, None, None)
+            .expect("cached metadata launch plan should build");
+
+        assert!(plan
+            .arguments
+            .contains(&"com.example.minecraft.Main".to_owned()));
+        let classpath = launch_argument_value(&plan.arguments, "-cp").expect("classpath exists");
+        assert!(classpath.contains("cache/libraries/com/example/core/1.0.0/core-1.0.0.jar"));
+        assert!(!classpath.contains("libraries/*"));
+    }
+
+    #[test]
+    fn launch_plan_uses_cached_fabric_metadata_for_main_class_and_classpath() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let version_path = cached_minecraft_version_details_path("1.21.8", &directories)
+            .expect("version path should build");
+        fs::create_dir_all(version_path.parent().expect("version path has parent"))
+            .expect("version dir should create");
+        fs::write(
+            &version_path,
+            serde_json::to_vec_pretty(&minecraft_details_fixture()).expect("fixture serializes"),
+        )
+        .expect("cached version details should write");
+        let metadata_path = modloader_metadata_path("fabric-loader", "1.21.8", &directories)
+            .expect("metadata path should build");
+        fs::create_dir_all(metadata_path.parent().expect("metadata path has parent"))
+            .expect("metadata dir should create");
+        fs::write(&metadata_path, fabric_loader_metadata_fixture())
+            .expect("fabric metadata should write");
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let profile = ProfileSummary {
+            id: "fabric-1218".to_owned(),
+            name: "Fabric 1.21.8".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_launch_plan_for_profile(&profile, &settings, &directories, None, None)
+            .expect("cached Fabric launch plan should build");
+
+        assert!(plan
+            .arguments
+            .contains(&"net.fabricmc.loader.impl.launch.knot.KnotClient".to_owned()));
+        assert!(!plan
+            .arguments
+            .contains(&"com.example.minecraft.Main".to_owned()));
+        let classpath = launch_argument_value(&plan.arguments, "-cp").expect("classpath exists");
+        assert!(classpath.contains(
+            "cache/libraries/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar"
+        ));
+        assert!(classpath
+            .contains("cache/libraries/net/fabricmc/intermediary/1.21.8/intermediary-1.21.8.jar"));
+        assert!(classpath.contains("cache/libraries/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar"));
+        assert!(classpath.contains("cache/versions/1.21.8/client.jar"));
+    }
+
+    #[test]
+    fn modloader_classpath_deduplicates_vanilla_library_entries() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let details = minecraft_details_fixture();
+        let duplicate_library = "C:/cache/libraries/com/example/core/1.0.0/core-1.0.0.jar";
+        let metadata = ModloaderLaunchMetadata {
+            main_class: "cpw.mods.bootstraplauncher.BootstrapLauncher".to_owned(),
+            classpath_entries: vec![
+                duplicate_library.to_owned(),
+                "C:/cache/libraries/cpw/mods/bootstraplauncher/1.1.2/bootstraplauncher-1.1.2.jar"
+                    .to_owned(),
+            ],
+            jvm_arguments: Vec::new(),
+            game_arguments: Vec::new(),
+        };
+
+        let classpath = minecraft_classpath(&details, &directories, Some(&metadata))
+            .expect("classpath should build");
+        let duplicate_count = classpath_entries(&classpath)
+            .into_iter()
+            .filter(|entry| *entry == duplicate_library)
+            .count();
+
+        assert_eq!(duplicate_count, 1);
+    }
+
+    #[test]
+    fn modloader_classpath_prefers_later_maven_artifact_versions() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let mut details = minecraft_details_fixture();
+        details.libraries.push(MinecraftLibrary {
+            name: "org.apache.logging.log4j:log4j-slf4j2-impl:2.22.1".to_owned(),
+            downloads: MinecraftLibraryDownloads {
+                artifact: Some(MinecraftDownloadArtifact {
+                    path: "org/apache/logging/log4j/log4j-slf4j2-impl/2.22.1/log4j-slf4j2-impl-2.22.1.jar".to_owned(),
+                    sha1: "sha1".to_owned(),
+                    size: 1,
+                    url: "https://libraries.minecraft.net/org/apache/logging/log4j/log4j-slf4j2-impl/2.22.1/log4j-slf4j2-impl-2.22.1.jar".to_owned(),
+                }),
+                classifiers: HashMap::new(),
+            },
+            natives: None,
+            rules: Vec::new(),
+        });
+        let metadata = ModloaderLaunchMetadata {
+            main_class: "cpw.mods.bootstraplauncher.BootstrapLauncher".to_owned(),
+            classpath_entries: vec![
+                "C:/cache/libraries/org/apache/logging/log4j/log4j-slf4j2-impl/2.19.0/log4j-slf4j2-impl-2.19.0.jar"
+                    .to_owned(),
+            ],
+            jvm_arguments: Vec::new(),
+            game_arguments: Vec::new(),
+        };
+
+        let classpath = minecraft_classpath(&details, &directories, Some(&metadata))
+            .expect("classpath should build");
+
+        assert!(!classpath.contains("log4j-slf4j2-impl-2.19.0.jar"));
+        assert!(classpath.contains("log4j-slf4j2-impl-2.22.1.jar"));
+    }
+
+    #[test]
+    fn modloader_classpath_keeps_classified_maven_artifacts() {
+        let mut entries = vec![
+            "C:/cache/libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3.jar".to_owned(),
+            "C:/cache/libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-windows.jar".to_owned(),
+        ];
+
+        deduplicate_classpath_entries(&mut entries);
+
+        assert!(entries
+            .iter()
+            .any(|entry| entry.ends_with("lwjgl-3.3.3.jar")));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.ends_with("lwjgl-3.3.3-natives-windows.jar")));
+    }
+
+    #[test]
+    fn forge_installer_metadata_feeds_dependencies_and_launch_plan() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let version_path = cached_minecraft_version_details_path("1.21.8", &directories)
+            .expect("version path should build");
+        fs::create_dir_all(version_path.parent().expect("version path has parent"))
+            .expect("version dir should create");
+        fs::write(
+            &version_path,
+            serde_json::to_vec_pretty(&minecraft_details_fixture()).expect("fixture serializes"),
+        )
+        .expect("cached version details should write");
+        let installer_path = root
+            .path()
+            .join("cache")
+            .join("modloaders")
+            .join("forge")
+            .join("1.21.8-52.0.1")
+            .join("forge-installer.jar");
+        fs::create_dir_all(installer_path.parent().expect("installer path has parent"))
+            .expect("installer dir should create");
+        write_zip_archive(
+            &installer_path,
+            &[(
+                "version.json",
+                generated_forge_version_json_fixture().as_bytes(),
+            )],
+        );
+        let profile = ProfileSummary {
+            id: "forge-1218".to_owned(),
+            name: "Forge 1.21.8".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let installer_plan = DownloadPlan {
+            version_id: "forge-1218-forge".to_owned(),
+            items: vec![DownloadItem {
+                id: "forge-installer-1.21.8-52.0.1".to_owned(),
+                kind: DownloadKind::ModLoaderInstaller,
+                url: "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1-installer.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&installer_path),
+            }],
+        };
+
+        let extraction = extract_modloader_installer_metadata_for_profile(
+            &profile,
+            &installer_plan,
+            &directories,
+        )
+        .expect("installer metadata should extract")
+        .expect("forge installer should produce metadata operation");
+        assert!(extraction
+            .events
+            .iter()
+            .any(|event| event.message.contains("Cached forge launch metadata")));
+
+        let dependency_plan =
+            build_modloader_dependency_download_plan_for_profile(&profile, &directories)
+                .expect("dependency plan should build")
+                .expect("forge dependencies should exist");
+        assert!(dependency_plan.items.iter().any(|item| {
+            item.url == "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1.jar"
+                && item.destination.ends_with("cache/libraries/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1.jar")
+        }));
+
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let plan = build_launch_plan_for_profile(&profile, &settings, &directories, None, None)
+            .expect("cached Forge launch plan should build");
+
+        assert!(plan
+            .arguments
+            .contains(&"cpw.mods.bootstraplauncher.BootstrapLauncher".to_owned()));
+        assert!(plan.arguments.contains(&"--launchTarget".to_owned()));
+        assert!(plan.arguments.contains(&"forgeclient".to_owned()));
+        assert!(plan
+            .arguments
+            .contains(&"-Dforge.logging.console.level=info".to_owned()));
+        assert!(plan
+            .arguments
+            .iter()
+            .any(|arg| arg.ends_with("cache/libraries") && arg.starts_with("-DlibraryDirectory=")));
+        let classpath_separator = if cfg!(windows) { ";" } else { ":" };
+        assert!(plan.arguments.iter().any(|arg| {
+            arg.starts_with("-DlegacyClassPath=")
+                && arg.contains(&format!("example/example.jar{classpath_separator}"))
+                && arg.ends_with("cache/libraries/other/other.jar")
+                && !arg.contains("${")
+        }));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--fml.mcVersion" && pair[1] == "1.21.8"));
+        let classpath = launch_argument_value(&plan.arguments, "-cp").expect("classpath exists");
+        assert!(classpath.contains(
+            "cache/libraries/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1.jar"
+        ));
+    }
+
+    #[test]
+    fn forge_install_profile_preserves_client_processors_in_cached_metadata() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let installer_path = root
+            .path()
+            .join("cache")
+            .join("modloaders")
+            .join("forge")
+            .join("1.21.8-52.0.1")
+            .join("forge-installer.jar");
+        fs::create_dir_all(installer_path.parent().expect("installer path has parent"))
+            .expect("installer dir should create");
+        write_zip_archive(
+            &installer_path,
+            &[(
+                "install_profile.json",
+                generated_forge_install_profile_json_fixture().as_bytes(),
+            )],
+        );
+        let profile = ProfileSummary {
+            id: "forge-1218".to_owned(),
+            name: "Forge 1.21.8".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let installer_plan = DownloadPlan {
+            version_id: "forge-1218-forge".to_owned(),
+            items: vec![DownloadItem {
+                id: "forge-installer-1.21.8-52.0.1".to_owned(),
+                kind: DownloadKind::ModLoaderInstaller,
+                url: "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1-installer.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&installer_path),
+            }],
+        };
+
+        let extraction = extract_modloader_installer_metadata_for_profile(
+            &profile,
+            &installer_plan,
+            &directories,
+        )
+        .expect("installer metadata should extract")
+        .expect("forge installer should produce metadata operation");
+
+        assert!(extraction.events.iter().any(|event| event
+            .message
+            .contains("Discovered 2 client forge installer processors")));
+        let metadata_path = modloader_metadata_path("forge", "1.21.8", &directories)
+            .expect("metadata path should build");
+        let metadata = fs::read_to_string(metadata_path).expect("metadata should write");
+        let cached = serde_json::from_str::<GeneratedModloaderVersionJson>(&metadata)
+            .expect("metadata parses");
+        assert_eq!(cached.installer_processors.len(), 2);
+        assert!(cached
+            .installer_processors
+            .iter()
+            .any(|processor| processor.jar.as_deref()
+                == Some("net.minecraftforge:installertools:1.4.0")
+                && processor.sides.is_empty()));
+        assert!(cached
+            .installer_processors
+            .iter()
+            .any(|processor| processor.jar.as_deref()
+                == Some("net.minecraftforge:binarypatcher:1.1.1")
+                && processor
+                    .sides
+                    .iter()
+                    .any(|side| side.eq_ignore_ascii_case("client"))));
+        assert!(!cached
+            .installer_processors
+            .iter()
+            .any(|processor| processor.jar.as_deref()
+                == Some("net.minecraftforge:server-only:1.0.0")));
+        let launch_metadata = load_cached_modloader_launch_metadata(&profile, &directories)
+            .expect("cached Forge launch metadata should read")
+            .expect("Forge launch metadata should exist");
+        assert!(!launch_metadata
+            .classpath_entries
+            .iter()
+            .any(|entry| entry.contains("installertools")));
+        assert!(!launch_metadata
+            .classpath_entries
+            .iter()
+            .any(|entry| entry.contains("binarypatcher")));
+        let dependency_plan =
+            build_modloader_dependency_download_plan_for_profile(&profile, &directories)
+                .expect("dependency plan should build")
+                .expect("forge dependencies should exist");
+        assert!(dependency_plan.items.iter().any(|item| {
+            item.url == "https://maven.minecraftforge.net/net/minecraftforge/installertools/1.4.0/installertools-1.4.0.jar"
+                && item.destination.ends_with(
+                    "cache/libraries/net/minecraftforge/installertools/1.4.0/installertools-1.4.0.jar",
+                )
+        }));
+        assert!(dependency_plan.items.iter().any(|item| {
+            item.url == "https://maven.minecraftforge.net/net/minecraftforge/binarypatcher/1.1.1/binarypatcher-1.1.1.jar"
+                && item.destination.ends_with(
+                    "cache/libraries/net/minecraftforge/binarypatcher/1.1.1/binarypatcher-1.1.1.jar",
+                )
+        }));
+        assert!(!dependency_plan.items.iter().any(|item| {
+            item.url.contains("server-only") || item.destination.contains("server-only")
+        }));
+    }
+
+    #[test]
+    fn installer_with_version_json_preserves_top_level_install_profile_libraries() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let installer_path = root
+            .path()
+            .join("cache")
+            .join("modloaders")
+            .join("neoforge")
+            .join("21.1.1")
+            .join("neoforge-installer.jar");
+        fs::create_dir_all(installer_path.parent().expect("installer path has parent"))
+            .expect("installer dir should create");
+        write_zip_archive(
+            &installer_path,
+            &[
+                (
+                    "version.json",
+                    generated_neoforge_version_json_fixture().as_bytes(),
+                ),
+                (
+                    "install_profile.json",
+                    generated_neoforge_install_profile_with_top_level_libraries_fixture()
+                        .as_bytes(),
+                ),
+            ],
+        );
+        let profile = ProfileSummary {
+            id: "neoforge-1211".to_owned(),
+            name: "NeoForge 1.21.1".to_owned(),
+            loader: ModLoader::Neoforge,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let installer_plan = DownloadPlan {
+            version_id: "neoforge-1211-neoforge".to_owned(),
+            items: vec![DownloadItem {
+                id: "neoforge-installer-21.1.1".to_owned(),
+                kind: DownloadKind::ModLoaderInstaller,
+                url: "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.1/neoforge-21.1.1-installer.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&installer_path),
+            }],
+        };
+
+        extract_modloader_installer_metadata_for_profile(&profile, &installer_plan, &directories)
+            .expect("installer metadata should extract")
+            .expect("neoforge installer should produce metadata operation");
+        let metadata_path = modloader_metadata_path("neoforge", "1.21.1", &directories)
+            .expect("metadata path should build");
+        let metadata = fs::read_to_string(metadata_path).expect("metadata should write");
+        let cached = serde_json::from_str::<GeneratedModloaderVersionJson>(&metadata)
+            .expect("metadata parses");
+        assert!(cached
+            .libraries
+            .iter()
+            .any(|library| library.name == "net.neoforged:neoforge:21.1.1:universal"));
+
+        let dependency_plan =
+            build_modloader_dependency_download_plan_for_profile(&profile, &directories)
+                .expect("dependency plan should build")
+                .expect("neoforge dependencies should exist");
+        assert!(dependency_plan.items.iter().any(|item| {
+            item.url == "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar"
+                && item.destination.ends_with(
+                    "cache/libraries/net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar",
+                )
+        }));
+    }
+
+    #[test]
+    fn forge_installer_processor_plan_substitutes_client_arguments() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let installer_path = root
+            .path()
+            .join("cache")
+            .join("modloaders")
+            .join("forge")
+            .join("1.21.8-52.0.1")
+            .join("forge-installer.jar");
+        fs::create_dir_all(installer_path.parent().expect("installer path has parent"))
+            .expect("installer dir should create");
+        write_zip_archive(
+            &installer_path,
+            &[(
+                "install_profile.json",
+                generated_forge_install_profile_json_fixture().as_bytes(),
+            )],
+        );
+        let profile = ProfileSummary {
+            id: "forge-1218".to_owned(),
+            name: "Forge 1.21.8".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let installer_plan = DownloadPlan {
+            version_id: "forge-1218-forge".to_owned(),
+            items: vec![DownloadItem {
+                id: "forge-installer-1.21.8-52.0.1".to_owned(),
+                kind: DownloadKind::ModLoaderInstaller,
+                url: "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1-installer.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&installer_path),
+            }],
+        };
+        extract_modloader_installer_metadata_for_profile(&profile, &installer_plan, &directories)
+            .expect("installer metadata should extract")
+            .expect("forge installer should produce metadata operation");
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+
+        let processors =
+            build_modloader_installer_processor_plan_for_profile(&profile, &settings, &directories)
+                .expect("processor plan should build")
+                .expect("forge processor plan should exist");
+
+        assert_eq!(processors.len(), 2);
+        assert!(processors.iter().all(|processor| !processor
+            .args
+            .iter()
+            .any(|arg| arg.contains('{') || arg.contains('}'))));
+        assert!(processors[0].executable_jar.ends_with(
+            "cache/libraries/net/minecraftforge/installertools/1.4.0/installertools-1.4.0.jar"
+        ));
+        assert!(processors[0]
+            .args
+            .iter()
+            .any(|arg| arg.ends_with("cache/versions/1.21.8/client.jar")));
+        let binary_patcher = &processors[1];
+        assert!(binary_patcher.classpath.iter().any(|entry| entry.ends_with(
+            "cache/libraries/net/minecraftforge/binarypatcher/1.1.1/binarypatcher-1.1.1.jar"
+        )));
+        assert!(binary_patcher.args.iter().any(|arg| {
+            arg.ends_with("cache/modloaders/forge/1.21.8/processor-outputs/binpatched.jar")
+        }));
+        assert_eq!(
+            binary_patcher
+                .expected_outputs
+                .values()
+                .next()
+                .map(String::as_str),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn forge_installer_processor_command_specs_read_cached_jar_main_classes() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let installer_path = root
+            .path()
+            .join("cache")
+            .join("modloaders")
+            .join("forge")
+            .join("1.21.8-52.0.1")
+            .join("forge-installer.jar");
+        fs::create_dir_all(installer_path.parent().expect("installer path has parent"))
+            .expect("installer dir should create");
+        write_zip_archive(
+            &installer_path,
+            &[(
+                "install_profile.json",
+                generated_forge_install_profile_json_fixture().as_bytes(),
+            )],
+        );
+        write_jar_with_main_class(
+            &root.path().join(
+                "cache/libraries/net/minecraftforge/installertools/1.4.0/installertools-1.4.0.jar",
+            ),
+            "net.minecraftforge.installertools.ConsoleTool",
+        );
+        write_jar_with_main_class(
+            &root.path().join(
+                "cache/libraries/net/minecraftforge/binarypatcher/1.1.1/binarypatcher-1.1.1.jar",
+            ),
+            "net.minecraftforge.binarypatcher.ConsoleTool",
+        );
+        let profile = ProfileSummary {
+            id: "forge-1218".to_owned(),
+            name: "Forge 1.21.8".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let installer_plan = DownloadPlan {
+            version_id: "forge-1218-forge".to_owned(),
+            items: vec![DownloadItem {
+                id: "forge-installer-1.21.8-52.0.1".to_owned(),
+                kind: DownloadKind::ModLoaderInstaller,
+                url: "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1-installer.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&installer_path),
+            }],
+        };
+        extract_modloader_installer_metadata_for_profile(&profile, &installer_plan, &directories)
+            .expect("installer metadata should extract")
+            .expect("forge installer should produce metadata operation");
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+
+        let specs = build_modloader_installer_processor_command_specs_for_profile(
+            &profile,
+            &settings,
+            &directories,
+        )
+        .expect("processor command specs should build")
+        .expect("forge processor command specs should exist");
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].args[0], "-cp");
+        assert!(specs[0].args[1].contains("installertools-1.4.0.jar"));
+        assert_eq!(
+            specs[0].args[2],
+            "net.minecraftforge.installertools.ConsoleTool"
+        );
+        assert!(specs[0].args.iter().any(|arg| arg == "--task"));
+        assert_eq!(
+            specs[1].args[2],
+            "net.minecraftforge.binarypatcher.ConsoleTool"
+        );
+        assert!(specs[1].args.iter().any(|arg| {
+            arg.ends_with("cache/modloaders/forge/1.21.8/processor-outputs/binpatched.jar")
+        }));
+        assert_eq!(specs[0].env[0].key, "THEBOYSLAUNCHER_MODLOADER_PROCESSOR");
+    }
+
+    #[test]
+    fn modloader_processor_command_spec_rejects_missing_main_class() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let jar_path = root.path().join("processor.jar");
+        write_zip_archive(
+            &jar_path,
+            &[(
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\r\n".as_slice(),
+            )],
+        );
+        let processor = ModloaderInstallerProcessorPlan {
+            executable: "java".to_owned(),
+            executable_jar: display_path(&jar_path),
+            classpath: vec![display_path(&jar_path)],
+            args: Vec::new(),
+            working_dir: display_path(root.path()),
+            expected_outputs: BTreeMap::new(),
+        };
+
+        let error = build_modloader_installer_processor_command_spec(&processor)
+            .expect_err("missing Main-Class should fail");
+
+        assert!(error.to_string().contains("Main-Class"));
+    }
+
+    #[test]
+    fn modloader_processor_command_spec_rejects_missing_classpath_entries() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let jar_path = root.path().join("processor.jar");
+        let missing_classpath = root.path().join("missing-dependency.jar");
+        write_jar_with_main_class(&jar_path, "example.Processor");
+        let processor = ModloaderInstallerProcessorPlan {
+            executable: "java".to_owned(),
+            executable_jar: display_path(&jar_path),
+            classpath: vec![display_path(&jar_path), display_path(&missing_classpath)],
+            args: Vec::new(),
+            working_dir: display_path(root.path()),
+            expected_outputs: BTreeMap::new(),
+        };
+
+        let error = build_modloader_installer_processor_command_spec(&processor)
+            .expect_err("missing classpath dependency should fail");
+
+        assert!(error
+            .to_string()
+            .contains("modloader processor classpath entry"));
+        assert!(error
+            .to_string()
+            .contains("Install or repair the profile before running installer processors"));
+    }
+
+    #[test]
+    fn modloader_processor_command_spec_accepts_existing_classpath_entries() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let jar_path = root.path().join("processor.jar");
+        let dependency_path = root.path().join("dependency.jar");
+        write_jar_with_main_class(&jar_path, "example.Processor");
+        write_jar_with_main_class(&dependency_path, "example.Dependency");
+        let processor = ModloaderInstallerProcessorPlan {
+            executable: "java".to_owned(),
+            executable_jar: display_path(&jar_path),
+            classpath: vec![display_path(&jar_path), display_path(&dependency_path)],
+            args: Vec::new(),
+            working_dir: display_path(root.path()),
+            expected_outputs: BTreeMap::new(),
+        };
+
+        let spec = build_modloader_installer_processor_command_spec(&processor)
+            .expect("complete classpath should build");
+
+        assert_eq!(spec.args[0], "-cp");
+        assert!(spec.args[1].contains("processor.jar"));
+        assert!(spec.args[1].contains("dependency.jar"));
+        assert_eq!(spec.args[2], "example.Processor");
+    }
+
+    #[test]
+    fn modloader_processor_executor_runs_in_order_and_verifies_outputs() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let first_jar = root.path().join("first.jar");
+        let second_jar = root.path().join("second.jar");
+        write_jar_with_main_class(&first_jar, "example.First");
+        write_jar_with_main_class(&second_jar, "example.Second");
+        let first_output = root.path().join("first-output.jar");
+        let second_output = root.path().join("second-output.jar");
+        let first_bytes = b"first processor output";
+        let second_bytes = b"second processor output";
+        let processors = vec![
+            ModloaderInstallerProcessorPlan {
+                executable: "java".to_owned(),
+                executable_jar: display_path(&first_jar),
+                classpath: vec![display_path(&first_jar)],
+                args: vec!["--first".to_owned()],
+                working_dir: display_path(root.path()),
+                expected_outputs: BTreeMap::from([(
+                    display_path(&first_output),
+                    sha1_hex(first_bytes),
+                )]),
+            },
+            ModloaderInstallerProcessorPlan {
+                executable: "java".to_owned(),
+                executable_jar: display_path(&second_jar),
+                classpath: vec![display_path(&second_jar)],
+                args: vec!["--second".to_owned()],
+                working_dir: display_path(root.path()),
+                expected_outputs: BTreeMap::from([(
+                    display_path(&second_output),
+                    sha1_hex(second_bytes),
+                )]),
+            },
+        ];
+        let mut seen_main_classes = Vec::new();
+
+        let operation = execute_modloader_installer_processor_plans_with_runner(
+            "forge-1218",
+            &processors,
+            |spec| {
+                seen_main_classes.push(spec.args[2].clone());
+                if spec.args[2] == "example.First" {
+                    fs::write(&first_output, first_bytes).expect("first output should write");
+                } else {
+                    fs::write(&second_output, second_bytes).expect("second output should write");
+                }
+                Ok(ProcessCompletion::success())
+            },
+        )
+        .expect("processors should execute");
+
+        assert_eq!(seen_main_classes, vec!["example.First", "example.Second"]);
+        assert_eq!(operation.operation, LauncherOperation::DownloadArtifacts);
+        assert_eq!(operation.subject_id, "forge-1218");
+        assert_eq!(
+            operation.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+        assert!(operation
+            .events
+            .iter()
+            .all(|event| event.operation == Some(LauncherOperation::DownloadArtifacts)));
+    }
+
+    #[test]
+    fn modloader_processor_executor_streams_events_as_processors_run() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let jar_path = root.path().join("processor.jar");
+        write_jar_with_main_class(&jar_path, "example.Processor");
+        let output_path = root.path().join("output.jar");
+        let output_bytes = b"processor output";
+        let processors = vec![ModloaderInstallerProcessorPlan {
+            executable: "java".to_owned(),
+            executable_jar: display_path(&jar_path),
+            classpath: vec![display_path(&jar_path)],
+            args: Vec::new(),
+            working_dir: display_path(root.path()),
+            expected_outputs: BTreeMap::from([(
+                display_path(&output_path),
+                sha1_hex(output_bytes),
+            )]),
+        }];
+        let streamed = std::cell::RefCell::new(Vec::new());
+
+        let operation = execute_modloader_installer_processor_plans_with_runner_and_events(
+            "forge-1218",
+            &processors,
+            |_spec| {
+                assert_eq!(
+                    streamed
+                        .borrow()
+                        .last()
+                        .map(|event: &LauncherEvent| &event.kind),
+                    Some(&LauncherEventKind::Planning)
+                );
+                fs::write(&output_path, output_bytes).expect("output should write");
+                Ok(ProcessCompletion::success())
+            },
+            |event| {
+                streamed.borrow_mut().push(event);
+                Ok(())
+            },
+        )
+        .expect("processors should execute");
+
+        let streamed = streamed.into_inner();
+        assert_eq!(operation.events, streamed);
+        assert_eq!(
+            streamed.iter().map(|event| &event.kind).collect::<Vec<_>>(),
+            vec![
+                &LauncherEventKind::Queued,
+                &LauncherEventKind::Planning,
+                &LauncherEventKind::Verifying,
+                &LauncherEventKind::Completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn modloader_processor_executor_rejects_output_hash_mismatch() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let jar_path = root.path().join("processor.jar");
+        write_jar_with_main_class(&jar_path, "example.Processor");
+        let output_path = root.path().join("output.jar");
+        let processors = vec![ModloaderInstallerProcessorPlan {
+            executable: "java".to_owned(),
+            executable_jar: display_path(&jar_path),
+            classpath: vec![display_path(&jar_path)],
+            args: Vec::new(),
+            working_dir: display_path(root.path()),
+            expected_outputs: BTreeMap::from([(
+                display_path(&output_path),
+                "0000000000000000000000000000000000000000".to_owned(),
+            )]),
+        }];
+
+        let error = execute_modloader_installer_processor_plans_with_runner(
+            "forge-1218",
+            &processors,
+            |_spec| {
+                fs::write(&output_path, b"unexpected bytes").expect("output should write");
+                Ok(ProcessCompletion::success())
+            },
+        )
+        .expect_err("hash mismatch should fail");
+
+        assert!(error.to_string().contains("sha1 mismatch"));
+    }
+
+    #[test]
+    fn modloader_processor_executor_streams_failed_event_before_error() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let jar_path = root.path().join("processor.jar");
+        write_jar_with_main_class(&jar_path, "example.Processor");
+        let processors = vec![ModloaderInstallerProcessorPlan {
+            executable: "java".to_owned(),
+            executable_jar: display_path(&jar_path),
+            classpath: vec![display_path(&jar_path)],
+            args: Vec::new(),
+            working_dir: display_path(root.path()),
+            expected_outputs: BTreeMap::new(),
+        }];
+        let mut streamed = Vec::new();
+
+        let error = execute_modloader_installer_processor_plans_with_runner_and_events(
+            "forge-1218",
+            &processors,
+            |_spec| {
+                Ok(ProcessCompletion::failure(
+                    42,
+                    "processor stdout line",
+                    "processor stderr line",
+                ))
+            },
+            |event| {
+                streamed.push(event);
+                Ok(())
+            },
+        )
+        .expect_err("non-zero exit should fail");
+
+        assert!(error.to_string().contains("exited with code 42"));
+        assert!(error.to_string().contains("processor stderr line"));
+        assert!(error.to_string().contains("processor stdout line"));
+        assert_eq!(
+            streamed.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Failed)
+        );
+        assert_eq!(
+            streamed
+                .last()
+                .and_then(|event| event.subject_id.as_deref()),
+            Some("forge-1218")
+        );
+        let failed_message = streamed
+            .last()
+            .map(|event| event.message.as_str())
+            .unwrap_or_default();
+        assert!(failed_message.contains("exited with code 42"));
+        assert!(failed_message.contains("processor stderr line"));
+        assert!(failed_message.contains("processor stdout line"));
+    }
+
+    #[test]
+    fn modloader_metadata_builds_dependency_download_plan() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "fabric-1218".to_owned(),
+            name: "Fabric 1.21.8".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_modloader_dependency_download_plan_from_metadata(
+            &profile,
+            fabric_loader_metadata_fixture(),
+            &directories,
+        )
+        .expect("dependency plan should build");
+
+        assert_eq!(plan.version_id, "fabric-1218-fabric-dependencies");
+        assert!(plan.items.iter().any(|item| item.id
+            == "modloader-library-net-fabricmc-fabric-loader-0-19-3"
+            && item.kind == DownloadKind::Library
+            && item.url
+                == "https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar"
+            && item.destination
+                == "C:/cache/libraries/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar"));
+        assert!(plan.items.iter().any(|item| {
+            item.url
+            == "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.8/intermediary-1.21.8.jar"
+        }));
+        assert!(plan.items.iter().any(|item| item.url
+            == "https://maven.fabricmc.net/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar"
+            && item.sha1.as_deref() == Some("ada2141c0cc52ee8f5c48cd5fa4ce0e794f22236")
+            && item.sha256.as_deref()
+                == Some("ed825d10ab1399c8c0cb669e688cf0c8c82629b4c8399b58352b68e92ca10fcb")
+            && item.size == Some(126151)));
+    }
+
+    #[test]
+    fn modloader_metadata_accepts_string_main_class() {
+        let metadata = parse_modloader_launch_metadata(
+            &ModLoader::Fabric,
+            r#"[
+              {
+                "loader": { "maven": "net.fabricmc:fabric-loader:0.16.14" },
+                "intermediary": { "maven": "net.fabricmc:intermediary:1.21.1" },
+                "launcherMeta": {
+                  "libraries": { "client": [], "common": [] },
+                  "mainClass": "net.minecraft.launchwrapper.Launch"
+                }
+              }
+            ]"#,
+            "C:/cache",
+        )
+        .expect("string mainClass metadata should parse");
+
+        assert_eq!(metadata.main_class, "net.minecraft.launchwrapper.Launch");
+    }
+
+    #[test]
+    fn direct_pack_file_plan_skips_packwiz_metafiles() {
+        let source = DownloadPlan {
+            version_id: "winterpack".to_owned(),
+            items: vec![
+                DownloadItem {
+                    id: "packwiz-manifest".to_owned(),
+                    kind: DownloadKind::PackFile,
+                    url: "https://packs.example/winterpack/pack.toml".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/data/profiles/winterpack/pack.toml".to_owned(),
+                },
+                DownloadItem {
+                    id: "packwiz-index".to_owned(),
+                    kind: DownloadKind::PackFile,
+                    url: "https://packs.example/winterpack/index.toml".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/data/profiles/winterpack/index.toml".to_owned(),
+                },
+                DownloadItem {
+                    id: "direct-config".to_owned(),
+                    kind: DownloadKind::PackFile,
+                    url: "https://packs.example/winterpack/config/example.toml".to_owned(),
+                    sha1: None,
+                    sha256: Some(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    ),
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/data/profiles/winterpack/config/example.toml".to_owned(),
+                },
+                DownloadItem {
+                    id: "modrinth-metafile".to_owned(),
+                    kind: DownloadKind::PackFile,
+                    url: "https://packs.example/winterpack/mods/example.pw.toml".to_owned(),
+                    sha1: None,
+                    sha256: Some(
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_owned(),
+                    ),
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/data/profiles/winterpack/mods/example.jar".to_owned(),
+                },
+                DownloadItem {
+                    id: "fabric-loader".to_owned(),
+                    kind: DownloadKind::ModLoaderMetadata,
+                    url: "https://meta.fabricmc.net/v2/versions/loader/1.21.8".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/cache/modloaders/fabric-loader/1.21.8/metadata.json"
+                        .to_owned(),
+                },
+            ],
+        };
+
+        let direct = direct_pack_file_download_plan(&source)
+            .expect("direct plan should build")
+            .expect("direct pack files exist");
+
+        assert_eq!(direct.version_id, "winterpack-direct-pack-files");
+        assert_eq!(direct.items.len(), 3);
+        assert!(direct
+            .items
+            .iter()
+            .any(|item| item.id == "packwiz-manifest"));
+        assert!(direct.items.iter().any(|item| item.id == "packwiz-index"));
+        assert!(direct.items.iter().any(|item| item.id == "direct-config"));
+        assert!(!direct
+            .items
+            .iter()
+            .any(|item| item.id == "modrinth-metafile"));
+    }
+
+    #[test]
+    fn packwiz_metafile_resolves_direct_url_download_item() {
+        let metafile_item = DownloadItem {
+            id: "sodium-metafile".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://packs.example/winterpack/mods/sodium.pw.toml".to_owned(),
+            sha1: None,
+            sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: "C:/data/profiles/winterpack/mods/sodium.pw.toml".to_owned(),
+        };
+        let resolved = packwiz_metafile_download_item(
+            &metafile_item,
+            r#"
+name = "Sodium"
+filename = "sodium-fabric.jar"
+side = "client"
+
+[download]
+url = "https://cdn.example/mods/sodium-fabric.jar"
+hash-format = "sha256"
+hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#,
+        )
+        .expect("metafile should resolve")
+        .expect("client metafile should apply");
+
+        assert_eq!(resolved.id, "sodium-resolved");
+        assert_eq!(resolved.kind, DownloadKind::PackFile);
+        assert_eq!(resolved.url, "https://cdn.example/mods/sodium-fabric.jar");
+        assert_eq!(resolved.sha1, None);
+        assert_eq!(
+            resolved.sha256.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            resolved.destination,
+            "C:/data/profiles/winterpack/mods/sodium-fabric.jar"
+        );
+    }
+
+    #[tokio::test]
+    async fn packwiz_metafile_fetch_rejects_index_hash_mismatch() {
+        let metafile_body = r#"
+name = "Sodium"
+filename = "sodium-fabric.jar"
+side = "client"
+
+[download]
+url = "https://cdn.example/mods/sodium-fabric.jar"
+hash-format = "sha256"
+hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#;
+        let (url, request_count) =
+            serve_http_responses(vec![http_response("200 OK", metafile_body)]);
+        let metafile_url = format!("{url}/sodium.pw.toml");
+        let plan = DownloadPlan {
+            version_id: "winterpack".to_owned(),
+            items: vec![DownloadItem {
+                id: "sodium-metafile".to_owned(),
+                kind: DownloadKind::PackFile,
+                url: metafile_url,
+                sha1: None,
+                sha256: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                ),
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: Some(metafile_body.len() as u64),
+                destination: "C:/data/profiles/winterpack/mods/sodium.pw.toml".to_owned(),
+            }],
+        };
+
+        let error = fetch_packwiz_metafile_download_plan(&plan)
+            .await
+            .expect_err("metafile hash mismatch should fail before resolving download metadata");
+
+        assert!(
+            error.to_string().contains("sha256 mismatch"),
+            "expected hash mismatch error, got {error:#}"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn packwiz_metafile_skips_server_only_and_disabled_optional_files() {
+        let metafile_item = DownloadItem {
+            id: "server-only-metafile".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://packs.example/winterpack/mods/server-only.pw.toml".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: "C:/data/profiles/winterpack/mods/server-only.pw.toml".to_owned(),
+        };
+
+        let server_only = packwiz_metafile_download_item(
+            &metafile_item,
+            r#"
+filename = "server-only.jar"
+side = "server"
+
+[download]
+url = "https://cdn.example/mods/server-only.jar"
+hash-format = "sha1"
+hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )
+        .expect("server-only metafile should parse");
+        assert!(server_only.is_none());
+
+        let disabled_optional = packwiz_metafile_download_item(
+            &metafile_item,
+            r#"
+filename = "optional.jar"
+side = "both"
+
+[download]
+url = "https://cdn.example/mods/optional.jar"
+hash-format = "sha1"
+hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[option]
+optional = true
+default = false
+"#,
+        )
+        .expect("optional metafile should parse");
+        assert!(disabled_optional.is_none());
+    }
+
+    #[test]
+    fn packwiz_metafile_rejects_unsafe_filename_and_unsupported_hash() {
+        let metafile_item = DownloadItem {
+            id: "bad-metafile".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://packs.example/winterpack/mods/bad.pw.toml".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: "C:/data/profiles/winterpack/mods/bad.pw.toml".to_owned(),
+        };
+
+        let traversal = packwiz_metafile_download_item(
+            &metafile_item,
+            r#"
+filename = "../bad.jar"
+
+[download]
+url = "https://cdn.example/mods/bad.jar"
+hash-format = "sha256"
+hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#,
+        );
+        assert!(traversal.is_err());
+
+        let unsupported_hash = packwiz_metafile_download_item(
+            &metafile_item,
+            r#"
+filename = "bad.jar"
+
+[download]
+url = "https://cdn.example/mods/bad.jar"
+hash-format = "sha384"
+hash = "1234"
+"#,
+        );
+        assert!(unsupported_hash.is_err());
+    }
+
+    #[test]
+    fn packwiz_metafile_resolves_direct_url_murmur2_download_item() {
+        let metafile_item = DownloadItem {
+            id: "sodium-metafile".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://packs.example/winterpack/mods/sodium.pw.toml".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: "C:/data/profiles/winterpack/mods/sodium.pw.toml".to_owned(),
+        };
+        let metafile = parse_packwiz_metafile_toml(
+            r#"
+name = "Sodium"
+filename = "sodium.jar"
+
+[download]
+url = "https://cdn.example/mods/sodium.jar"
+hash-format = "murmur2"
+hash = "1234567890"
+"#,
+        )
+        .expect("murmur2 metafile should parse");
+
+        let item = packwiz_metafile_direct_download_item(&metafile_item, &metafile)
+            .expect("direct resolver should succeed")
+            .expect("direct resolver should return item");
+
+        assert_eq!(
+            item.destination,
+            "C:/data/profiles/winterpack/mods/sodium.jar"
+        );
+        assert_eq!(item.murmur2.as_deref(), Some("1234567890"));
+        assert!(item.sha1.is_none());
+        assert!(item.sha256.is_none());
+        assert!(item.sha512.is_none());
+        assert!(item.md5.is_none());
+    }
+
+    #[test]
+    fn packwiz_metafile_resolves_modrinth_provider_download_item() {
+        let metafile_item = DownloadItem {
+            id: "iris-metafile".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://packs.example/winterpack/mods/iris.pw.toml".to_owned(),
+            sha1: None,
+            sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: "C:/data/profiles/winterpack/mods/iris.pw.toml".to_owned(),
+        };
+        let metafile = parse_packwiz_metafile_toml(
+            r#"
+name = "Iris"
+filename = "iris-fabric.jar"
+side = "both"
+
+[update.modrinth]
+mod-id = "YL57xq9U"
+version = "abc_123-Version"
+"#,
+        )
+        .expect("provider-only metafile should parse");
+
+        assert!(
+            packwiz_metafile_direct_download_item(&metafile_item, &metafile)
+                .expect("direct resolver should not fail")
+                .is_none()
+        );
+        assert_eq!(
+            modrinth_version_api_url(
+                metafile
+                    .update
+                    .as_ref()
+                    .and_then(|update| update.modrinth.as_ref())
+                    .expect("modrinth metadata")
+                    .version
+                    .as_str()
+            )
+            .expect("version URL should build"),
+            "https://api.modrinth.com/v2/version/abc_123-Version"
+        );
+
+        let resolved = modrinth_version_download_item_from_json(
+            &metafile_item,
+            &metafile,
+            r#"
+{
+  "id": "abc_123-Version",
+  "files": [
+    {
+      "url": "https://cdn.modrinth.com/data/YL57xq9U/versions/abc/iris-fabric-sources.jar",
+      "filename": "iris-fabric-sources.jar",
+      "primary": false,
+      "size": 10,
+      "hashes": { "sha1": "1111111111111111111111111111111111111111" }
+    },
+    {
+      "url": "https://cdn.modrinth.com/data/YL57xq9U/versions/abc/iris-fabric.jar",
+      "filename": "iris-fabric.jar",
+      "primary": true,
+      "size": 12345,
+      "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+    }
+  ]
+}
+"#,
+        )
+        .expect("Modrinth response should resolve")
+        .expect("download item should be produced");
+
+        assert_eq!(resolved.id, "iris-resolved");
+        assert_eq!(resolved.kind, DownloadKind::PackFile);
+        assert_eq!(
+            resolved.url,
+            "https://cdn.modrinth.com/data/YL57xq9U/versions/abc/iris-fabric.jar"
+        );
+        assert_eq!(
+            resolved.sha1.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(resolved.sha256, None);
+        assert_eq!(resolved.size, Some(12345));
+        assert_eq!(
+            resolved.destination,
+            "C:/data/profiles/winterpack/mods/iris-fabric.jar"
+        );
+    }
+
+    #[test]
+    fn packwiz_metafile_resolves_curseforge_provider_download_item() {
+        let metafile_item = DownloadItem {
+            id: "journeymap-metafile".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://packs.example/winterpack/mods/journeymap.pw.toml".to_owned(),
+            sha1: None,
+            sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ),
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: "C:/data/profiles/winterpack/mods/journeymap.pw.toml".to_owned(),
+        };
+        let resolved = packwiz_metafile_download_item(
+            &metafile_item,
+            r#"
+name = "JourneyMap"
+filename = "journeymap.jar"
+side = "both"
+
+[download]
+hash-format = "sha1"
+hash = "cccccccccccccccccccccccccccccccccccccccc"
+mode = "metadata:curseforge"
+
+[update.curseforge]
+project-id = 32274
+file-id = 5622881
+"#,
+        )
+        .expect("CurseForge metafile should resolve")
+        .expect("client metafile should apply");
+
+        assert_eq!(resolved.id, "journeymap-resolved");
+        assert_eq!(resolved.kind, DownloadKind::PackFile);
+        assert_eq!(
+            resolved.url,
+            "https://edge.forgecdn.net/files/5622/881/journeymap.jar"
+        );
+        assert_eq!(
+            resolved.sha1.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccc")
+        );
+        assert_eq!(resolved.sha256, None);
+        assert_eq!(
+            resolved.destination,
+            "C:/data/profiles/winterpack/mods/journeymap.jar"
+        );
+    }
+
+    #[test]
+    fn curseforge_download_url_uses_file_id_path_and_encoded_filename() {
+        let url = curseforge_download_url(930207, 5650506, "noisium-forge-2.3.0+mc1.20-1.20.1.jar")
+            .expect("curseforge URL should build");
+
+        assert_eq!(
+            url,
+            "https://edge.forgecdn.net/files/5650/506/noisium-forge-2.3.0%2Bmc1.20-1.20.1.jar"
+        );
+    }
+
+    #[test]
+    fn packwiz_metafile_rejects_bad_curseforge_metadata() {
+        assert!(parse_packwiz_metafile_toml(
+            r#"
+filename = "bad.jar"
+
+[download]
+hash-format = "sha1"
+hash = "cccccccccccccccccccccccccccccccccccccccc"
+mode = "metadata:curseforge"
+
+[update.curseforge]
+project-id = 0
+file-id = 5622881
+"#,
+        )
+        .is_err());
+
+        assert!(parse_packwiz_metafile_toml(
+            r#"
+filename = "bad.jar"
+
+[update.curseforge]
+project-id = 32274
+file-id = 5622881
+"#,
+        )
+        .is_err());
+
+        assert!(parse_packwiz_metafile_toml(
+            r#"
+filename = "bad.jar"
+
+[download]
+hash-format = "sha1"
+hash = "cccccccccccccccccccccccccccccccccccccccc"
+mode = "metadata:unknown"
+"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn packwiz_metafile_rejects_bad_modrinth_metadata_and_response_hashes() {
+        assert!(parse_packwiz_metafile_toml(
+            r#"
+filename = "bad.jar"
+
+[update.modrinth]
+version = "../escape"
+"#,
+        )
+        .is_err());
+
+        let metafile_item = DownloadItem {
+            id: "bad-modrinth-metafile".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://packs.example/winterpack/mods/bad-modrinth.pw.toml".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: "C:/data/profiles/winterpack/mods/bad-modrinth.pw.toml".to_owned(),
+        };
+        let metafile = parse_packwiz_metafile_toml(
+            r#"
+filename = "bad.jar"
+
+[update.modrinth]
+version = "safeVersion"
+"#,
+        )
+        .expect("safe provider metadata should parse");
+
+        assert!(modrinth_version_download_item_from_json(
+            &metafile_item,
+            &metafile,
+            r#"
+{
+  "id": "safeVersion",
+  "files": [
+    {
+      "url": "https://cdn.modrinth.com/data/example/versions/safe/bad.jar",
+      "filename": "bad.jar",
+      "primary": true,
+      "hashes": { "sha1": "not-a-valid-sha1" }
+    }
+  ]
+}
+"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn vanilla_download_plan_can_cache_version_metadata_json() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let mut plan = build_download_plan(&minecraft_details_fixture(), &directories)
+            .expect("download plan should build");
+        let version = resolve_minecraft_version(&minecraft_manifest_fixture(), Some("1.21.8"))
+            .expect("version resolves");
+
+        prepend_version_json_download_item(&mut plan, &version, &directories)
+            .expect("version metadata item should prepend");
+
+        let item = &plan.items[0];
+        assert_eq!(item.kind, DownloadKind::VersionJson);
+        assert_eq!(item.id, "version-json-1.21.8");
+        assert_eq!(item.url, "https://example.invalid/1.21.8.json");
+        assert_eq!(item.sha1.as_deref(), Some("version-sha"));
+        assert_eq!(item.destination, "C:/cache/versions/1.21.8/1.21.8.json");
+    }
+
+    fn launch_argument_value(arguments: &[String], name: &str) -> Option<String> {
+        arguments
+            .iter()
+            .position(|argument| argument == name)
+            .and_then(|index| arguments.get(index + 1))
+            .cloned()
+    }
+
+    #[test]
+    fn offline_launch_plan_can_include_server_quick_join() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let server = ServerLaunchTarget {
+            name: Some("The Cabin".to_owned()),
+            address: "play.theboys.example".to_owned(),
+            port: Some(25565),
+        };
+
+        let plan = build_offline_launch_plan_with_server(
+            "winterpack",
+            &settings,
+            &directories,
+            Some(&server),
+        )
+        .expect("plan builds");
+
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| { pair[0] == "--server" && pair[1] == "play.theboys.example" }));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--port" && pair[1] == "25565"));
+    }
+
+    #[test]
+    fn explicit_server_quick_join_overrides_profile_default_server() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let server = ServerLaunchTarget {
+            name: Some("Creative".to_owned()),
+            address: "creative.theboys.example".to_owned(),
+            port: Some(25566),
+        };
+        let profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: Some("Yesterday".to_owned()),
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: Some(ServerLaunchTarget {
+                name: Some("The Cabin".to_owned()),
+                address: "play.theboys.example".to_owned(),
+                port: Some(25565),
+            }),
+            java_runtime_override_path: None,
+        };
+
+        let plan =
+            build_launch_plan_for_profile(&profile, &settings, &directories, None, Some(&server))
+                .expect("plan builds");
+
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--server" && pair[1] == "creative.theboys.example"));
+        assert!(!plan
+            .arguments
+            .iter()
+            .any(|argument| argument == "play.theboys.example"));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--port" && pair[1] == "25566"));
+    }
+
+    #[test]
+    fn offline_launch_plan_rejects_invalid_server_targets() {
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let server = ServerLaunchTarget {
+            name: None,
+            address: "bad address".to_owned(),
+            port: Some(25565),
+        };
+
+        assert!(build_offline_launch_plan_with_server(
+            "winterpack",
+            &settings,
+            &directories,
+            Some(&server)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn server_quick_join_rejects_url_like_addresses() {
+        let invalid_addresses = [
+            "https://play.theboys.example",
+            "play.theboys.example/lobby",
+            "play.theboys.example?token=secret",
+            "play.theboys.example#spawn",
+            "player@play.theboys.example",
+            "play.theboys.example%0A--demo",
+            "play.theboys.example\n--demo",
+        ];
+
+        for address in invalid_addresses {
+            let server = ServerLaunchTarget {
+                name: None,
+                address: address.to_owned(),
+                port: Some(25565),
+            };
+
+            assert!(
+                server_launch_arguments(&server).is_err(),
+                "{address} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn server_quick_join_allows_common_host_forms() {
+        let valid_addresses = [
+            "play.theboys.example",
+            "localhost",
+            "127.0.0.1",
+            "mc_server.internal",
+            "[::1]",
+        ];
+
+        for address in valid_addresses {
+            let server = ServerLaunchTarget {
+                name: None,
+                address: address.to_owned(),
+                port: Some(25565),
+            };
+
+            let args = server_launch_arguments(&server).expect("server should be valid");
+            assert_eq!(args[0], "--server");
+            assert_eq!(args[1], address);
+        }
+    }
+
+    #[test]
+    fn profile_default_server_rejects_url_like_addresses() {
+        let mut profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: Some(ServerLaunchTarget {
+                name: Some("Bad".to_owned()),
+                address: "https://play.theboys.example".to_owned(),
+                port: Some(25565),
+            }),
+            java_runtime_override_path: None,
+        };
+
+        assert!(validate_profiles(std::slice::from_ref(&profile)).is_err());
+
+        profile.default_server = Some(ServerLaunchTarget {
+            name: Some("Good".to_owned()),
+            address: "play.theboys.example".to_owned(),
+            port: Some(25565),
+        });
+        validate_profiles(std::slice::from_ref(&profile)).expect("valid profile should pass");
+    }
+
+    #[test]
+    fn authenticated_launch_plan_uses_session_identity_and_token() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let session = MinecraftSession {
+            username: "Builder".to_owned(),
+            uuid: Uuid::parse_str("12345678-1234-5678-1234-567812345678").expect("uuid fixture"),
+            access_token: "token-123".to_owned(),
+        };
+
+        let plan =
+            build_authenticated_launch_plan("winterpack", &settings, &directories, &session, None)
+                .expect("plan builds");
+
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--username" && pair[1] == "Builder"));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| { pair[0] == "--uuid" && pair[1] == "12345678123456781234567812345678" }));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--accessToken" && pair[1] == "token-123"));
+        assert_eq!(plan.offline_username, "Builder");
+    }
+
+    #[test]
+    fn authenticated_launch_plan_rejects_invalid_session() {
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let session = MinecraftSession {
+            username: "bad name".to_owned(),
+            uuid: Uuid::nil(),
+            access_token: String::new(),
+        };
+
+        assert!(build_authenticated_launch_plan(
+            "winterpack",
+            &settings,
+            &directories,
+            &session,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stored_minecraft_session_round_trips_to_json() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-123".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+
+        let saved =
+            save_minecraft_session_to_path(&path, session.clone()).expect("session should save");
+        let loaded = load_minecraft_session_from_path(&path)
+            .expect("session should load")
+            .expect("session should exist");
+
+        assert_eq!(saved, session);
+        assert_eq!(loaded, session);
+
+        clear_minecraft_session_at_path(&path).expect("session should clear");
+        assert!(load_minecraft_session_from_path(&path)
+            .expect("session load should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn stored_minecraft_accounts_can_save_list_and_switch_active_session() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let session_path = root.path().join("minecraft-session.json");
+        let accounts_path = root.path().join("minecraft-accounts.json");
+        let first = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "BuilderOne".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-1".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+        let second = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "BuilderTwo".to_owned(),
+                uuid: Uuid::parse_str("22345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-2".to_owned(),
+            },
+            account_id: Some("account-2".to_owned()),
+            expires_at_unix_seconds: Some(3_000),
+            microsoft_refresh_token: Some("refresh-token-2".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-2".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+
+        save_minecraft_session_to_paths(&session_path, &accounts_path, first.clone())
+            .expect("first session should save");
+        save_minecraft_session_to_paths(&session_path, &accounts_path, second.clone())
+            .expect("second session should save");
+
+        let accounts = list_minecraft_accounts_from_paths(&session_path, &accounts_path)
+            .expect("accounts should list");
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts
+            .iter()
+            .any(|account| account.account_id == "account-1" && !account.active));
+        assert!(accounts
+            .iter()
+            .any(|account| account.account_id == "account-2" && account.active));
+        assert_eq!(
+            load_active_minecraft_session_from_paths(&session_path, &accounts_path)
+                .expect("active should load")
+                .expect("active should exist")
+                .session
+                .username,
+            "BuilderTwo"
+        );
+
+        let selected =
+            select_minecraft_account_at_paths(&session_path, &accounts_path, "account-1")
+                .expect("account should select");
+        assert_eq!(selected.session.username, "BuilderOne");
+        assert_eq!(
+            load_minecraft_session_from_path(&session_path)
+                .expect("legacy active should load")
+                .expect("legacy active should exist")
+                .session
+                .username,
+            "BuilderOne"
+        );
+    }
+
+    #[test]
+    fn stored_minecraft_account_removal_preserves_or_switches_active_account() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let session_path = root.path().join("minecraft-session.json");
+        let accounts_path = root.path().join("minecraft-accounts.json");
+        let first = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "BuilderOne".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-1".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+        let second = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "BuilderTwo".to_owned(),
+                uuid: Uuid::parse_str("22345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-2".to_owned(),
+            },
+            account_id: Some("account-2".to_owned()),
+            expires_at_unix_seconds: Some(3_000),
+            microsoft_refresh_token: Some("refresh-token-2".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-2".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+
+        save_minecraft_session_to_paths(&session_path, &accounts_path, first.clone())
+            .expect("first session should save");
+        save_minecraft_session_to_paths(&session_path, &accounts_path, second.clone())
+            .expect("second session should save");
+
+        let active_after_inactive_remove =
+            remove_minecraft_account_at_paths(&session_path, &accounts_path, "account-1")
+                .expect("inactive account should remove")
+                .expect("active session should remain");
+        assert_eq!(active_after_inactive_remove.session.username, "BuilderTwo");
+        let accounts = list_minecraft_accounts_from_paths(&session_path, &accounts_path)
+            .expect("accounts should list");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, "account-2");
+        assert!(accounts[0].active);
+
+        let active_after_active_remove =
+            remove_minecraft_account_at_paths(&session_path, &accounts_path, "account-2")
+                .expect("active account should remove");
+        assert!(active_after_active_remove.is_none());
+        assert!(load_minecraft_session_from_path(&session_path)
+            .expect("legacy active should load")
+            .is_none());
+        assert!(
+            list_minecraft_accounts_from_paths(&session_path, &accounts_path)
+                .expect("accounts should list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stored_minecraft_accounts_fall_back_to_legacy_session_file() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let session_path = root.path().join("minecraft-session.json");
+        let accounts_path = root.path().join("minecraft-accounts.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Legacy".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-legacy".to_owned(),
+            },
+            account_id: Some("legacy-account".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: None,
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-legacy".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+        save_minecraft_session_to_path(&session_path, session.clone())
+            .expect("legacy session should save");
+
+        let active = load_active_minecraft_session_from_paths(&session_path, &accounts_path)
+            .expect("active should load")
+            .expect("legacy active should exist");
+        let accounts = list_minecraft_accounts_from_paths(&session_path, &accounts_path)
+            .expect("accounts should list");
+
+        assert_eq!(active, session);
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, "legacy-account");
+        assert!(accounts[0].active);
+    }
+
+    #[test]
+    fn stored_minecraft_session_loads_legacy_plaintext_refresh_token() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-123".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&session).expect("session should serialize"),
+        )
+        .expect("legacy session should write");
+
+        let loaded = load_minecraft_session_from_path(&path)
+            .expect("legacy session should load")
+            .expect("legacy session should exist");
+
+        assert_eq!(loaded, session);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_refresh_token_round_trips_on_windows() {
+        let protected = protect_stored_secret("refresh-token-1")
+            .expect("refresh token should be protected with DPAPI");
+        assert!(protected.starts_with("dpapi:v1:"));
+        assert_ne!(protected, "refresh-token-1");
+        let payload = stored_secret_protected_payload(&protected)
+            .expect("protected token should have payload");
+
+        assert_eq!(
+            unprotect_stored_secret(payload).expect("refresh token should unprotect"),
+            "refresh-token-1"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stored_minecraft_session_refresh_token_is_dpapi_protected_on_windows() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-123".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+
+        let saved =
+            save_minecraft_session_to_path(&path, session.clone()).expect("session should save");
+        let raw = fs::read_to_string(&path).expect("session file should read");
+        let persisted =
+            serde_json::from_str::<StoredMinecraftSession>(&raw).expect("session should parse");
+        let protected = persisted
+            .microsoft_refresh_token
+            .as_deref()
+            .expect("refresh token should persist");
+        let loaded = load_minecraft_session_from_path(&path)
+            .expect("session should load")
+            .expect("session should exist");
+
+        assert_eq!(
+            saved.microsoft_refresh_token.as_deref(),
+            Some("refresh-token-1")
+        );
+        assert!(!raw.contains("refresh-token-1"));
+        assert!(protected.starts_with("dpapi:v1:"));
+        assert_ne!(protected, "refresh-token-1");
+        assert_eq!(loaded, session);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stored_minecraft_session_access_token_is_dpapi_protected_on_windows() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "minecraft-access-token-1".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: None,
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+
+        save_minecraft_session_to_path(&path, session.clone()).expect("session should save");
+        let raw = fs::read_to_string(&path).expect("session file should read");
+        let persisted =
+            serde_json::from_str::<StoredMinecraftSession>(&raw).expect("session should parse");
+        let loaded = load_minecraft_session_from_path(&path)
+            .expect("session should load")
+            .expect("session should exist");
+
+        assert!(!raw.contains("minecraft-access-token-1"));
+        assert!(persisted.session.access_token.starts_with("dpapi:v1:"));
+        assert_ne!(persisted.session.access_token, "minecraft-access-token-1");
+        assert_eq!(loaded, session);
+    }
+
+    #[test]
+    fn stored_minecraft_session_save_replaces_existing_file_without_temp_artifacts() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let first = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-123".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+        let mut second = first.clone();
+        second.session.access_token = "token-456".to_owned();
+        second.microsoft_refresh_token = Some("refresh-token-2".to_owned());
+        second.stored_at_unix_seconds = 1_100;
+
+        save_minecraft_session_to_path(&path, first).expect("first session should save");
+        save_minecraft_session_to_path(&path, second.clone()).expect("second session should save");
+
+        let loaded = load_minecraft_session_from_path(&path)
+            .expect("session should load")
+            .expect("session should exist");
+        assert_eq!(loaded, second);
+        let temp_artifacts = fs::read_dir(root.path())
+            .expect("temp dir should read")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.ends_with(".tmp"))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            temp_artifacts.is_empty(),
+            "session temp files should be cleaned up"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_minecraft_session_file_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-123".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+
+        save_minecraft_session_to_path(&path, session).expect("session should save");
+
+        let mode = fs::metadata(&path)
+            .expect("session metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn stored_minecraft_session_validation_rejects_bad_sessions() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "bad name".to_owned(),
+                uuid: Uuid::nil(),
+                access_token: String::new(),
+            },
+            account_id: Some("bad account".to_owned()),
+            expires_at_unix_seconds: Some(900),
+            microsoft_refresh_token: None,
+            microsoft_client_id: None,
+            microsoft_user_id: None,
+            microsoft_scopes: None,
+            stored_at_unix_seconds: 1_000,
+        };
+
+        assert!(save_minecraft_session_to_path(&path, session).is_err());
+    }
+
+    #[test]
+    fn stored_authenticated_launch_plan_uses_persisted_session_identity() {
+        let _java = JavaRuntimeDiscoveryGuard::java_21();
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let now = current_unix_seconds();
+        let stored_session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-123".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(now + 3600),
+            microsoft_refresh_token: None,
+            microsoft_client_id: None,
+            microsoft_user_id: None,
+            microsoft_scopes: None,
+            stored_at_unix_seconds: now,
+        };
+
+        let plan = build_stored_authenticated_launch_plan(
+            "winterpack",
+            &settings,
+            &directories,
+            &stored_session,
+            None,
+        )
+        .expect("stored session launch should build");
+
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--username" && pair[1] == "Builder"));
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--accessToken" && pair[1] == "token-123"));
+    }
+
+    #[test]
+    fn stored_authenticated_launch_plan_rejects_expired_session() {
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let now = current_unix_seconds();
+        let stored_session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-123".to_owned(),
+            },
+            account_id: None,
+            expires_at_unix_seconds: Some(now.saturating_sub(1)),
+            microsoft_refresh_token: None,
+            microsoft_client_id: None,
+            microsoft_user_id: None,
+            microsoft_scopes: None,
+            stored_at_unix_seconds: now.saturating_sub(3600),
+        };
+
+        assert!(build_stored_authenticated_launch_plan(
+            "winterpack",
+            &settings,
+            &directories,
+            &stored_session,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn microsoft_auth_flow_builds_authorization_url() {
+        let flow = build_microsoft_auth_start(
+            "client-123",
+            "http://localhost:53682/",
+            &["XboxLive.signin", "offline_access"],
+            "state-abc",
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_",
+        );
+
+        assert_eq!(flow.client_id, "client-123");
+        assert_eq!(flow.state, "state-abc");
+        assert_eq!(
+            flow.code_verifier,
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        );
+        assert_eq!(
+            flow.code_challenge,
+            pkce_code_challenge(&flow.code_verifier)
+        );
+        assert_eq!(flow.scopes, vec!["XboxLive.signin", "offline_access"]);
+        assert!(flow
+            .auth_url
+            .starts_with("https://login.live.com/oauth20_authorize.srf?"));
+        assert!(flow.auth_url.contains("client_id=client-123"));
+        assert!(flow.auth_url.contains("response_type=code"));
+        assert!(flow
+            .auth_url
+            .contains("redirect_uri=http%3A%2F%2Flocalhost%3A53682%2F"));
+        assert!(flow
+            .auth_url
+            .contains("scope=XboxLive.signin%20offline_access"));
+        assert!(flow.auth_url.contains("state=state-abc"));
+        assert!(flow.auth_url.contains("code_challenge="));
+        assert!(flow.auth_url.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn microsoft_auth_flow_rejects_missing_or_unsupported_client_ids() {
+        assert!(start_microsoft_auth_flow(" ").is_err());
+        assert!(start_microsoft_auth_flow("client id").is_err());
+    }
+
+    #[test]
+    fn microsoft_callback_builds_token_exchange_plan() {
+        let plan = plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?code=abc%20123&state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                .to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .expect("callback should plan token exchange");
+
+        assert_eq!(plan.token_url, "https://login.live.com/oauth20_token.srf");
+        assert_eq!(plan.method, "POST");
+        assert_eq!(plan.client_id, "client-123");
+        assert_eq!(plan.redirect_uri, MICROSOFT_REDIRECT_URI);
+        assert_eq!(plan.code, "abc 123");
+        assert_eq!(
+            plan.code_verifier,
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        );
+        assert_eq!(
+            plan.form_fields
+                .iter()
+                .find(|field| field.key == "grant_type")
+                .map(|field| field.value.as_str()),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            plan.form_fields
+                .iter()
+                .find(|field| field.key == "code_verifier")
+                .map(|field| field.value.as_str()),
+            Some("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        );
+        assert_eq!(
+            plan.form_fields
+                .iter()
+                .find(|field| field.key == "scope")
+                .map(|field| field.value.as_str()),
+            Some("XboxLive.signin offline_access")
+        );
+    }
+
+    #[test]
+    fn microsoft_callback_rejects_unconfigured_redirect_uri() {
+        let code_verifier =
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_".to_owned();
+        let cases = [
+            "https://localhost:53682/auth/microsoft/callback?code=abc&state=state-abc",
+            "http://127.0.0.1:53682/?code=abc&state=state-abc",
+            "http://localhost:53683/?code=abc&state=state-abc",
+            "http://localhost:53682/other?code=abc&state=state-abc",
+        ];
+
+        for callback_url in cases {
+            let error = plan_microsoft_token_exchange(MicrosoftAuthCallback {
+                callback_url: callback_url.to_owned(),
+                expected_state: "state-abc".to_owned(),
+                code_verifier: code_verifier.clone(),
+                client_id: "client-123".to_owned(),
+            })
+            .expect_err("unconfigured redirect URI should be rejected");
+
+            assert!(error.to_string().contains("configured redirect URI"));
+        }
+    }
+
+    #[test]
+    fn microsoft_callback_rejects_duplicate_sensitive_query_params() {
+        let code_verifier =
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_".to_owned();
+        let cases = [
+            (
+                "http://localhost:53682/?code=abc&code=def&state=state-abc",
+                "duplicate code",
+            ),
+            (
+                "http://localhost:53682/?code=abc&state=state-abc&state=other",
+                "duplicate state",
+            ),
+            (
+                "http://localhost:53682/?error=access_denied&error=server_error&state=state-abc",
+                "duplicate error",
+            ),
+            (
+                "http://localhost:53682/?error=access_denied&error_description=one&error_description=two&state=state-abc",
+                "duplicate error_description",
+            ),
+        ];
+
+        for (callback_url, expected_message) in cases {
+            let error = plan_microsoft_token_exchange(MicrosoftAuthCallback {
+                callback_url: callback_url.to_owned(),
+                expected_state: "state-abc".to_owned(),
+                code_verifier: code_verifier.clone(),
+                client_id: "client-123".to_owned(),
+            })
+            .expect_err("duplicate sensitive OAuth params should be rejected");
+
+            assert!(
+                error.to_string().contains(expected_message),
+                "{expected_message} should appear in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn microsoft_callback_rejects_control_character_codes() {
+        let error = plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?code=abc%0Adef&state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                .to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .expect_err("control character OAuth code should be rejected");
+
+        assert!(error.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn microsoft_token_exchange_form_preserves_planned_fields() {
+        let plan = plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?code=abc&state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                .to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .expect("token exchange plan should build");
+
+        validate_microsoft_token_exchange_plan(&plan).expect("plan should validate");
+        let form = microsoft_token_exchange_form(&plan);
+
+        assert!(form
+            .iter()
+            .any(|(key, value)| key == "grant_type" && value == "authorization_code"));
+        assert!(form.iter().any(|(key, value)| key == "code_verifier"
+            && value == "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"));
+    }
+
+    #[test]
+    fn microsoft_token_exchange_plan_rejects_conflicting_renderer_form_fields() {
+        let plan = plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?code=abc&state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                .to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .expect("token exchange plan should build");
+
+        let mut duplicate_code = plan.clone();
+        duplicate_code.form_fields.push(MicrosoftTokenFormField {
+            key: "code".to_owned(),
+            value: "attacker-code".to_owned(),
+        });
+        assert!(validate_microsoft_token_exchange_plan(&duplicate_code)
+            .expect_err("duplicate code should be rejected")
+            .to_string()
+            .contains("duplicate code"));
+
+        let mut mismatched_verifier = plan.clone();
+        mismatched_verifier
+            .form_fields
+            .iter_mut()
+            .find(|field| field.key == "code_verifier")
+            .expect("code_verifier field should exist")
+            .value = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-~".to_owned();
+        assert!(validate_microsoft_token_exchange_plan(&mismatched_verifier)
+            .expect_err("mismatched verifier should be rejected")
+            .to_string()
+            .contains("code_verifier does not match"));
+
+        let mut unsupported_field = plan.clone();
+        unsupported_field.form_fields.push(MicrosoftTokenFormField {
+            key: "client_secret".to_owned(),
+            value: "not-for-public-clients".to_owned(),
+        });
+        assert!(validate_microsoft_token_exchange_plan(&unsupported_field)
+            .expect_err("unsupported form field should be rejected")
+            .to_string()
+            .contains("unsupported client_secret field"));
+
+        let mut mismatched_scope = plan.clone();
+        mismatched_scope.scopes = vec!["XboxLive.signin".to_owned()];
+        assert!(validate_microsoft_token_exchange_plan(&mismatched_scope)
+            .expect_err("mismatched top-level scopes should be rejected")
+            .to_string()
+            .contains("scopes are not supported"));
+    }
+
+    #[test]
+    fn microsoft_token_exchange_plan_rejects_malformed_renderer_codes() {
+        let plan = plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?code=abc&state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                .to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .expect("token exchange plan should build");
+
+        let mut control_code = plan.clone();
+        control_code.code = "abc\n123".to_owned();
+        assert!(validate_microsoft_token_exchange_plan(&control_code)
+            .expect_err("control code should be rejected")
+            .to_string()
+            .contains("control characters"));
+
+        let mut oversized_code = plan;
+        oversized_code.code = "a".repeat(4097);
+        assert!(validate_microsoft_token_exchange_plan(&oversized_code)
+            .expect_err("oversized code should be rejected")
+            .to_string()
+            .contains("too large"));
+    }
+
+    #[test]
+    fn microsoft_token_response_parses_success() {
+        let tokens = parse_microsoft_token_response(
+            200,
+            r#"{
+              "token_type": "bearer",
+              "expires_in": 3600,
+              "scope": "XboxLive.signin offline_access",
+              "access_token": "ms-access",
+              "refresh_token": "ms-refresh",
+              "user_id": "user-123"
+            }"#,
+        )
+        .expect("token response should parse");
+
+        assert_eq!(tokens.token_type, "bearer");
+        assert_eq!(tokens.expires_in, 3600);
+        assert_eq!(
+            tokens.scope.as_deref(),
+            Some("XboxLive.signin offline_access")
+        );
+        assert_eq!(tokens.access_token, "ms-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("ms-refresh"));
+        assert_eq!(tokens.user_id.as_deref(), Some("user-123"));
+        assert_eq!(tokens.client_id, None);
+    }
+
+    #[test]
+    fn microsoft_refresh_token_form_uses_stored_client_and_refresh_token() {
+        let form = microsoft_refresh_token_form(
+            "client-123",
+            "refresh-token-123",
+            Some("offline_access XboxLive.signin"),
+        )
+        .expect("refresh form should build");
+
+        assert!(form
+            .iter()
+            .any(|(key, value)| key == "client_id" && value == "client-123"));
+        assert!(form
+            .iter()
+            .any(|(key, value)| key == "grant_type" && value == "refresh_token"));
+        assert!(form
+            .iter()
+            .any(|(key, value)| key == "refresh_token" && value == "refresh-token-123"));
+        assert!(form
+            .iter()
+            .any(|(key, value)| { key == "scope" && value == "XboxLive.signin offline_access" }));
+    }
+
+    #[test]
+    fn microsoft_refresh_token_form_rejects_unsupported_scopes() {
+        for (scope, expected_message) in [
+            ("XboxLive.signin offline_access profile", "not supported"),
+            (
+                "XboxLive.signin XboxLive.signin offline_access",
+                "duplicates",
+            ),
+            ("XboxLive.signin", "not supported"),
+        ] {
+            assert!(
+                microsoft_refresh_token_form("client-123", "refresh-token-123", Some(scope))
+                    .expect_err("unsupported refresh scopes should be rejected")
+                    .to_string()
+                    .contains(expected_message),
+                "scope {scope} should fail with {expected_message}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_http_client_times_out_slow_auth_endpoints() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should expose local address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            thread::sleep(Duration::from_millis(250));
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        });
+
+        let client = auth_http_client_with_timeout(Duration::from_millis(50))
+            .expect("auth client should build");
+        let error = client
+            .get(format!("http://{address}/auth"))
+            .send()
+            .await
+            .expect_err("slow auth endpoint should time out");
+        server.join().expect("test server should finish");
+
+        assert!(error.is_timeout(), "expected timeout error, got {error}");
+    }
+
+    #[tokio::test]
+    async fn metadata_http_client_times_out_slow_metadata_endpoints() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should expose local address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test server should accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            thread::sleep(Duration::from_millis(250));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nversion='1'",
+            );
+        });
+
+        let client = metadata_http_client_with_timeout(Duration::from_millis(50))
+            .expect("metadata client should build");
+        let error = client
+            .get(format!("http://{address}/pack.toml"))
+            .send()
+            .await
+            .expect_err("slow metadata endpoint should time out");
+        server.join().expect("test server should finish");
+
+        assert!(error.is_timeout(), "expected timeout error, got {error}");
+    }
+
+    #[test]
+    fn stored_session_preserves_microsoft_refresh_metadata() {
+        let token = MinecraftServicesToken {
+            token_type: "Bearer".to_owned(),
+            expires_in: 86_400,
+            access_token: "mc-access".to_owned(),
+            username: Some("auth-uuid".to_owned()),
+        };
+        let entitlements = MinecraftEntitlements {
+            owns_minecraft: true,
+            items: vec![MinecraftEntitlementItem {
+                name: "game_minecraft".to_owned(),
+                signature: None,
+            }],
+        };
+        let profile = MinecraftProfile {
+            id: Uuid::parse_str("12345678-1234-5678-9234-567812345678").expect("uuid fixture"),
+            name: "Builder".to_owned(),
+        };
+        let microsoft_tokens = MicrosoftOAuthTokens {
+            token_type: "bearer".to_owned(),
+            expires_in: 3600,
+            scope: Some("XboxLive.signin offline_access".to_owned()),
+            access_token: "ms-access".to_owned(),
+            refresh_token: Some("ms-refresh".to_owned()),
+            client_id: Some("client-123".to_owned()),
+            user_id: Some("user-123".to_owned()),
+        };
+
+        let session =
+            build_stored_minecraft_session_from_auth(&token, &entitlements, &profile, 1_000)
+                .map(|session| {
+                    stored_session_with_microsoft_refresh_metadata(session, &microsoft_tokens)
+                })
+                .expect("session should build");
+
+        assert_eq!(
+            session.microsoft_refresh_token.as_deref(),
+            Some("ms-refresh")
+        );
+        assert_eq!(session.microsoft_client_id.as_deref(), Some("client-123"));
+        assert_eq!(session.microsoft_user_id.as_deref(), Some("user-123"));
+        assert_eq!(
+            session.microsoft_scopes.as_deref(),
+            Some("XboxLive.signin offline_access")
+        );
+        validate_stored_minecraft_session(&session).expect("session should validate");
+    }
+
+    #[test]
+    fn stored_session_refresh_metadata_merge_keeps_existing_optional_fields() {
+        let existing = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "Builder".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "mc-access".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("old-refresh".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("user-123".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+        let tokens = MicrosoftOAuthTokens {
+            token_type: "bearer".to_owned(),
+            expires_in: 3600,
+            scope: None,
+            access_token: "ms-access".to_owned(),
+            refresh_token: Some("new-refresh".to_owned()),
+            client_id: Some("client-456".to_owned()),
+            user_id: None,
+        };
+
+        let merged = stored_session_with_microsoft_refresh_metadata(existing, &tokens);
+
+        assert_eq!(
+            merged.microsoft_refresh_token.as_deref(),
+            Some("new-refresh")
+        );
+        assert_eq!(merged.microsoft_client_id.as_deref(), Some("client-456"));
+        assert_eq!(merged.microsoft_user_id.as_deref(), Some("user-123"));
+        assert_eq!(
+            merged.microsoft_scopes.as_deref(),
+            Some("XboxLive.signin offline_access")
+        );
+    }
+
+    #[test]
+    fn microsoft_token_response_rejects_error_body() {
+        let error = parse_microsoft_token_response(
+            400,
+            r#"{
+              "error": "invalid_grant",
+              "error_description": "The provided authorization code is invalid."
+            }"#,
+        )
+        .expect_err("error body should be rejected");
+
+        assert!(error.to_string().contains("invalid_grant"));
+    }
+
+    #[test]
+    fn microsoft_token_response_rejects_missing_access_token() {
+        assert!(parse_microsoft_token_response(
+            200,
+            r#"{
+              "token_type": "bearer",
+              "expires_in": 3600,
+              "access_token": ""
+            }"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn xbox_live_auth_payload_uses_rps_ticket() {
+        let payload = serde_json::to_value(xbox_live_auth_payload("ms-access"))
+            .expect("payload should serialize");
+
+        assert_eq!(payload["Properties"]["AuthMethod"], "RPS");
+        assert_eq!(payload["Properties"]["SiteName"], "user.auth.xboxlive.com");
+        assert_eq!(payload["Properties"]["RpsTicket"], "d=ms-access");
+        assert_eq!(payload["RelyingParty"], "http://auth.xboxlive.com");
+        assert_eq!(payload["TokenType"], "JWT");
+    }
+
+    #[test]
+    fn xsts_authorize_payload_targets_minecraft_services() {
+        let payload = serde_json::to_value(xsts_authorize_payload("xbl-token"))
+            .expect("payload should serialize");
+
+        assert_eq!(payload["Properties"]["SandboxId"], "RETAIL");
+        assert_eq!(payload["Properties"]["UserTokens"][0], "xbl-token");
+        assert_eq!(payload["RelyingParty"], "rp://api.minecraftservices.com/");
+        assert_eq!(payload["TokenType"], "JWT");
+    }
+
+    #[test]
+    fn minecraft_login_payload_uses_xbl_identity_token_format() {
+        let token = XboxLiveAuthToken {
+            token: "xsts-token".to_owned(),
+            user_hash: "userhash".to_owned(),
+            expires_at: None,
+        };
+        let payload = serde_json::to_value(minecraft_login_with_xbox_payload(&token))
+            .expect("payload should serialize");
+
+        assert_eq!(payload["identityToken"], "XBL3.0 x=userhash;xsts-token");
+    }
+
+    #[test]
+    fn xbox_live_token_response_parses_user_hash() {
+        let token = parse_xbox_live_token_response(
+            200,
+            r#"{
+              "IssueInstant": "2026-06-25T12:00:00Z",
+              "NotAfter": "2026-06-26T12:00:00Z",
+              "Token": "xbl-token",
+              "DisplayClaims": {
+                "xui": [{ "uhs": "userhash" }]
+              }
+            }"#,
+        )
+        .expect("Xbox token response should parse");
+
+        assert_eq!(token.token, "xbl-token");
+        assert_eq!(token.user_hash, "userhash");
+        assert_eq!(token.expires_at.as_deref(), Some("2026-06-26T12:00:00Z"));
+    }
+
+    #[test]
+    fn xbox_live_token_response_rejects_missing_user_hash() {
+        assert!(parse_xbox_live_token_response(
+            200,
+            r#"{
+              "Token": "xbl-token",
+              "DisplayClaims": { "xui": [] }
+            }"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn minecraft_services_token_response_parses_success() {
+        let token = parse_minecraft_services_token_response(
+            200,
+            r#"{
+              "username": "auth-uuid",
+              "roles": [],
+              "access_token": "mc-access",
+              "token_type": "Bearer",
+              "expires_in": 86400
+            }"#,
+        )
+        .expect("Minecraft Services token should parse");
+
+        assert_eq!(token.token_type, "Bearer");
+        assert_eq!(token.access_token, "mc-access");
+        assert_eq!(token.expires_in, 86400);
+        assert_eq!(token.username.as_deref(), Some("auth-uuid"));
+    }
+
+    #[test]
+    fn minecraft_entitlements_response_detects_ownership() {
+        let entitlements = parse_minecraft_entitlements_response(
+            200,
+            r#"{
+              "items": [
+                { "name": "product_minecraft", "signature": "abc" },
+                { "name": "game_minecraft", "signature": "def" }
+              ],
+              "signature": "root",
+              "keyId": "1"
+            }"#,
+        )
+        .expect("entitlements should parse");
+
+        assert!(entitlements.owns_minecraft);
+        assert_eq!(entitlements.items.len(), 2);
+    }
+
+    #[test]
+    fn minecraft_profile_response_parses_simple_uuid() {
+        let profile = parse_minecraft_profile_response(
+            200,
+            r#"{
+              "id": "12345678123456789234567812345678",
+              "name": "Builder"
+            }"#,
+        )
+        .expect("profile should parse");
+
+        assert_eq!(profile.name, "Builder");
+        assert_eq!(
+            profile.id,
+            Uuid::parse_str("12345678-1234-5678-9234-567812345678").expect("uuid fixture")
+        );
+    }
+
+    #[test]
+    fn minecraft_profile_response_rejects_invalid_names() {
+        assert!(parse_minecraft_profile_response(
+            200,
+            r#"{
+              "id": "12345678123456789234567812345678",
+              "name": "bad name"
+            }"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stored_minecraft_session_builds_from_authenticated_profile() {
+        let token = MinecraftServicesToken {
+            token_type: "Bearer".to_owned(),
+            expires_in: 86_400,
+            access_token: "mc-access".to_owned(),
+            username: Some("auth-account-id".to_owned()),
+        };
+        let entitlements = MinecraftEntitlements {
+            owns_minecraft: true,
+            items: vec![MinecraftEntitlementItem {
+                name: "game_minecraft".to_owned(),
+                signature: Some("sig".to_owned()),
+            }],
+        };
+        let profile = MinecraftProfile {
+            id: Uuid::parse_str("12345678-1234-5678-9234-567812345678").expect("uuid fixture"),
+            name: "Builder".to_owned(),
+        };
+
+        let session =
+            build_stored_minecraft_session_from_auth(&token, &entitlements, &profile, 1_000)
+                .expect("session should build");
+
+        assert_eq!(session.session.username, "Builder");
+        assert_eq!(session.session.uuid, profile.id);
+        assert_eq!(session.session.access_token, "mc-access");
+        assert_eq!(session.account_id.as_deref(), Some("auth-account-id"));
+        assert_eq!(session.stored_at_unix_seconds, 1_000);
+        assert_eq!(session.expires_at_unix_seconds, Some(87_400));
+    }
+
+    #[test]
+    fn authenticated_minecraft_session_persists_to_json() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let token = MinecraftServicesToken {
+            token_type: "Bearer".to_owned(),
+            expires_in: 86_400,
+            access_token: "mc-access".to_owned(),
+            username: Some("auth-account-id".to_owned()),
+        };
+        let entitlements = MinecraftEntitlements {
+            owns_minecraft: true,
+            items: vec![MinecraftEntitlementItem {
+                name: "game_minecraft".to_owned(),
+                signature: Some("sig".to_owned()),
+            }],
+        };
+        let profile = MinecraftProfile {
+            id: Uuid::parse_str("12345678-1234-5678-9234-567812345678").expect("uuid fixture"),
+            name: "Builder".to_owned(),
+        };
+
+        let saved = save_authenticated_minecraft_session_to_path(
+            &path,
+            &token,
+            &entitlements,
+            &profile,
+            1_000,
+        )
+        .expect("session should persist");
+        let loaded = load_minecraft_session_from_path(&path)
+            .expect("session should load")
+            .expect("session should exist");
+
+        assert_eq!(saved, loaded);
+        assert_eq!(loaded.session.username, "Builder");
+        assert_eq!(loaded.session.uuid, profile.id);
+        assert_eq!(loaded.session.access_token, "mc-access");
+        assert_eq!(loaded.account_id.as_deref(), Some("auth-account-id"));
+        assert_eq!(loaded.stored_at_unix_seconds, 1_000);
+        assert_eq!(loaded.expires_at_unix_seconds, Some(87_400));
+    }
+
+    #[test]
+    fn authenticated_minecraft_session_does_not_persist_without_entitlement() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("minecraft-session.json");
+        let token = MinecraftServicesToken {
+            token_type: "Bearer".to_owned(),
+            expires_in: 86_400,
+            access_token: "mc-access".to_owned(),
+            username: Some("auth-account-id".to_owned()),
+        };
+        let entitlements = MinecraftEntitlements {
+            owns_minecraft: false,
+            items: Vec::new(),
+        };
+        let profile = MinecraftProfile {
+            id: Uuid::parse_str("12345678-1234-5678-9234-567812345678").expect("uuid fixture"),
+            name: "Builder".to_owned(),
+        };
+
+        assert!(save_authenticated_minecraft_session_to_path(
+            &path,
+            &token,
+            &entitlements,
+            &profile,
+            1_000,
+        )
+        .is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stored_minecraft_session_rejects_missing_entitlement() {
+        let token = MinecraftServicesToken {
+            token_type: "Bearer".to_owned(),
+            expires_in: 86_400,
+            access_token: "mc-access".to_owned(),
+            username: Some("auth-account-id".to_owned()),
+        };
+        let entitlements = MinecraftEntitlements {
+            owns_minecraft: false,
+            items: Vec::new(),
+        };
+        let profile = MinecraftProfile {
+            id: Uuid::parse_str("12345678-1234-5678-9234-567812345678").expect("uuid fixture"),
+            name: "Builder".to_owned(),
+        };
+
+        assert!(
+            build_stored_minecraft_session_from_auth(&token, &entitlements, &profile, 1_000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stored_minecraft_session_rejects_invalid_minecraft_token() {
+        let token = MinecraftServicesToken {
+            token_type: "Bearer".to_owned(),
+            expires_in: 0,
+            access_token: "mc-access".to_owned(),
+            username: Some("auth-account-id".to_owned()),
+        };
+        let entitlements = MinecraftEntitlements {
+            owns_minecraft: true,
+            items: Vec::new(),
+        };
+        let profile = MinecraftProfile {
+            id: Uuid::parse_str("12345678-1234-5678-9234-567812345678").expect("uuid fixture"),
+            name: "Builder".to_owned(),
+        };
+
+        assert!(
+            build_stored_minecraft_session_from_auth(&token, &entitlements, &profile, 1_000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn microsoft_callback_rejects_state_mismatch_and_oauth_errors() {
+        assert!(plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?code=abc&state=wrong".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                .to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .is_err());
+        assert!(plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?error=access_denied&error_description=User+cancelled&state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_".to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .is_err());
+        assert!(plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                .to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .is_err());
+        assert!(plan_microsoft_token_exchange(MicrosoftAuthCallback {
+            callback_url: "http://localhost:53682/?code=abc&state=state-abc".to_owned(),
+            expected_state: "state-abc".to_owned(),
+            code_verifier: "short".to_owned(),
+            client_id: "client-123".to_owned(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn offline_uuid_seed_is_valid_deterministic_uuid() {
+        let uuid = offline_uuid_seed("Player");
+
+        assert_eq!(uuid, offline_uuid_seed("Player"));
+        assert_eq!(uuid.len(), 32);
+        assert!(Uuid::parse_str(&uuid).is_ok());
+        assert_ne!(uuid, offline_uuid_seed("Builder"));
+    }
+
+    #[test]
+    fn offline_launch_plan_rejects_unknown_profiles() {
+        let settings = default_settings();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        assert!(build_offline_launch_plan("missing", &settings, &directories).is_err());
+    }
+
+    #[test]
+    fn process_command_spec_is_built_from_launch_plan() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: vec![
+                "-Xmx4096M".to_owned(),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let spec = build_process_command_spec(&launch_plan).expect("spec should build");
+
+        assert_eq!(spec.executable, "java");
+        assert_eq!(spec.working_dir, "C:/data/profiles/winterpack");
+        assert!(spec.args.contains(&"-Xmx4096M".to_owned()));
+        assert!(spec
+            .env
+            .iter()
+            .any(|env| { env.key == "THEBOYSLAUNCHER_PROFILE_ID" && env.value == "winterpack" }));
+    }
+
+    #[test]
+    fn process_command_spec_requires_executable_and_working_dir() {
+        let mut launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: String::new(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        assert!(build_process_command_spec(&launch_plan).is_err());
+        launch_plan.java_executable = "java".to_owned();
+        launch_plan.working_dir.clear();
+        assert!(build_process_command_spec(&launch_plan).is_err());
+    }
+
+    #[test]
+    fn process_command_spec_rejects_missing_explicit_java_executable_path() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let missing_java = root.path().join("runtimes/java-21/bin/java.exe");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: display_path(&missing_java),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec!["net.minecraft.client.main.Main".to_owned()],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("missing explicit Java path should fail before process spawn");
+        let message = error.to_string();
+
+        assert!(message.contains("Java executable"));
+        assert!(message.contains("Install a managed Java runtime from Settings"));
+    }
+
+    #[test]
+    fn process_command_spec_allows_bare_java_executable_names_from_path() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "missing-java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec!["net.minecraft.client.main.Main".to_owned()],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let spec = build_process_command_spec(&launch_plan)
+            .expect("bare executable names should be resolved by the process spawn environment");
+
+        assert_eq!(spec.executable, "missing-java");
+    }
+
+    #[test]
+    fn process_command_spec_rejects_missing_concrete_classpath_entries() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let missing_library = root.path().join("cache/libraries/missing.jar");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "-cp".to_owned(),
+                display_path(&missing_library),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("missing concrete classpath entry should fail");
+
+        assert!(error.to_string().contains("launch artifact is missing"));
+        assert!(error.to_string().contains("Install or repair"));
+    }
+
+    #[test]
+    fn process_command_spec_allows_existing_classpath_entries_and_wildcards() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let client_jar = root.path().join("cache/versions/1.21.8/client.jar");
+        let libraries_dir = root.path().join("cache/libraries");
+        fs::create_dir_all(client_jar.parent().expect("client jar parent should exist"))
+            .expect("client jar parent should create");
+        fs::create_dir_all(&libraries_dir).expect("libraries wildcard dir should create");
+        fs::write(&client_jar, b"jar").expect("client jar fixture should write");
+        let classpath = format!(
+            "{}{}{}",
+            display_path(&client_jar),
+            if cfg!(windows) { ";" } else { ":" },
+            display_path(&libraries_dir.join("*"))
+        );
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "-cp".to_owned(),
+                classpath,
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let spec = build_process_command_spec(&launch_plan).expect("valid artifacts should build");
+
+        assert_eq!(spec.executable, "java");
+    }
+
+    #[test]
+    fn process_command_spec_validates_module_path_entries() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let module_jar = root
+            .path()
+            .join("cache/libraries/cpw/mods/bootstraplauncher.jar");
+        fs::create_dir_all(module_jar.parent().expect("module jar parent should exist"))
+            .expect("module jar parent should create");
+        fs::write(&module_jar, b"jar").expect("module jar fixture should write");
+        let mut launch_plan = LaunchPlan {
+            profile_id: "neoforge-live".to_owned(),
+            profile_name: "NeoForge Live".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/neoforge-live")),
+            arguments: vec![
+                "-p".to_owned(),
+                display_path(&module_jar),
+                "--add-modules".to_owned(),
+                "ALL-MODULE-PATH".to_owned(),
+                "cpw.mods.bootstraplauncher.BootstrapLauncher".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        build_process_command_spec(&launch_plan).expect("existing module path should build");
+
+        launch_plan.arguments[1] = display_path(&root.path().join("cache/libraries/missing.jar"));
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("missing module path entry should fail before Java starts");
+
+        assert!(error.to_string().contains("module path"));
+        assert!(error.to_string().contains("Install or repair"));
+    }
+
+    #[test]
+    fn process_command_spec_rejects_missing_classpath_wildcard_directory() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "-cp".to_owned(),
+                display_path(&root.path().join("cache/libraries/*")),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("missing classpath wildcard directory should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("launch artifact is missing"));
+        assert!(message.contains("classpath wildcard directory"));
+        assert!(message.contains("Install or repair"));
+    }
+
+    #[test]
+    fn process_command_spec_rejects_malformed_classpath_wildcards() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "-cp".to_owned(),
+                display_path(&root.path().join("cache/libraries/*.jar")),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("malformed classpath wildcard should fail");
+
+        assert!(error.to_string().contains("unsupported classpath wildcard"));
+    }
+
+    #[test]
+    fn process_command_spec_rejects_classpath_flag_without_value() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "-cp".to_owned(),
+                "--assetsDir".to_owned(),
+                display_path(&root.path().join("cache/assets")),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("classpath flag without a value should fail before Java starts");
+
+        assert!(error
+            .to_string()
+            .contains("launch argument '-cp' is missing a value"));
+    }
+
+    #[test]
+    fn process_command_spec_rejects_missing_asset_index() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "--assetsDir".to_owned(),
+                display_path(&root.path().join("cache/assets")),
+                "--assetIndex".to_owned(),
+                "1.21.8".to_owned(),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error =
+            build_process_command_spec(&launch_plan).expect_err("missing asset index should fail");
+
+        assert!(error.to_string().contains("launch artifact is missing"));
+        assert!(error.to_string().contains("asset index"));
+        assert!(error.to_string().contains("Install or repair"));
+    }
+
+    #[test]
+    fn process_command_spec_allows_legacy_assets_dir_without_asset_index() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let assets_dir = root.path().join("cache/assets");
+        fs::create_dir_all(&assets_dir).expect("assets dir should create");
+        fs::create_dir_all(root.path().join("profiles/winterpack"))
+            .expect("working dir should create");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "--assetsDir".to_owned(),
+                display_path(&assets_dir),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let command = build_process_command_spec(&launch_plan)
+            .expect("legacy assetsDir without assetIndex should be allowed");
+
+        assert_eq!(command.args, launch_plan.arguments);
+    }
+
+    #[test]
+    fn process_command_spec_rejects_missing_natives_directory() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let natives_dir = root.path().join("cache/natives/1.21.8");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                format!("-Djava.library.path={}", display_path(&natives_dir)),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("missing natives directory should fail");
+
+        assert!(error.to_string().contains("launch artifact is missing"));
+        assert!(error.to_string().contains("natives directory"));
+        assert!(error.to_string().contains(&display_path(&natives_dir)));
+        assert!(error.to_string().contains("Install or repair"));
+    }
+
+    #[test]
+    fn process_command_spec_reports_all_missing_launch_artifacts() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let missing_library = root.path().join("cache/libraries/missing.jar");
+        let assets_dir = root.path().join("cache/assets");
+        let asset_index = assets_dir.join("indexes/1.21.8.json");
+        let natives_dir = root.path().join("cache/natives/1.21.8");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                "-cp".to_owned(),
+                display_path(&missing_library),
+                "--assetsDir".to_owned(),
+                display_path(&assets_dir),
+                "--assetIndex".to_owned(),
+                "1.21.8".to_owned(),
+                format!("-Djava.library.path={}", display_path(&natives_dir)),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let error = build_process_command_spec(&launch_plan)
+            .expect_err("missing artifacts should be reported together");
+        let message = error.to_string();
+
+        assert!(message.contains("launch artifacts are missing"));
+        assert!(message.contains(&display_path(&missing_library)));
+        assert!(message.contains(&format!("asset index {}", display_path(&asset_index))));
+        assert!(message.contains(&format!("natives directory {}", display_path(&natives_dir))));
+        assert!(message.contains("Install or repair"));
+    }
+
+    #[test]
+    fn process_command_spec_allows_existing_asset_index_and_natives_directory() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let assets_dir = root.path().join("cache/assets");
+        let asset_index = assets_dir.join("indexes/1.21.8.json");
+        let natives_dir = root.path().join("cache/natives/1.21.8");
+        fs::create_dir_all(
+            asset_index
+                .parent()
+                .expect("asset index parent should exist"),
+        )
+        .expect("asset index parent should create");
+        fs::write(&asset_index, b"{}").expect("asset index fixture should write");
+        fs::create_dir_all(&natives_dir).expect("natives dir should create");
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: display_path(&root.path().join("profiles/winterpack")),
+            arguments: vec![
+                format!("-Djava.library.path={}", display_path(&natives_dir)),
+                "--assetsDir".to_owned(),
+                display_path(&assets_dir),
+                "--assetIndex".to_owned(),
+                "1.21.8".to_owned(),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let spec = build_process_command_spec(&launch_plan)
+            .expect("existing asset index and natives should build");
+
+        assert_eq!(spec.executable, "java");
+    }
+
+    #[test]
+    fn process_working_dir_is_created() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let working_dir = root.path().join("profiles/winterpack");
+        let spec = ProcessCommandSpec {
+            executable: "java".to_owned(),
+            args: Vec::new(),
+            working_dir: display_path(&working_dir),
+            env: Vec::new(),
+        };
+
+        prepare_process_working_dir(&spec).expect("working dir should be created");
+
+        assert!(working_dir.is_dir());
+    }
+
+    #[test]
+    fn long_java_process_uses_argument_file() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let long_classpath = "library.jar;".repeat(3_000);
+        let spec = ProcessCommandSpec {
+            executable: "javaw.exe".to_owned(),
+            args: vec![
+                "-Xmx4096M".to_owned(),
+                "-cp".to_owned(),
+                long_classpath,
+                "--accessToken".to_owned(),
+                "token-123".to_owned(),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            working_dir: display_path(root.path()),
+            env: Vec::new(),
+        };
+
+        let args = process_spawn_args(&spec).expect("spawn args should build");
+
+        assert_eq!(args.len(), 1);
+        assert!(args[0].starts_with('@'));
+        let arg_file = PathBuf::from(args[0].trim_start_matches('@'));
+        assert!(arg_file.starts_with(root.path()));
+        assert!(arg_file.is_file());
+        assert_eq!(
+            arg_file.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("launch-args"))
+        );
+        let contents = fs::read_to_string(arg_file).expect("arg file should be readable");
+        assert!(contents.contains("\"-Xmx4096M\""));
+        assert!(contents.contains("\"--accessToken\""));
+        assert!(contents.contains("\"token-123\""));
+        assert!(contents.contains("\"net.minecraft.client.main.Main\""));
+
+        let temp_files = fs::read_dir(root.path().join(".theboyslauncher/launch-args"))
+            .expect("arg file directory should read")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .count();
+        assert_eq!(temp_files, 0);
+    }
+
+    #[test]
+    fn short_or_non_java_process_keeps_inline_arguments() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let java_spec = ProcessCommandSpec {
+            executable: "java.exe".to_owned(),
+            args: vec!["-version".to_owned()],
+            working_dir: display_path(root.path()),
+            env: Vec::new(),
+        };
+        let non_java_spec = ProcessCommandSpec {
+            executable: "launcher-helper.exe".to_owned(),
+            args: vec!["x".repeat(JAVA_ARG_FILE_THRESHOLD_CHARS + 1)],
+            working_dir: display_path(root.path()),
+            env: Vec::new(),
+        };
+
+        assert_eq!(
+            process_spawn_args(&java_spec).expect("short java args should build"),
+            java_spec.args
+        );
+        assert_eq!(
+            process_spawn_args(&non_java_spec).expect("non-java args should build"),
+            non_java_spec.args
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_processes_use_no_console_creation_flag() {
+        assert_eq!(WINDOWS_CREATE_NO_WINDOW, 0x08000000);
+    }
+
+    #[test]
+    fn java_argument_file_quoting_escapes_special_characters() {
+        assert_eq!(
+            quote_java_argument_file_arg(r#"C:\Users\Player Name\game "dir""#),
+            r#""C:\\Users\\Player Name\\game \"dir\"""#
+        );
+        assert_eq!(
+            quote_java_argument_file_arg("line\nnext"),
+            r#""line\nnext""#
+        );
+    }
+
+    #[test]
+    fn process_registry_records_exited_processes() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let summary = registry
+            .spawn(exit_command_spec(root.path(), 7))
+            .expect("process should spawn");
+
+        let latest = wait_for_managed_process(
+            &registry,
+            summary.id,
+            80,
+            Duration::from_millis(25),
+            |process| process.state == ManagedProcessState::Exited,
+        );
+
+        assert_eq!(latest.state, ManagedProcessState::Exited);
+        assert_eq!(latest.exit_code, Some(7));
+        assert!(latest.exited_at_unix_seconds.is_some());
+        assert!(latest.exited_at_unix_seconds.unwrap() >= latest.started_at_unix_seconds);
+    }
+
+    #[test]
+    fn process_registry_startup_wait_reports_fast_exit() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let summary = registry
+            .spawn(exit_command_spec(root.path(), 7))
+            .expect("process should spawn");
+
+        let startup = registry
+            .wait_for_startup(summary.id, Duration::from_secs(2))
+            .expect("startup wait should complete");
+
+        assert_eq!(startup.state, ManagedProcessState::Exited);
+        assert_eq!(startup.exit_code, Some(7));
+        assert!(startup.exited_at_unix_seconds.is_some());
+    }
+
+    #[test]
+    fn process_registry_startup_wait_keeps_running_processes() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let summary = registry
+            .spawn(sleep_command_spec(root.path()))
+            .expect("process should spawn");
+
+        let startup = registry
+            .wait_for_startup(summary.id, Duration::from_millis(150))
+            .expect("startup wait should complete");
+
+        assert_eq!(startup.state, ManagedProcessState::Running);
+        assert_eq!(startup.exit_code, None);
+        let _ = registry.stop(startup.id);
+    }
+
+    #[test]
+    fn process_registry_captures_output_after_process_exits() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let summary = registry
+            .spawn(output_command_spec(root.path()))
+            .expect("process should spawn");
+
+        let latest = wait_for_managed_process(
+            &registry,
+            summary.id,
+            80,
+            Duration::from_millis(25),
+            |process| process.state == ManagedProcessState::Exited,
+        );
+
+        assert_eq!(latest.state, ManagedProcessState::Exited);
+        assert!(latest.output.iter().any(|line| {
+            line.stream == ProcessOutputStream::Stdout && line.line.contains("hello stdout")
+        }));
+        assert!(latest.output.iter().any(|line| {
+            line.stream == ProcessOutputStream::Stderr && line.line.contains("hello stderr")
+        }));
+    }
+
+    #[test]
+    fn process_log_export_writes_summary_and_output_lines() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let summary = ManagedProcessSummary {
+            id: Uuid::parse_str("12345678-1234-5678-1234-567812345678").expect("uuid fixture"),
+            process_id: 42,
+            command: ProcessCommandSpec {
+                executable: "java".to_owned(),
+                args: vec![
+                    "-Xmx4096M".to_owned(),
+                    "--accessToken".to_owned(),
+                    "secret-token-123".to_owned(),
+                    "--token=inline-secret".to_owned(),
+                    "net.minecraft.client.main.Main".to_owned(),
+                ],
+                working_dir: "C:/data/profiles/winterpack".to_owned(),
+                env: vec![
+                    ProcessEnvVar {
+                        key: "THEBOYSLAUNCHER_PROFILE_ID".to_owned(),
+                        value: "winterpack".to_owned(),
+                    },
+                    ProcessEnvVar {
+                        key: "MINECRAFT_ACCESS_TOKEN".to_owned(),
+                        value: "env-secret-token".to_owned(),
+                    },
+                ],
+            },
+            state: ManagedProcessState::Exited,
+            stop_requested: false,
+            exit_code: Some(0),
+            started_at_unix_seconds: 1234,
+            exited_at_unix_seconds: Some(1246),
+            runtime_seconds: 12,
+            total_output_line_count: 5,
+            dropped_output_line_count: 3,
+            output: vec![
+                ProcessOutputLine {
+                    stream: ProcessOutputStream::Stdout,
+                    line: "hello".to_owned(),
+                },
+                ProcessOutputLine {
+                    stream: ProcessOutputStream::Stderr,
+                    line: "warning".to_owned(),
+                },
+            ],
+        };
+
+        let exported = export_process_log(&summary, &directories).expect("log should export");
+        let content = fs::read_to_string(&exported.path).expect("log should read");
+
+        assert_eq!(exported.line_count, 2);
+        assert_eq!(exported.total_output_line_count, 5);
+        assert_eq!(exported.dropped_output_line_count, 3);
+        assert!(exported
+            .path
+            .ends_with("1234-12345678-1234-5678-1234-567812345678.log"));
+        assert!(content.contains("processId: 42"));
+        assert!(content.contains("exitedAtUnixSeconds: Some(1246)"));
+        assert!(content.contains("runtimeSeconds: 12"));
+        assert!(content.contains("totalOutputLineCount: 5"));
+        assert!(content.contains("droppedOutputLineCount: 3"));
+        assert!(content.contains("capturedOutputLineCount: 2"));
+        assert!(content.contains("executable: java"));
+        assert!(content.contains("args: -Xmx4096M --accessToken [redacted] --token=[redacted] net.minecraft.client.main.Main"));
+        assert!(content.contains("env:"));
+        assert!(content.contains("THEBOYSLAUNCHER_PROFILE_ID=winterpack"));
+        assert!(content.contains("MINECRAFT_ACCESS_TOKEN=[redacted]"));
+        assert!(!content.contains("secret-token-123"));
+        assert!(!content.contains("inline-secret"));
+        assert!(!content.contains("env-secret-token"));
+        assert!(content.contains("Stdout: hello"));
+        assert!(content.contains("Stderr: warning"));
+    }
+
+    #[test]
+    fn process_arg_redaction_hides_access_tokens() {
+        let args = vec![
+            "--username".to_owned(),
+            "Builder".to_owned(),
+            "--accessToken".to_owned(),
+            "secret-token".to_owned(),
+            "--access_token=snake-secret".to_owned(),
+            "--token=inline-secret".to_owned(),
+        ];
+
+        let redacted = redact_process_args(&args);
+
+        assert_eq!(
+            redacted,
+            vec![
+                "--username",
+                "Builder",
+                "--accessToken",
+                "[redacted]",
+                "--access_token=[redacted]",
+                "--token=[redacted]",
+            ]
+        );
+    }
+
+    #[test]
+    fn process_command_spec_redaction_hides_sensitive_summary_args() {
+        let spec = ProcessCommandSpec {
+            executable: "java".to_owned(),
+            args: vec![
+                "-Xmx4096M".to_owned(),
+                "--accessToken".to_owned(),
+                "secret-token".to_owned(),
+                "--token=inline-secret".to_owned(),
+                "net.minecraft.client.main.Main".to_owned(),
+            ],
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            env: vec![
+                ProcessEnvVar {
+                    key: "JAVA_TOOL_OPTIONS".to_owned(),
+                    value: "-Dlauncher=test".to_owned(),
+                },
+                ProcessEnvVar {
+                    key: "MINECRAFT_ACCESS_TOKEN".to_owned(),
+                    value: "env-secret".to_owned(),
+                },
+            ],
+        };
+
+        let redacted = redact_process_command_spec(&spec);
+
+        assert_eq!(redacted.executable, "java");
+        assert_eq!(redacted.working_dir, "C:/data/profiles/winterpack");
+        assert_eq!(
+            redacted.env,
+            vec![
+                ProcessEnvVar {
+                    key: "JAVA_TOOL_OPTIONS".to_owned(),
+                    value: "-Dlauncher=test".to_owned(),
+                },
+                ProcessEnvVar {
+                    key: "MINECRAFT_ACCESS_TOKEN".to_owned(),
+                    value: "[redacted]".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            redacted.args,
+            vec![
+                "-Xmx4096M",
+                "--accessToken",
+                "[redacted]",
+                "--token=[redacted]",
+                "net.minecraft.client.main.Main",
+            ]
+        );
+        assert!(spec.args.contains(&"secret-token".to_owned()));
+        assert!(!redacted.args.contains(&"secret-token".to_owned()));
+        assert!(!redacted.args.contains(&"--token=inline-secret".to_owned()));
+        assert!(spec.env.iter().any(|env_var| env_var.value == "env-secret"));
+        assert!(!redacted
+            .env
+            .iter()
+            .any(|env_var| env_var.value == "env-secret"));
+    }
+
+    #[test]
+    fn process_registry_reports_truncated_output_counts() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let noisy_line_count = PROCESS_OUTPUT_CAPACITY + 30;
+        let summary = registry
+            .spawn(noisy_output_command_spec(root.path(), noisy_line_count))
+            .expect("process should spawn");
+
+        let latest = wait_for_managed_process(
+            &registry,
+            summary.id,
+            120,
+            Duration::from_millis(25),
+            |process| {
+                process.state == ManagedProcessState::Exited
+                    && process.total_output_line_count >= noisy_line_count as u64
+            },
+        );
+
+        assert_eq!(latest.total_output_line_count, noisy_line_count as u64);
+        assert_eq!(latest.output.len(), PROCESS_OUTPUT_CAPACITY);
+        assert_eq!(latest.dropped_output_line_count, 30);
+        assert!(latest
+            .output
+            .first()
+            .is_some_and(|line| line.line.contains("line-31")));
+        assert!(latest
+            .output
+            .last()
+            .is_some_and(|line| line.line.contains(&format!("line-{noisy_line_count}"))));
+    }
+
+    #[test]
+    fn process_registry_captures_output_while_process_runs() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let summary = registry
+            .spawn(live_output_command_spec(root.path()))
+            .expect("process should spawn");
+
+        let latest = wait_for_managed_process(
+            &registry,
+            summary.id,
+            120,
+            Duration::from_millis(25),
+            |process| {
+                process.output.iter().any(|line| {
+                    line.stream == ProcessOutputStream::Stdout && line.line.contains("live stdout")
+                })
+            },
+        );
+
+        assert!(latest.output.iter().any(|line| {
+            line.stream == ProcessOutputStream::Stdout && line.line.contains("live stdout")
+        }));
+        let _ = registry.stop(latest.id);
+    }
+
+    #[test]
+    fn process_registry_notifies_subscribers_on_spawn_and_stop() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let subscriber = registry.subscribe().expect("subscriber should register");
+
+        let summary = registry
+            .spawn(sleep_command_spec(root.path()))
+            .expect("process should spawn");
+        let spawned = subscriber
+            .recv_timeout(Duration::from_millis(250))
+            .expect("spawn summary should be broadcast");
+
+        assert_eq!(spawned.id, summary.id);
+        assert_eq!(spawned.state, ManagedProcessState::Running);
+
+        let stopped = registry.stop(summary.id).expect("process should stop");
+        let stop_requested_update = subscriber
+            .recv_timeout(Duration::from_millis(250))
+            .expect("stop-requested summary should be broadcast");
+        assert_eq!(stop_requested_update.id, summary.id);
+        assert_eq!(
+            stop_requested_update.state,
+            ManagedProcessState::StopRequested
+        );
+
+        let stopped_update = (0..5)
+            .map(|_| {
+                subscriber
+                    .recv_timeout(Duration::from_millis(250))
+                    .expect("stop summary should be broadcast")
+            })
+            .find(|update| update.id == summary.id && update.state == ManagedProcessState::Exited)
+            .expect("exited summary should be broadcast");
+        assert_eq!(stopped_update.exit_code, stopped.exit_code);
+    }
+
+    #[test]
+    fn process_registry_notifies_subscribers_with_live_output() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let subscriber = registry.subscribe().expect("subscriber should register");
+        let summary = registry
+            .spawn(live_output_command_spec(root.path()))
+            .expect("process should spawn");
+
+        let output_update = (0..10)
+            .map(|_| {
+                subscriber
+                    .recv_timeout(Duration::from_millis(250))
+                    .expect("process update should be broadcast")
+            })
+            .find(|update| {
+                update.id == summary.id
+                    && update.state == ManagedProcessState::Running
+                    && update.output.iter().any(|line| {
+                        line.stream == ProcessOutputStream::Stdout
+                            && line.line.contains("live stdout")
+                    })
+            })
+            .expect("live output summary should be broadcast");
+
+        assert!(output_update.output.iter().any(|line| {
+            line.stream == ProcessOutputStream::Stdout && line.line.contains("live stdout")
+        }));
+        let _ = registry.stop(summary.id);
+    }
+
+    #[test]
+    fn process_output_reader_preserves_non_running_lifecycle_state() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let (tx, rx) = mpsc::channel();
+        let lifecycle = Arc::new(Mutex::new(ProcessLifecycleSnapshot {
+            state: ManagedProcessState::Exited,
+            stop_requested: true,
+            exit_code: Some(0),
+            exited_at_unix_seconds: Some(1_710_000_005),
+        }));
+        let subscribers = Arc::new(Mutex::new(vec![tx]));
+
+        spawn_output_reader(
+            Cursor::new(b"late stdout after stop\n".to_vec()),
+            ProcessOutputStream::Stdout,
+            ProcessUpdateContext {
+                id: Uuid::new_v4(),
+                process_id: 42,
+                command: sleep_command_spec(root.path()),
+                started_at_unix_seconds: 1_710_000_000,
+                output: Arc::new(Mutex::new(Vec::new())),
+                total_output_line_count: Arc::new(AtomicU64::new(0)),
+                lifecycle,
+                subscribers,
+            },
+        );
+
+        let update = rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("late output update should be broadcast");
+        assert_eq!(update.state, ManagedProcessState::Exited);
+        assert!(update.stop_requested);
+        assert_eq!(update.exit_code, Some(0));
+        assert_eq!(update.exited_at_unix_seconds, Some(1_710_000_005));
+        assert!(update
+            .output
+            .iter()
+            .any(|line| line.line == "late stdout after stop"));
+    }
+
+    #[test]
+    fn process_registry_can_stop_running_processes() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let summary = registry
+            .spawn(sleep_command_spec(root.path()))
+            .expect("process should spawn");
+
+        let stopped = registry.stop(summary.id).expect("process should stop");
+
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+        assert!(stopped.stop_requested);
+        assert!(stopped.exited_at_unix_seconds.is_some());
+        assert!(stopped.exited_at_unix_seconds.unwrap() >= stopped.started_at_unix_seconds);
+    }
+
+    #[test]
+    fn process_registry_stop_refreshes_already_exited_process_once() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let subscriber = registry.subscribe().expect("subscriber should register");
+        let summary = registry
+            .spawn(exit_command_spec(root.path(), 7))
+            .expect("process should spawn");
+        let spawned = subscriber
+            .recv_timeout(Duration::from_millis(250))
+            .expect("spawn summary should be broadcast");
+        assert_eq!(spawned.id, summary.id);
+        assert_eq!(spawned.state, ManagedProcessState::Running);
+
+        wait_for_managed_process(
+            &registry,
+            summary.id,
+            80,
+            Duration::from_millis(25),
+            |process| process.state == ManagedProcessState::Exited,
+        );
+        let stopped = registry.stop(summary.id).expect("process should refresh");
+        assert_eq!(stopped.state, ManagedProcessState::Exited);
+        assert_eq!(stopped.exit_code, Some(7));
+
+        let exited = subscriber
+            .recv_timeout(Duration::from_millis(500))
+            .expect("exited summary should be broadcast");
+        assert_eq!(exited.id, summary.id);
+        assert_eq!(exited.state, ManagedProcessState::Exited);
+        assert_eq!(exited.exit_code, Some(7));
+        assert!(subscriber.recv_timeout(Duration::from_millis(150)).is_err());
+    }
+
+    #[test]
+    fn process_registry_can_clear_exited_processes() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let registry = ProcessRegistry::new();
+        let exited = registry
+            .spawn(exit_command_spec(root.path(), 0))
+            .expect("process should spawn");
+        let running = registry
+            .spawn(sleep_command_spec(root.path()))
+            .expect("process should spawn");
+
+        for _ in 0..50 {
+            let processes = registry.list().expect("registry should list");
+            if processes.iter().any(|process| {
+                process.id == exited.id && process.state == ManagedProcessState::Exited
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let remaining = registry
+            .clear_exited()
+            .expect("exited processes should clear");
+
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, running.id);
+        assert_eq!(remaining[0].state, ManagedProcessState::Running);
+
+        let _ = registry.stop(running.id);
+    }
+
+    #[test]
+    fn repair_operation_plan_has_ordered_progress_events() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let plan = build_repair_operation_plan("winterpack", &launch_plan);
+
+        assert_eq!(plan.operation, LauncherOperation::RepairProfile);
+        assert_eq!(plan.subject_id, "winterpack");
+        assert_eq!(plan.events.len(), 5);
+        assert_eq!(
+            plan.events.first().map(|event| &event.kind),
+            Some(&LauncherEventKind::Queued)
+        );
+        assert_eq!(
+            plan.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+        assert_eq!(
+            plan.events.last().and_then(|event| event.progress_percent),
+            Some(100)
+        );
+        assert!(plan.events.windows(2).all(|pair| {
+            pair[0].progress_percent.unwrap_or(0) <= pair[1].progress_percent.unwrap_or(0)
+        }));
+    }
+
+    #[test]
+    fn launch_operation_plan_records_started_process() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let plan = build_launch_operation_plan(&launch_plan, 42);
+
+        assert_eq!(plan.operation, LauncherOperation::LaunchProfile);
+        assert_eq!(plan.subject_id, "winterpack");
+        assert_eq!(plan.events.len(), 3);
+        assert_eq!(
+            plan.events.first().map(|event| &event.kind),
+            Some(&LauncherEventKind::Queued)
+        );
+        assert_eq!(
+            plan.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+        assert!(plan
+            .events
+            .last()
+            .map(|event| event.message.contains("pid 42"))
+            .unwrap_or(false));
+        assert!(plan
+            .events
+            .last()
+            .map(|event| event.message.contains("using java"))
+            .unwrap_or(false));
+        assert!(plan.events.windows(2).all(|pair| {
+            pair[0].progress_percent.unwrap_or(0) <= pair[1].progress_percent.unwrap_or(0)
+        }));
+    }
+
+    #[test]
+    fn launch_failed_operation_plan_records_spawn_error() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "missing-java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+
+        let plan = build_launch_failed_operation_plan(&launch_plan, "program not found");
+
+        assert_eq!(plan.operation, LauncherOperation::LaunchProfile);
+        assert_eq!(plan.subject_id, "winterpack");
+        assert_eq!(plan.events.len(), 3);
+        assert_eq!(
+            plan.events.first().map(|event| &event.kind),
+            Some(&LauncherEventKind::Queued)
+        );
+        assert_eq!(
+            plan.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Failed)
+        );
+        assert!(plan
+            .events
+            .last()
+            .map(|event| event.message.contains("program not found"))
+            .unwrap_or(false));
+        assert!(plan
+            .events
+            .last()
+            .map(|event| event.message.contains("using missing-java"))
+            .unwrap_or(false));
+        assert_eq!(
+            plan.events.last().and_then(|event| event.progress_percent),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn launch_planning_failed_operation_plan_records_java_error() {
+        let plan = build_launch_planning_failed_operation_plan(
+            "modern-vanilla",
+            Some("Modern Vanilla"),
+            "Minecraft requires Java 21 or newer",
+        );
+
+        assert_eq!(plan.operation, LauncherOperation::LaunchProfile);
+        assert_eq!(plan.subject_id, "modern-vanilla");
+        assert_eq!(plan.events.len(), 3);
+        assert!(plan
+            .events
+            .iter()
+            .any(|event| event.message == "Launch queued for Modern Vanilla"));
+        assert!(plan.events.iter().any(|event| {
+            event.kind == LauncherEventKind::Failed
+                && event
+                    .message
+                    .contains("Minecraft requires Java 21 or newer")
+        }));
+    }
+
+    #[test]
+    fn managed_process_lifecycle_event_skips_running_output_updates() {
+        let summary = ManagedProcessSummary {
+            id: Uuid::new_v4(),
+            process_id: 42,
+            command: ProcessCommandSpec {
+                executable: "java".to_owned(),
+                args: Vec::new(),
+                working_dir: "C:/data/profiles/winterpack".to_owned(),
+                env: Vec::new(),
+            },
+            state: ManagedProcessState::Running,
+            stop_requested: false,
+            exit_code: None,
+            started_at_unix_seconds: 10,
+            exited_at_unix_seconds: None,
+            runtime_seconds: 3,
+            total_output_line_count: 1,
+            dropped_output_line_count: 0,
+            output: Vec::new(),
+        };
+
+        assert_eq!(managed_process_lifecycle_event(&summary), None);
+    }
+
+    #[test]
+    fn managed_process_lifecycle_event_records_exits() {
+        let summary = ManagedProcessSummary {
+            id: Uuid::new_v4(),
+            process_id: 42,
+            command: ProcessCommandSpec {
+                executable: "java".to_owned(),
+                args: Vec::new(),
+                working_dir: "C:/data/profiles/winterpack".to_owned(),
+                env: Vec::new(),
+            },
+            state: ManagedProcessState::Exited,
+            stop_requested: false,
+            exit_code: Some(7),
+            started_at_unix_seconds: 10,
+            exited_at_unix_seconds: Some(15),
+            runtime_seconds: 5,
+            total_output_line_count: 2,
+            dropped_output_line_count: 0,
+            output: Vec::new(),
+        };
+
+        let event = managed_process_lifecycle_event(&summary).expect("exit should record");
+
+        assert_eq!(event.operation_id, summary.id);
+        assert_eq!(event.operation, Some(LauncherOperation::ManagedProcess));
+        assert_eq!(
+            event.subject_id.as_deref(),
+            Some(summary.id.to_string().as_str())
+        );
+        assert_eq!(event.kind, LauncherEventKind::Failed);
+        assert!(event.message.contains("exit code 7"));
+        assert_eq!(event.progress_percent, Some(100));
+    }
+
+    #[test]
+    fn managed_process_lifecycle_event_records_requested_stops_as_completed() {
+        let summary = ManagedProcessSummary {
+            id: Uuid::new_v4(),
+            process_id: 42,
+            command: ProcessCommandSpec {
+                executable: "java".to_owned(),
+                args: Vec::new(),
+                working_dir: "C:/data/profiles/winterpack".to_owned(),
+                env: Vec::new(),
+            },
+            state: ManagedProcessState::Exited,
+            stop_requested: true,
+            exit_code: Some(1),
+            started_at_unix_seconds: 10,
+            exited_at_unix_seconds: Some(15),
+            runtime_seconds: 5,
+            total_output_line_count: 2,
+            dropped_output_line_count: 0,
+            output: Vec::new(),
+        };
+
+        let event = managed_process_lifecycle_event(&summary).expect("stop should record");
+
+        assert_eq!(event.kind, LauncherEventKind::Completed);
+        assert!(event.message.contains("stopped after 5s"));
+        assert!(!event.message.contains("exit code 1"));
+    }
+
+    #[test]
+    fn launcher_event_log_records_plan_events_in_order() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+        let plan = build_repair_operation_plan("winterpack", &launch_plan);
+        let log = LauncherEventLog::new();
+
+        log.record_plan(&plan).expect("plan should record");
+        let events = log.list(None).expect("events should list");
+
+        assert_eq!(events.len(), plan.events.len());
+        assert!(events
+            .iter()
+            .all(|event| event.occurred_at_unix_seconds > 0));
+        assert!(events
+            .iter()
+            .all(|event| event.operation == Some(LauncherOperation::RepairProfile)));
+        assert!(events
+            .iter()
+            .all(|event| event.subject_id.as_deref() == Some("winterpack")));
+        assert_eq!(
+            events.first().map(|event| &event.kind),
+            Some(&LauncherEventKind::Queued)
+        );
+        assert_eq!(
+            events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+    }
+
+    #[test]
+    fn launcher_event_log_notifies_subscribers() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+        let plan = build_repair_operation_plan("winterpack", &launch_plan);
+        let log = LauncherEventLog::new();
+        let subscriber = log.subscribe().expect("subscriber should register");
+
+        log.record_plan(&plan).expect("plan should record");
+
+        let received = (0..plan.events.len())
+            .map(|_| {
+                subscriber
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .expect("event should be broadcast")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(received.len(), plan.events.len());
+        assert!(received
+            .iter()
+            .zip(plan.events.iter())
+            .all(|(received, planned)| {
+                received.id == planned.id
+                    && received.operation_id == planned.operation_id
+                    && received.kind == planned.kind
+                    && received.message == planned.message
+                    && received.progress_percent == planned.progress_percent
+                    && received.operation == Some(plan.operation.clone())
+                    && received.subject_id.as_deref() == Some(plan.subject_id.as_str())
+                    && received.occurred_at_unix_seconds > 0
+            }));
+    }
+
+    #[test]
+    fn launcher_event_log_records_single_live_event() {
+        let log = LauncherEventLog::with_capacity(1);
+        let subscriber = log.subscribe().expect("subscriber should register");
+        let operation_id = Uuid::new_v4();
+        let event = LauncherEvent {
+            id: Uuid::new_v4(),
+            operation_id,
+            operation: Some(LauncherOperation::DownloadArtifacts),
+            subject_id: Some("winterpack".to_owned()),
+            kind: LauncherEventKind::Downloading,
+            message: "Downloaded file: client.jar (client jar, 45.2 MB)".to_owned(),
+            progress_percent: Some(50),
+            occurred_at_unix_seconds: 0,
+        };
+
+        let snapshot = log
+            .record_event(event.clone())
+            .expect("event should record");
+        let received = subscriber
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("event should broadcast");
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].operation_id, operation_id);
+        assert_eq!(
+            snapshot[0].operation,
+            Some(LauncherOperation::DownloadArtifacts)
+        );
+        assert_eq!(snapshot[0].subject_id.as_deref(), Some("winterpack"));
+        assert!(snapshot[0].occurred_at_unix_seconds > 0);
+        assert_eq!(received.id, event.id);
+        assert_eq!(
+            received.operation,
+            Some(LauncherOperation::DownloadArtifacts)
+        );
+        assert_eq!(received.subject_id.as_deref(), Some("winterpack"));
+        assert!(received.occurred_at_unix_seconds > 0);
+    }
+
+    #[test]
+    fn launcher_event_log_ignores_dropped_subscribers() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+        let plan = build_repair_operation_plan("winterpack", &launch_plan);
+        let log = LauncherEventLog::new();
+        let dropped = log.subscribe().expect("subscriber should register");
+        drop(dropped);
+        let live = log.subscribe().expect("subscriber should register");
+
+        log.record_plan(&plan).expect("plan should record");
+
+        let event = live
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("live subscriber should receive event");
+        assert_eq!(event.id, plan.events[0].id);
+        assert_eq!(event.kind, plan.events[0].kind);
+        assert!(event.occurred_at_unix_seconds > 0);
+    }
+
+    #[test]
+    fn launcher_event_log_keeps_newest_events_within_capacity() {
+        let launch_plan = LaunchPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            java_executable: "java".to_owned(),
+            working_dir: "C:/data/profiles/winterpack".to_owned(),
+            arguments: Vec::new(),
+            memory_mb: 4096,
+            offline_username: "Builder".to_owned(),
+        };
+        let plan = build_repair_operation_plan("winterpack", &launch_plan);
+        let log = LauncherEventLog::with_capacity(3);
+
+        log.record_plan(&plan).expect("plan should record");
+        let events = log.list(None).expect("events should list");
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events.first().map(|event| &event.kind),
+            Some(&LauncherEventKind::Downloading)
+        );
+        assert_eq!(
+            events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+    }
+
+    #[test]
+    fn repair_profile_rejects_unknown_profiles() {
+        assert!(repair_profile("missing-profile").is_err());
+    }
+
+    #[test]
+    fn repair_plan_does_not_require_java_runtime_selection() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        let profiles_path = profiles_path().expect("profiles path should resolve");
+        save_profiles_to_path(
+            &profiles_path,
+            &[ProfileSummary {
+                id: "modern-vanilla".to_owned(),
+                name: "Modern Vanilla".to_owned(),
+                loader: ModLoader::Vanilla,
+                game_version: "1.21.8".to_owned(),
+                installed_pack_version: None,
+                last_played: None,
+                memory_mb: 4096,
+                jvm_args: Vec::new(),
+                resolution: None,
+                default_server: None,
+                java_runtime_override_path: None,
+            }],
+        )
+        .expect("profile should save");
+
+        let plan = plan_repair_profile("modern-vanilla")
+            .expect("repair planning should not require Java runtime selection");
+
+        assert_eq!(plan.operation, LauncherOperation::RepairProfile);
+        assert_eq!(plan.subject_id, "modern-vanilla");
+        assert!(plan
+            .events
+            .first()
+            .expect("repair plan should contain events")
+            .message
+            .contains("Modern Vanilla"));
+    }
+
+    #[test]
+    fn java_version_parser_handles_legacy_and_modern_versions() {
+        assert_eq!(
+            parse_java_version(r#"java version "1.8.0_391""#),
+            Some(("1.8.0_391".to_owned(), 8))
+        );
+        assert_eq!(
+            parse_java_version(r#"openjdk version "17.0.12" 2024-07-16"#),
+            Some(("17.0.12".to_owned(), 17))
+        );
+        assert_eq!(
+            parse_java_version("openjdk 21.0.4 2024-07-16"),
+            Some(("21.0.4".to_owned(), 21))
+        );
+    }
+
+    #[test]
+    fn java_release_file_parser_reads_java_version() {
+        assert_eq!(
+            parse_java_release_version(
+                r#"
+IMPLEMENTOR="Eclipse Adoptium"
+JAVA_VERSION="21.0.4"
+"#
+            ),
+            Some("21.0.4".to_owned())
+        );
+        assert_eq!(
+            parse_java_release_version("JAVA_VERSION='17.0.12'"),
+            Some("17.0.12".to_owned())
+        );
+        assert_eq!(parse_java_release_version("IMPLEMENTOR=\"missing\""), None);
+    }
+
+    #[test]
+    fn managed_java_runtime_summary_can_use_release_file_after_extract() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let java = root.path().join("runtimes/java-21/bin/java.exe");
+        fs::create_dir_all(java.parent().expect("java parent should exist"))
+            .expect("java parent should create");
+        fs::write(&java, b"not a real executable").expect("java fixture should write");
+        fs::write(
+            root.path().join("runtimes/java-21/release"),
+            "JAVA_VERSION=\"21.0.4\"\n",
+        )
+        .expect("release fixture should write");
+
+        let runtime = inspect_java_runtime(&java, JavaRuntimeSource::Bundled)
+            .expect("managed runtime should fall back to release metadata");
+
+        assert_eq!(runtime.version, "21.0.4");
+        assert_eq!(runtime.major_version, 21);
+        assert_eq!(runtime.source, JavaRuntimeSource::Bundled);
+        assert_eq!(runtime.path, display_path(&java));
+    }
+
+    #[test]
+    fn required_java_major_tracks_minecraft_generations() {
+        assert_eq!(required_java_major_for_minecraft("1.16.5"), 8);
+        assert_eq!(required_java_major_for_minecraft("1.17.1"), 16);
+        assert_eq!(required_java_major_for_minecraft("1.18.2"), 17);
+        assert_eq!(required_java_major_for_minecraft("1.20.4"), 17);
+        assert_eq!(required_java_major_for_minecraft("1.20.5"), 21);
+        assert_eq!(required_java_major_for_minecraft("1.21.8"), 21);
+        assert_eq!(required_java_major_for_minecraft("26.2"), 25);
+        assert_eq!(required_java_major_for_minecraft("26w14a"), 25);
+    }
+
+    #[test]
+    fn java_runtime_selection_prefers_lowest_satisfying_runtime() {
+        let runtimes = vec![
+            JavaRuntimeSummary {
+                id: "java-8".to_owned(),
+                path: "C:/Java/8/bin/java.exe".to_owned(),
+                version: "1.8.0_391".to_owned(),
+                major_version: 8,
+                source: JavaRuntimeSource::Path,
+            },
+            JavaRuntimeSummary {
+                id: "java-21".to_owned(),
+                path: "C:/Java/21/bin/java.exe".to_owned(),
+                version: "21.0.4".to_owned(),
+                major_version: 21,
+                source: JavaRuntimeSource::JavaHome,
+            },
+            JavaRuntimeSummary {
+                id: "java-17".to_owned(),
+                path: "C:/Java/17/bin/java.exe".to_owned(),
+                version: "17.0.12".to_owned(),
+                major_version: 17,
+                source: JavaRuntimeSource::Path,
+            },
+        ];
+
+        let selected = select_java_runtime(&runtimes, 17).expect("runtime should match");
+
+        assert_eq!(selected.major_version, 17);
+    }
+
+    #[test]
+    fn java_runtime_selection_requires_java_8_for_legacy_profiles() {
+        let runtimes = vec![
+            JavaRuntimeSummary {
+                id: "java-17".to_owned(),
+                path: "C:/Java/17/bin/java.exe".to_owned(),
+                version: "17.0.12".to_owned(),
+                major_version: 17,
+                source: JavaRuntimeSource::Path,
+            },
+            JavaRuntimeSummary {
+                id: "java-8".to_owned(),
+                path: "C:/Java/8/bin/java.exe".to_owned(),
+                version: "1.8.0_391".to_owned(),
+                major_version: 8,
+                source: JavaRuntimeSource::Path,
+            },
+        ];
+
+        let selected = select_java_runtime(&runtimes, 8).expect("Java 8 should match legacy");
+
+        assert_eq!(selected.major_version, 8);
+        assert_eq!(selected.path, "C:/Java/8/bin/java.exe");
+        assert!(select_java_runtime(&runtimes[..1], 8).is_none());
+    }
+
+    #[test]
+    fn java_runtime_selection_can_use_bundled_runtime() {
+        let runtimes = vec![
+            JavaRuntimeSummary {
+                id: "java-8".to_owned(),
+                path: "C:/Java/8/bin/java.exe".to_owned(),
+                version: "1.8.0_391".to_owned(),
+                major_version: 8,
+                source: JavaRuntimeSource::Path,
+            },
+            JavaRuntimeSummary {
+                id: "java-21-bundled".to_owned(),
+                path: "C:/TheBoysLauncher/runtimes/java-21/bin/java.exe".to_owned(),
+                version: "21.0.4".to_owned(),
+                major_version: 21,
+                source: JavaRuntimeSource::Bundled,
+            },
+        ];
+
+        let selected = select_java_runtime(&runtimes, 21).expect("bundled runtime should match");
+
+        assert_eq!(selected.source, JavaRuntimeSource::Bundled);
+        assert_eq!(selected.major_version, 21);
+    }
+
+    #[test]
+    fn java_launch_executable_selection_returns_compatible_path() {
+        let runtimes = vec![JavaRuntimeSummary {
+            id: "java-21-bundled".to_owned(),
+            path: "C:/TheBoysLauncher/runtimes/java-21/bin/java.exe".to_owned(),
+            version: "21.0.4".to_owned(),
+            major_version: 21,
+            source: JavaRuntimeSource::Bundled,
+        }];
+
+        let executable =
+            select_java_executable_from_runtimes(&runtimes, 21).expect("Java 21 should match");
+
+        assert_eq!(
+            executable,
+            "C:/TheBoysLauncher/runtimes/java-21/bin/java.exe"
+        );
+    }
+
+    #[test]
+    fn java_launch_executable_selection_rejects_incompatible_runtime() {
+        let runtimes = vec![JavaRuntimeSummary {
+            id: "java-17".to_owned(),
+            path: "C:/Java/17/bin/java.exe".to_owned(),
+            version: "17.0.12".to_owned(),
+            major_version: 17,
+            source: JavaRuntimeSource::Path,
+        }];
+
+        let error = select_java_executable_from_runtimes(&runtimes, 21)
+            .expect_err("Java 17 should not satisfy Java 21 launch");
+        let message = error.to_string();
+
+        assert!(message.contains("Minecraft requires Java 21 or newer"));
+        assert!(message.contains("Java 17 at C:/Java/17/bin/java.exe"));
+        assert!(message.contains("Install a managed Java runtime from Settings"));
+    }
+
+    #[test]
+    fn managed_java_candidate_paths_scan_launcher_runtime_layouts() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        fs::create_dir_all(root.path().join("runtimes/java-21/bin")).expect("create bin runtime");
+        fs::create_dir_all(root.path().join("runtimes/java-17")).expect("create flat runtime");
+        fs::create_dir_all(root.path().join("runtimes/temurin-21/jdk-21.0.4+7/bin"))
+            .expect("create nested JDK runtime");
+        fs::write(
+            root.path()
+                .join("runtimes/java-21/bin")
+                .join(java_executable_name()),
+            "",
+        )
+        .expect("write bin java fixture");
+        fs::write(
+            root.path()
+                .join("runtimes/java-17")
+                .join(java_executable_name()),
+            "",
+        )
+        .expect("write flat java fixture");
+        fs::write(
+            root.path()
+                .join("runtimes/temurin-21/jdk-21.0.4+7/bin")
+                .join(java_executable_name()),
+            "",
+        )
+        .expect("write nested JDK java fixture");
+
+        let candidates = managed_java_candidate_paths_from_root(root.path().join("runtimes"));
+
+        assert!(candidates
+            .iter()
+            .all(|(_, source)| *source == JavaRuntimeSource::Bundled));
+        assert!(candidates.iter().any(|(path, _)| path.ends_with(
+            Path::new("java-21")
+                .join("bin")
+                .join(java_executable_name())
+        )));
+        assert!(candidates
+            .iter()
+            .any(|(path, _)| path.ends_with(Path::new("java-17").join(java_executable_name()))));
+        assert!(candidates.iter().any(|(path, _)| path.ends_with(
+            Path::new("temurin-21")
+                .join("jdk-21.0.4+7")
+                .join("bin")
+                .join(java_executable_name())
+        )));
+    }
+
+    #[test]
+    fn recommended_java_manifest_entries_build_download_requests() {
+        let manifest = recommended_java_runtime_manifest();
+        let java_21 = manifest
+            .iter()
+            .find(|entry| entry.major_version == 21)
+            .expect("Java 21 recommendation should exist");
+        let java_25 = manifest
+            .iter()
+            .find(|entry| entry.major_version == 25)
+            .expect("Java 25 recommendation should exist");
+        let java_8 = manifest
+            .iter()
+            .find(|entry| entry.major_version == 8)
+            .expect("Java 8 recommendation should exist");
+
+        assert_eq!(java_21.vendor, "Eclipse Adoptium");
+        assert_eq!(java_21.platform, "windows-x64");
+        assert!(java_21.url.contains("/binary/latest/21/"));
+        assert!(java_25.url.contains("/binary/latest/25/"));
+        assert!(java_8.url.contains("/binary/latest/8/"));
+        let request = java_runtime_request_from_manifest_entry(java_21);
+
+        assert_eq!(request.runtime_id, "temurin-21-windows-x64");
+        assert_eq!(
+            request.archive_file_name.as_deref(),
+            Some("temurin-21-windows-x64.zip")
+        );
+        assert_eq!(request.url, java_21.url);
+    }
+
+    #[test]
+    fn java_runtime_manifest_parses_object_and_normalizes_entries() {
+        let manifest = parse_recommended_java_runtime_manifest_json(
+            r#"{
+              "runtimes": [
+                {
+                  "runtimeId": " Temurin 21 Windows x64 ",
+                  "label": " Temurin 21 LTS ",
+                  "vendor": " Eclipse Adoptium ",
+                  "majorVersion": 21,
+                  "platform": " windows-x64 ",
+                  "url": " https://example.com/java/temurin-21.zip ",
+                  "sha1": " abc123 ",
+                  "size": 12345,
+                  "archiveFileName": " temurin-21.zip ",
+                  "notes": " Recommended for current Minecraft. "
+                }
+              ]
+            }"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].runtime_id, "temurin-21-windows-x64");
+        assert_eq!(manifest[0].label, "Temurin 21 LTS");
+        assert_eq!(manifest[0].vendor, "Eclipse Adoptium");
+        assert_eq!(manifest[0].url, "https://example.com/java/temurin-21.zip");
+        assert_eq!(manifest[0].sha1.as_deref(), Some("abc123"));
+        assert_eq!(
+            manifest[0].archive_file_name.as_deref(),
+            Some("temurin-21.zip")
+        );
+        assert_eq!(manifest[0].notes, "Recommended for current Minecraft.");
+    }
+
+    #[test]
+    fn java_runtime_manifest_parses_bare_array() {
+        let manifest = parse_recommended_java_runtime_manifest_json(
+            r#"[
+              {
+                "runtimeId": "temurin-17-windows-x64",
+                "label": "Temurin 17 LTS",
+                "vendor": "Eclipse Adoptium",
+                "majorVersion": 17,
+                "platform": "windows-x64",
+                "url": "https://example.com/java/temurin-17.zip",
+                "archiveFileName": "temurin-17.zip",
+                "notes": "Recommended for older packs."
+              }
+            ]"#,
+        )
+        .expect("array manifest should parse");
+
+        assert_eq!(manifest[0].runtime_id, "temurin-17-windows-x64");
+        assert_eq!(manifest[0].major_version, 17);
+    }
+
+    #[test]
+    fn java_runtime_manifest_rejects_duplicate_or_unsafe_entries() {
+        assert!(parse_recommended_java_runtime_manifest_json(
+            r#"[
+                  {
+                    "runtimeId": "temurin-21",
+                    "label": "Temurin 21",
+                    "vendor": "Eclipse Adoptium",
+                    "majorVersion": 21,
+                    "platform": "windows-x64",
+                    "url": "https://example.com/java/temurin-21.zip",
+                    "archiveFileName": "temurin-21.zip",
+                    "notes": "Current"
+                  },
+                  {
+                    "runtimeId": "Temurin 21",
+                    "label": "Temurin 21 Duplicate",
+                    "vendor": "Eclipse Adoptium",
+                    "majorVersion": 21,
+                    "platform": "windows-x64",
+                    "url": "https://example.com/java/temurin-21b.zip",
+                    "archiveFileName": "temurin-21b.zip",
+                    "notes": "Duplicate"
+                  }
+                ]"#
+        )
+        .is_err());
+        assert!(parse_recommended_java_runtime_manifest_json(
+            r#"[
+                  {
+                    "runtimeId": "bad-url",
+                    "label": "Bad URL",
+                    "vendor": "Example",
+                    "majorVersion": 21,
+                    "platform": "windows-x64",
+                    "url": "file:///tmp/java.zip",
+                    "archiveFileName": "java.zip",
+                    "notes": "Nope"
+                  }
+                ]"#
+        )
+        .is_err());
+        assert!(parse_recommended_java_runtime_manifest_json(
+            r#"[
+                  {
+                    "runtimeId": "bad-archive",
+                    "label": "Bad Archive",
+                    "vendor": "Example",
+                    "majorVersion": 21,
+                    "platform": "windows-x64",
+                    "url": "https://example.com/java.zip",
+                    "archiveFileName": "../java.zip",
+                    "notes": "Nope"
+                  }
+                ]"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn recommended_java_manifest_entry_targets_managed_runtime_download() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let request = java_runtime_request_from_manifest_entry(
+            recommended_java_runtime_manifest()
+                .first()
+                .expect("recommendation should exist"),
+        );
+
+        let plan = build_managed_java_runtime_download_plan(request, &directories)
+            .expect("recommended runtime should plan");
+
+        assert_eq!(plan.version_id, "temurin-21-windows-x64");
+        assert_eq!(plan.items.len(), 1);
+        assert!(plan.items[0].destination.replace('\\', "/").ends_with(
+            "data/runtimes/temurin-21-windows-x64/downloads/temurin-21-windows-x64.zip"
+        ));
+    }
+
+    #[test]
+    fn java_runtime_summary_can_be_built_from_version_output() {
+        let runtime = java_runtime_from_version_output(
+            Path::new("C:/Java/21/bin/java.exe"),
+            JavaRuntimeSource::JavaHome,
+            r#"openjdk version "21.0.4" 2024-07-16"#,
+        )
+        .expect("runtime should parse");
+
+        assert_eq!(runtime.major_version, 21);
+        assert_eq!(runtime.source, JavaRuntimeSource::JavaHome);
+        assert!(runtime.id.starts_with("java-21-"));
+    }
+
+    #[test]
+    fn profiles_seed_to_json_when_missing() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+
+        let profiles = load_profiles_from_path(&path).expect("profiles should seed");
+
+        assert!(path.is_file());
+        assert!(!profiles.iter().any(|profile| profile.id == "winterpack"));
+        assert!(profiles
+            .iter()
+            .any(|profile| profile.id == "latest-release"));
+    }
+
+    #[test]
+    fn legacy_profiles_load_with_default_launch_metadata() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        fs::write(
+            &path,
+            r#"[
+              {
+                "id": "legacy",
+                "name": "Legacy",
+                "loader": "vanilla",
+                "gameVersion": "1.21.8",
+                "lastPlayed": null,
+                "memoryMb": 4096
+              }
+            ]"#,
+        )
+        .expect("legacy profile fixture should write");
+
+        let profiles = load_profiles_from_path(&path).expect("legacy profiles should load");
+
+        assert_eq!(profiles[0].id, "legacy");
+        assert!(profiles[0].jvm_args.is_empty());
+        assert_eq!(profiles[0].resolution, None);
+        assert_eq!(profiles[0].default_server, None);
+        assert_eq!(profiles[0].java_runtime_override_path, None);
+    }
+
+    #[test]
+    fn create_profile_persists_sorted_profile() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+
+        let profile = create_profile_at_path(
+            &path,
+            CreateProfileRequest {
+                name: "Creative Night".to_owned(),
+                loader: ModLoader::Vanilla,
+                game_version: "1.21.8".to_owned(),
+                memory_mb: 4096,
+            },
+        )
+        .expect("profile should create");
+        let profiles = load_profiles_from_path(&path).expect("profiles should load");
+
+        assert_eq!(profile.id, "creative-night");
+        assert!(profiles
+            .iter()
+            .any(|profile| profile.id == "creative-night"));
+        assert_eq!(profiles[0].name, "Creative Night");
+    }
+
+    #[test]
+    fn create_profile_rejects_duplicate_slug() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        let request = CreateProfileRequest {
+            name: "Creative Night".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.21.8".to_owned(),
+            memory_mb: 4096,
+        };
+
+        create_profile_at_path(&path, request.clone()).expect("first profile should create");
+
+        assert!(create_profile_at_path(&path, request).is_err());
+    }
+
+    #[test]
+    fn update_profile_persists_selected_fields() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        save_profiles_to_path(
+            &path,
+            &[ProfileSummary {
+                id: "winterpack".to_owned(),
+                name: "WinterPack".to_owned(),
+                loader: ModLoader::Fabric,
+                game_version: "1.21.1".to_owned(),
+                installed_pack_version: None,
+                last_played: Some("Yesterday".to_owned()),
+                memory_mb: 4096,
+                jvm_args: Vec::new(),
+                resolution: None,
+                default_server: None,
+                java_runtime_override_path: None,
+            }],
+        )
+        .expect("profiles should save");
+
+        let updated = update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: Some("WinterPack Plus".to_owned()),
+                loader: Some(ModLoader::Quilt),
+                game_version: Some("1.21.8".to_owned()),
+                memory_mb: Some(8192),
+                jvm_args: Some(vec![" -Dcustom.flag=true ".to_owned()]),
+                resolution: Some(ProfileResolution {
+                    width: 1600,
+                    height: 900,
+                }),
+                clear_resolution: false,
+                default_server: Some(ServerLaunchTarget {
+                    name: Some("Creative".to_owned()),
+                    address: "creative.theboys.example".to_owned(),
+                    port: Some(25566),
+                }),
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .expect("profile should update");
+        let profiles = load_profiles_from_path(&path).expect("profiles should load");
+
+        assert_eq!(updated.name, "WinterPack Plus");
+        assert_eq!(updated.loader, ModLoader::Quilt);
+        assert_eq!(updated.game_version, "1.21.8");
+        assert_eq!(updated.memory_mb, 8192);
+        assert_eq!(updated.jvm_args, vec!["-Dcustom.flag=true"]);
+        assert_eq!(
+            updated.resolution,
+            Some(ProfileResolution {
+                width: 1600,
+                height: 900,
+            })
+        );
+        assert_eq!(
+            updated.default_server,
+            Some(ServerLaunchTarget {
+                name: Some("Creative".to_owned()),
+                address: "creative.theboys.example".to_owned(),
+                port: Some(25566),
+            })
+        );
+        assert_eq!(updated.last_played, Some("Yesterday".to_owned()));
+        assert_eq!(profiles[0], updated);
+    }
+
+    #[test]
+    fn update_profile_can_clear_optional_launch_customizations() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        save_profiles_to_path(
+            &path,
+            &[ProfileSummary {
+                id: "winterpack".to_owned(),
+                name: "WinterPack".to_owned(),
+                loader: ModLoader::Forge,
+                game_version: "1.20.1".to_owned(),
+                installed_pack_version: None,
+                last_played: None,
+                memory_mb: 6144,
+                jvm_args: vec!["-Dcustom=true".to_owned()],
+                resolution: Some(ProfileResolution {
+                    width: 1600,
+                    height: 900,
+                }),
+                default_server: Some(ServerLaunchTarget {
+                    name: Some("The Cabin".to_owned()),
+                    address: "play.theboys.example".to_owned(),
+                    port: Some(25565),
+                }),
+                java_runtime_override_path: None,
+            }],
+        )
+        .expect("profiles should save");
+
+        let updated = update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: Some(Vec::new()),
+                resolution: None,
+                clear_resolution: true,
+                default_server: None,
+                clear_default_server: true,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .expect("profile should clear launch customizations");
+
+        assert!(updated.jvm_args.is_empty());
+        assert_eq!(updated.resolution, None);
+        assert_eq!(updated.default_server, None);
+    }
+
+    #[test]
+    fn mark_profile_launched_updates_last_played_without_reordering() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        save_profiles_to_path(
+            &path,
+            &[
+                ProfileSummary {
+                    id: "alpha".to_owned(),
+                    name: "Alpha".to_owned(),
+                    loader: ModLoader::Vanilla,
+                    game_version: "1.21.8".to_owned(),
+                    installed_pack_version: None,
+                    last_played: Some("Earlier".to_owned()),
+                    memory_mb: 2048,
+                    jvm_args: Vec::new(),
+                    resolution: None,
+                    default_server: None,
+                    java_runtime_override_path: None,
+                },
+                ProfileSummary {
+                    id: "winterpack".to_owned(),
+                    name: "WinterPack".to_owned(),
+                    loader: ModLoader::Forge,
+                    game_version: "1.20.1".to_owned(),
+                    installed_pack_version: Some("2.3.7".to_owned()),
+                    last_played: None,
+                    memory_mb: 4096,
+                    jvm_args: vec!["-Dcustom=true".to_owned()],
+                    resolution: Some(ProfileResolution {
+                        width: 1280,
+                        height: 720,
+                    }),
+                    default_server: Some(ServerLaunchTarget {
+                        name: Some("Cabin".to_owned()),
+                        address: "play.theboys.example".to_owned(),
+                        port: Some(25565),
+                    }),
+                    java_runtime_override_path: None,
+                },
+            ],
+        )
+        .expect("profiles should save");
+
+        let updated = mark_profile_launched_at_path(&path, "winterpack", "Just now")
+            .expect("profile launch timestamp should update");
+        let profiles = load_profiles_from_path(&path).expect("profiles should load");
+
+        assert_eq!(updated.id, "winterpack");
+        assert_eq!(updated.last_played.as_deref(), Some("Just now"));
+        assert_eq!(updated.installed_pack_version.as_deref(), Some("2.3.7"));
+        assert_eq!(updated.jvm_args, vec!["-Dcustom=true"]);
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "winterpack"]
+        );
+        assert_eq!(
+            profiles
+                .iter()
+                .find(|profile| profile.id == "alpha")
+                .and_then(|profile| profile.last_played.as_deref()),
+            Some("Earlier")
+        );
+    }
+
+    #[test]
+    fn mark_profile_launched_uses_unix_timestamp_marker() {
+        let _env = LauncherDirEnvGuard::isolated();
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        env::set_var("THEBOYS_LAUNCHER_ROOT_DIR", root.path());
+        load_profiles().expect("profiles should seed");
+
+        let before = current_unix_seconds();
+        let updated =
+            mark_profile_launched("winterpack").expect("profile launch timestamp should update");
+        let after = current_unix_seconds();
+        let marker = updated
+            .last_played
+            .as_deref()
+            .expect("last played should be set")
+            .strip_prefix("unix:")
+            .expect("last played should use unix marker")
+            .parse::<u64>()
+            .expect("unix marker should parse");
+
+        assert!(marker >= before);
+        assert!(marker <= after);
+    }
+
+    #[test]
+    fn mark_profile_launched_rejects_missing_or_blank_values() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        load_profiles_from_path(&path).expect("profiles should seed");
+
+        assert!(mark_profile_launched_at_path(&path, "", "Just now").is_err());
+        assert!(mark_profile_launched_at_path(&path, "winterpack", "").is_err());
+        assert!(mark_profile_launched_at_path(&path, "missing", "Just now").is_err());
+    }
+
+    #[test]
+    fn installed_pack_profile_persists_new_profile() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        let profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: Some("10/30/2025".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let saved = persist_installed_pack_profile_at_path(&path, profile.clone())
+            .expect("installed profile should persist");
+        let profiles = load_profiles_from_path(&path).expect("profiles should load");
+        let stored = profiles
+            .iter()
+            .find(|profile| profile.id == "winterpack")
+            .expect("winterpack profile should exist");
+
+        assert_eq!(saved, profile);
+        assert_eq!(stored.name, "WinterPack");
+        assert_eq!(stored.loader, ModLoader::Forge);
+        assert_eq!(stored.game_version, "1.20.1");
+        assert_eq!(stored.installed_pack_version.as_deref(), Some("10/30/2025"));
+        assert_eq!(stored.memory_mb, 6144);
+    }
+
+    #[test]
+    fn installed_pack_profile_updates_metadata_and_keeps_launch_customizations() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        save_profiles_to_path(
+            &path,
+            &[ProfileSummary {
+                id: "winterpack".to_owned(),
+                name: "Old WinterPack".to_owned(),
+                loader: ModLoader::Fabric,
+                game_version: "1.21.1".to_owned(),
+                installed_pack_version: Some("10/01/2025".to_owned()),
+                last_played: Some("Yesterday".to_owned()),
+                memory_mb: 4096,
+                jvm_args: vec!["-Dtheboys.custom=true".to_owned()],
+                resolution: Some(ProfileResolution {
+                    width: 1600,
+                    height: 900,
+                }),
+                default_server: Some(ServerLaunchTarget {
+                    name: Some("Cabin".to_owned()),
+                    address: "play.example.test".to_owned(),
+                    port: Some(25565),
+                }),
+                java_runtime_override_path: None,
+            }],
+        )
+        .expect("seed profile should save");
+        let profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: Some("10/30/2025".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        persist_installed_pack_profile_at_path(&path, profile)
+            .expect("installed profile should update");
+        let profiles = load_profiles_from_path(&path).expect("profiles should load");
+        let stored = profiles
+            .iter()
+            .find(|profile| profile.id == "winterpack")
+            .expect("winterpack profile should exist");
+
+        assert_eq!(stored.name, "WinterPack");
+        assert_eq!(stored.loader, ModLoader::Forge);
+        assert_eq!(stored.game_version, "1.20.1");
+        assert_eq!(stored.installed_pack_version.as_deref(), Some("10/30/2025"));
+        assert_eq!(stored.memory_mb, 6144);
+        assert_eq!(stored.last_played.as_deref(), Some("Yesterday"));
+        assert_eq!(stored.jvm_args, vec!["-Dtheboys.custom=true"]);
+        assert_eq!(
+            stored.resolution.as_ref().map(|value| value.width),
+            Some(1600)
+        );
+        assert_eq!(
+            stored
+                .default_server
+                .as_ref()
+                .map(|value| value.address.as_str()),
+            Some("play.example.test")
+        );
+    }
+
+    #[test]
+    fn update_profile_rejects_invalid_or_empty_changes() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        load_profiles_from_path(&path).expect("profiles should seed");
+
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: None,
+                resolution: None,
+                clear_resolution: false,
+                default_server: None,
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: Some(" ".to_owned()),
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: None,
+                resolution: None,
+                clear_resolution: false,
+                default_server: None,
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: Some(256),
+                jvm_args: None,
+                resolution: None,
+                clear_resolution: false,
+                default_server: None,
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: Some(vec!["-Xmx16G".to_owned()]),
+                resolution: None,
+                clear_resolution: false,
+                default_server: None,
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: None,
+                resolution: Some(ProfileResolution {
+                    width: 100,
+                    height: 100,
+                }),
+                clear_resolution: false,
+                default_server: None,
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: None,
+                resolution: None,
+                clear_resolution: false,
+                default_server: Some(ServerLaunchTarget {
+                    name: None,
+                    address: "bad address".to_owned(),
+                    port: Some(25565),
+                }),
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: None,
+                resolution: Some(ProfileResolution {
+                    width: 1280,
+                    height: 720,
+                }),
+                clear_resolution: true,
+                default_server: None,
+                clear_default_server: false,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+        assert!(update_profile_at_path(
+            &path,
+            UpdateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+                loader: None,
+                game_version: None,
+                memory_mb: None,
+                jvm_args: None,
+                resolution: None,
+                clear_resolution: false,
+                default_server: Some(ServerLaunchTarget {
+                    name: Some("Cabin".to_owned()),
+                    address: "play.example.test".to_owned(),
+                    port: Some(25565),
+                }),
+                clear_default_server: true,
+                java_runtime_override_path: None,
+                clear_java_runtime_override: false,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn archive_profile_removes_catalog_entry_and_returns_profile() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        save_profiles_to_path(
+            &path,
+            &[
+                ProfileSummary {
+                    id: "winterpack".to_owned(),
+                    name: "WinterPack".to_owned(),
+                    loader: ModLoader::Fabric,
+                    game_version: "1.21.1".to_owned(),
+                    installed_pack_version: None,
+                    last_played: Some("Yesterday".to_owned()),
+                    memory_mb: 4096,
+                    jvm_args: Vec::new(),
+                    resolution: None,
+                    default_server: None,
+                    java_runtime_override_path: None,
+                },
+                ProfileSummary {
+                    id: "latest-release".to_owned(),
+                    name: "Latest Release".to_owned(),
+                    loader: ModLoader::Vanilla,
+                    game_version: "1.21.8".to_owned(),
+                    installed_pack_version: None,
+                    last_played: None,
+                    memory_mb: 4096,
+                    jvm_args: Vec::new(),
+                    resolution: None,
+                    default_server: None,
+                    java_runtime_override_path: None,
+                },
+            ],
+        )
+        .expect("profiles should save");
+
+        let archived = archive_profile_at_path(
+            &path,
+            ArchiveProfileRequest {
+                id: "winterpack".to_owned(),
+            },
+        )
+        .expect("profile should archive");
+        let profiles = load_profiles_from_path(&path).expect("profiles should load");
+
+        assert_eq!(archived.id, "winterpack");
+        assert_eq!(archived.last_played, Some("Yesterday".to_owned()));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "latest-release");
+    }
+
+    #[test]
+    fn archive_profile_rejects_blank_or_missing_ids() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("profiles.json");
+        load_profiles_from_path(&path).expect("profiles should seed");
+
+        assert!(
+            archive_profile_at_path(&path, ArchiveProfileRequest { id: " ".to_owned() },).is_err()
+        );
+        assert!(archive_profile_at_path(
+            &path,
+            ArchiveProfileRequest {
+                id: "missing-profile".to_owned(),
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delete_profile_removes_catalog_entry_and_managed_profile_directory_only() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let profiles_path = root.path().join("profiles.json");
+        let data_dir = root.path().join("data");
+        let deleted_profile_dir = data_dir.join("profiles/winterpack");
+        let sibling_profile_dir = data_dir.join("profiles/latest-release");
+        fs::create_dir_all(deleted_profile_dir.join("mods")).expect("profile dir should create");
+        fs::write(deleted_profile_dir.join("mods/example.jar"), b"mod")
+            .expect("profile file should write");
+        fs::create_dir_all(&sibling_profile_dir).expect("sibling profile dir should create");
+        fs::write(sibling_profile_dir.join("options.txt"), b"keep")
+            .expect("sibling file should write");
+        save_profiles_to_path(
+            &profiles_path,
+            &[
+                ProfileSummary {
+                    id: "winterpack".to_owned(),
+                    name: "WinterPack".to_owned(),
+                    loader: ModLoader::Fabric,
+                    game_version: "1.21.1".to_owned(),
+                    installed_pack_version: Some("2.3.7".to_owned()),
+                    last_played: Some("Yesterday".to_owned()),
+                    memory_mb: 4096,
+                    jvm_args: Vec::new(),
+                    resolution: None,
+                    default_server: None,
+                    java_runtime_override_path: None,
+                },
+                ProfileSummary {
+                    id: "latest-release".to_owned(),
+                    name: "Latest Release".to_owned(),
+                    loader: ModLoader::Vanilla,
+                    game_version: "1.21.8".to_owned(),
+                    installed_pack_version: None,
+                    last_played: None,
+                    memory_mb: 4096,
+                    jvm_args: Vec::new(),
+                    resolution: None,
+                    default_server: None,
+                    java_runtime_override_path: None,
+                },
+            ],
+        )
+        .expect("profiles should save");
+
+        let deleted = delete_profile_at_path(
+            &profiles_path,
+            DeleteProfileRequest {
+                id: "winterpack".to_owned(),
+            },
+            &LauncherDirectories {
+                data_dir: display_path(&data_dir),
+                config_dir: display_path(root.path()),
+                cache_dir: display_path(root.path()),
+                log_dir: display_path(root.path()),
+            },
+        )
+        .expect("profile should delete");
+        let profiles = load_profiles_from_path(&profiles_path).expect("profiles should load");
+
+        assert_eq!(deleted.id, "winterpack");
+        assert_eq!(deleted.installed_pack_version, Some("2.3.7".to_owned()));
+        assert!(!deleted_profile_dir.exists());
+        assert!(sibling_profile_dir.join("options.txt").is_file());
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "latest-release");
+    }
+
+    #[test]
+    fn delete_profile_rejects_blank_missing_or_unsafe_ids() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let profiles_path = root.path().join("profiles.json");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(root.path()),
+            cache_dir: display_path(root.path()),
+            log_dir: display_path(root.path()),
+        };
+        load_profiles_from_path(&profiles_path).expect("profiles should seed");
+
+        assert!(delete_profile_at_path(
+            &profiles_path,
+            DeleteProfileRequest { id: " ".to_owned() },
+            &directories,
+        )
+        .is_err());
+        assert!(delete_profile_at_path(
+            &profiles_path,
+            DeleteProfileRequest {
+                id: "../winterpack".to_owned(),
+            },
+            &directories,
+        )
+        .is_err());
+        assert!(delete_profile_at_path(
+            &profiles_path,
+            DeleteProfileRequest {
+                id: "missing-profile".to_owned(),
+            },
+            &directories,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn minecraft_manifest_resolves_latest_release_by_default() {
+        let manifest = minecraft_manifest_fixture();
+
+        let version = resolve_minecraft_version(&manifest, None).expect("version should resolve");
+
+        assert_eq!(version.id, "1.21.8");
+        assert_eq!(version.version_type, MinecraftVersionType::Release);
+        assert_eq!(version.release_time, "2025-07-17T12:00:00+00:00");
+    }
+
+    #[test]
+    fn minecraft_manifest_resolves_explicit_snapshot() {
+        let manifest = minecraft_manifest_fixture();
+
+        let version =
+            resolve_minecraft_version(&manifest, Some("25w31a")).expect("version should resolve");
+
+        assert_eq!(version.id, "25w31a");
+        assert_eq!(version.version_type, MinecraftVersionType::Snapshot);
+    }
+
+    #[test]
+    fn minecraft_manifest_rejects_unknown_versions() {
+        let manifest = minecraft_manifest_fixture();
+
+        assert!(resolve_minecraft_version(&manifest, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn download_plan_includes_client_asset_index_and_libraries() {
+        let details = minecraft_details_fixture();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        let plan = build_download_plan(&details, &directories).expect("plan should build");
+
+        assert_eq!(plan.version_id, "1.21.8");
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::ClientJar
+                && item.destination == "C:/cache/versions/1.21.8/client.jar"));
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::AssetIndex
+                && item.destination == "C:/cache/assets/indexes/17.json"));
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::Library
+                && item
+                    .destination
+                    .ends_with("com/example/core/1.0.0/core-1.0.0.jar")));
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::NativeLibrary
+                && item.id == "native-library-com.example:native:1.0.0-natives-windows"
+                && item.destination == "C:/cache/natives/1.21.8/native-1.0.0-natives-windows.jar"));
+        let has_modern_native = plan.items.iter().any(|item| {
+            item.kind == DownloadKind::NativeLibrary
+                && item.id == "native-library-org.lwjgl:lwjgl-glfw:3.3.1:natives-windows"
+                && item.destination
+                    == "C:/cache/natives/1.21.8/lwjgl-glfw-3.3.1-natives-windows.jar"
+        });
+        let modern_native_on_classpath = plan
+            .items
+            .iter()
+            .any(|item| item.id == "library-org.lwjgl:lwjgl-glfw:3.3.1:natives-windows");
+        assert_eq!(has_modern_native, cfg!(target_os = "windows"));
+        assert!(!modern_native_on_classpath);
+    }
+
+    #[test]
+    fn download_plan_applies_os_rules_to_libraries() {
+        let details = minecraft_details_fixture();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        let plan = build_download_plan(&details, &directories).expect("plan should build");
+        let has_windows_only = plan
+            .items
+            .iter()
+            .any(|item| item.id == "library-com.example:windows-only:1.0.0");
+
+        assert_eq!(has_windows_only, cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn download_plan_rejects_non_http_manifest_urls() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let mut details = minecraft_details_fixture();
+        details.downloads.client.url = "file:///C:/temp/client.jar".to_owned();
+
+        assert!(build_download_plan(&details, &directories).is_err());
+    }
+
+    #[test]
+    fn download_plan_rejects_escaping_library_paths() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let mut details = minecraft_details_fixture();
+        details.libraries[0]
+            .downloads
+            .artifact
+            .as_mut()
+            .expect("fixture has artifact")
+            .path = "../outside.jar".to_owned();
+
+        assert!(build_download_plan(&details, &directories).is_err());
+    }
+
+    #[tokio::test]
+    async fn minecraft_metadata_fetch_rejects_non_http_urls_before_requesting() {
+        assert!(
+            fetch_minecraft_version_details("file:///C:/temp/version.json")
+                .await
+                .is_err()
+        );
+        assert!(fetch_minecraft_asset_index("file:///C:/temp/assets.json")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn download_plan_extends_with_asset_objects() {
+        let details = minecraft_details_fixture();
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let mut plan = build_download_plan(&details, &directories).expect("plan should build");
+        let asset_index = minecraft_asset_index_fixture();
+
+        extend_download_plan_with_assets(&mut plan, &asset_index, &directories)
+            .expect("assets should plan");
+
+        let asset_items = plan
+            .items
+            .iter()
+            .filter(|item| item.kind == DownloadKind::AssetObject)
+            .collect::<Vec<_>>();
+        assert_eq!(asset_items.len(), 2);
+        assert_eq!(
+            asset_items[0].destination,
+            "C:/cache/assets/objects/12/1234567890abcdef"
+        );
+        assert_eq!(
+            asset_items[1].url,
+            "https://resources.download.minecraft.net/ab/abcdef1234567890"
+        );
+    }
+
+    #[test]
+    fn curated_pack_file_download_plan_targets_profile_directory() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        let plan = build_curated_pack_file_download_plan("winterpack", &directories)
+            .expect("pack files should plan");
+
+        assert_eq!(plan.version_id, "winterpack");
+        assert_eq!(plan.items.len(), 1);
+        assert!(plan.items.iter().all(|item| {
+            item.kind == DownloadKind::PackFile
+                && item.destination.starts_with("C:/data/profiles/winterpack/")
+        }));
+        assert_eq!(
+            plan.items[0].url,
+            "https://modpacks.dylan.lol/winterpack-modpack/pack.toml"
+        );
+        assert!(plan.items[0].destination.ends_with("/pack.toml"));
+        assert_eq!(plan.items[0].sha1, None);
+    }
+
+    #[test]
+    fn curated_pack_file_download_plan_rejects_unknown_pack() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        assert!(build_curated_pack_file_download_plan("missing-pack", &directories).is_err());
+    }
+
+    #[test]
+    fn pack_file_download_item_rejects_profile_escape_targets() {
+        let root = Path::new("C:/data/profiles/winterpack");
+        let file = CuratedPackFile {
+            id: "bad-file".to_owned(),
+            url: "https://cdn.theboys.example/bad.jar".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            target_path: "../escape.jar".to_owned(),
+            preserve: false,
+        };
+
+        assert!(pack_file_download_item(root, file).is_err());
+    }
+
+    #[test]
+    fn pack_file_download_item_rejects_non_http_urls() {
+        let root = Path::new("C:/data/profiles/winterpack");
+        let file = CuratedPackFile {
+            id: "bad-file".to_owned(),
+            url: "file:///C:/Users/server/.ssh/id_rsa".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            target_path: "mods/bad.jar".to_owned(),
+            preserve: false,
+        };
+
+        assert!(pack_file_download_item(root, file).is_err());
+    }
+
+    #[test]
+    fn modloader_download_plan_builds_fabric_metadata_item() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "fabric-night".to_owned(),
+            name: "Fabric Night".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_modloader_download_plan_for_profile(&profile, &directories)
+            .expect("modloader plan should build");
+
+        assert_eq!(plan.version_id, "fabric-night-fabric");
+        assert_eq!(plan.items.len(), 1);
+        let item = &plan.items[0];
+        assert_eq!(item.kind, DownloadKind::ModLoaderMetadata);
+        assert_eq!(
+            item.url,
+            "https://meta.fabricmc.net/v2/versions/loader/1.21.8"
+        );
+        assert_eq!(
+            item.destination,
+            "C:/cache/modloaders/fabric-loader/1.21.8/metadata.json"
+        );
+    }
+
+    #[test]
+    fn modloader_download_plan_builds_forge_installer_item() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "forge-night".to_owned(),
+            name: "Forge Night".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_modloader_download_plan_for_profile(&profile, &directories)
+            .expect("modloader plan should build");
+
+        assert_eq!(plan.version_id, "forge-night-forge");
+        let item = &plan.items[0];
+        assert_eq!(item.kind, DownloadKind::ModLoaderInstaller);
+        assert!(item
+            .url
+            .ends_with("/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar"));
+        assert_eq!(
+            item.destination,
+            "C:/cache/modloaders/forge/1.20.1-47.4.10/forge-installer.jar"
+        );
+    }
+
+    #[test]
+    fn modloader_download_plan_prefers_packwiz_forge_version() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_modloader_download_plan_for_profile_and_version(
+            &profile,
+            Some("47.4.0"),
+            &directories,
+        )
+        .expect("modloader plan should build");
+
+        assert_eq!(plan.version_id, "winterpack-forge");
+        let item = &plan.items[0];
+        assert_eq!(item.kind, DownloadKind::ModLoaderInstaller);
+        assert!(item
+            .url
+            .ends_with("/1.20.1-47.4.0/forge-1.20.1-47.4.0-installer.jar"));
+        assert_eq!(
+            item.destination,
+            "C:/cache/modloaders/forge/1.20.1-47.4.0/forge-installer.jar"
+        );
+    }
+
+    #[test]
+    fn modloader_download_plan_builds_neoforge_installer_item() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "neoforge-night".to_owned(),
+            name: "NeoForge Night".to_owned(),
+            loader: ModLoader::Neoforge,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_modloader_download_plan_for_profile(&profile, &directories)
+            .expect("modloader plan should build");
+
+        assert_eq!(plan.version_id, "neoforge-night-neoforge");
+        let item = &plan.items[0];
+        assert_eq!(item.kind, DownloadKind::ModLoaderInstaller);
+        assert_eq!(
+            item.url,
+            "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.1/neoforge-21.1.1-installer.jar"
+        );
+        assert_eq!(
+            item.destination,
+            "C:/cache/modloaders/neoforge/21.1.1/neoforge-installer.jar"
+        );
+    }
+
+    #[test]
+    fn modloader_download_plan_rejects_missing_installer_catalog_entries() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "forge-latest".to_owned(),
+            name: "Forge Latest".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        assert!(build_modloader_download_plan_for_profile(&profile, &directories).is_err());
+    }
+
+    #[test]
+    fn modloader_download_plan_rejects_vanilla_profiles() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "vanilla".to_owned(),
+            name: "Vanilla".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        assert!(build_modloader_download_plan_for_profile(&profile, &directories).is_err());
+    }
+
+    #[test]
+    fn managed_java_runtime_download_plan_targets_runtime_directory() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let plan = build_managed_java_runtime_download_plan(
+            JavaRuntimeDownloadRequest {
+                runtime_id: "Java 21 LTS".to_owned(),
+                url: "https://downloads.example/java-21.zip".to_owned(),
+                sha1: Some("abc123".to_owned()),
+                size: Some(4096),
+                archive_file_name: Some("java-21.zip".to_owned()),
+            },
+            &directories,
+        )
+        .expect("managed Java plan should build");
+
+        assert_eq!(plan.version_id, "java-21-lts");
+        assert_eq!(plan.items.len(), 1);
+        let item = &plan.items[0];
+        assert_eq!(item.kind, DownloadKind::JavaRuntimeArchive);
+        assert_eq!(item.url, "https://downloads.example/java-21.zip");
+        assert_eq!(item.sha1.as_deref(), Some("abc123"));
+        assert_eq!(item.size, Some(4096));
+        assert_eq!(
+            item.destination,
+            "C:/data/runtimes/java-21-lts/downloads/java-21.zip"
+        );
+    }
+
+    #[test]
+    fn managed_java_runtime_download_plan_rejects_archive_path_escape() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        assert!(build_managed_java_runtime_download_plan(
+            JavaRuntimeDownloadRequest {
+                runtime_id: "java-21".to_owned(),
+                url: "https://downloads.example/java-21.zip".to_owned(),
+                sha1: None,
+                size: None,
+                archive_file_name: Some("../escape.zip".to_owned()),
+            },
+            &directories,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn managed_java_runtime_download_plan_rejects_non_http_urls() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        assert!(build_managed_java_runtime_download_plan(
+            JavaRuntimeDownloadRequest {
+                runtime_id: "java-21".to_owned(),
+                url: "file:///C:/temp/java-21.zip".to_owned(),
+                sha1: None,
+                size: None,
+                archive_file_name: Some("java-21.zip".to_owned()),
+            },
+            &directories,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn managed_java_runtime_install_plan_validates_staged_archive() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root.path().join("runtimes/java-21/downloads/java-21.zip");
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("archive parent should create");
+        fs::write(&archive, "zip").expect("archive fixture should write");
+        let plan = DownloadPlan {
+            version_id: "java-21".to_owned(),
+            items: vec![DownloadItem {
+                id: "java-runtime-archive-java-21".to_owned(),
+                kind: DownloadKind::JavaRuntimeArchive,
+                url: "https://downloads.example/java-21.zip".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: Some(3),
+                destination: display_path(&archive),
+            }],
+        };
+
+        let operation =
+            plan_managed_java_runtime_install(&plan).expect("runtime install should plan");
+
+        assert_eq!(operation.operation, LauncherOperation::InstallJavaRuntime);
+        assert_eq!(operation.subject_id, "java-21");
+        assert_eq!(
+            operation
+                .events
+                .last()
+                .and_then(|event| event.progress_percent),
+            Some(100)
+        );
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message.contains("ready for archive extraction")));
+    }
+
+    #[test]
+    fn managed_java_runtime_install_plan_rejects_missing_archive() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root.path().join("runtimes/java-21/downloads/java-21.zip");
+        let plan = DownloadPlan {
+            version_id: "java-21".to_owned(),
+            items: vec![DownloadItem {
+                id: "java-runtime-archive-java-21".to_owned(),
+                kind: DownloadKind::JavaRuntimeArchive,
+                url: "https://downloads.example/java-21.zip".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive),
+            }],
+        };
+
+        assert!(plan_managed_java_runtime_install(&plan).is_err());
+    }
+
+    #[test]
+    fn managed_java_runtime_install_plan_rejects_non_runtime_items() {
+        let plan = DownloadPlan {
+            version_id: "java-21".to_owned(),
+            items: vec![DownloadItem {
+                id: "client-1.21.8".to_owned(),
+                kind: DownloadKind::ClientJar,
+                url: "https://downloads.example/client.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: "C:/cache/versions/1.21.8/client.jar".to_owned(),
+            }],
+        };
+
+        assert!(plan_managed_java_runtime_install(&plan).is_err());
+    }
+
+    #[test]
+    fn managed_java_runtime_install_extracts_zip_archive() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root.path().join("runtimes/java-21/downloads/java-21.zip");
+        write_zip_archive(
+            &archive,
+            &[
+                ("bin/java.exe", b"java binary".as_slice()),
+                ("release", b"JAVA_VERSION=\"21\"".as_slice()),
+            ],
+        );
+        let plan = DownloadPlan {
+            version_id: "java-21".to_owned(),
+            items: vec![DownloadItem {
+                id: "java-runtime-archive-java-21".to_owned(),
+                kind: DownloadKind::JavaRuntimeArchive,
+                url: "https://downloads.example/java-21.zip".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive),
+            }],
+        };
+
+        let operation =
+            execute_managed_java_runtime_install(&plan).expect("runtime archive should install");
+
+        assert_eq!(operation.operation, LauncherOperation::InstallJavaRuntime);
+        assert_eq!(operation.subject_id, "java-21");
+        assert_eq!(
+            fs::read(root.path().join("runtimes/java-21/bin/java.exe"))
+                .expect("java binary should extract"),
+            b"java binary"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("runtimes/java-21/release"))
+                .expect("release file should extract"),
+            "JAVA_VERSION=\"21\""
+        );
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message.contains("Extracted 2 Java runtime file")));
+        assert!(operation
+            .events
+            .last()
+            .expect("completion event should exist")
+            .message
+            .contains("is installed"));
+    }
+
+    #[test]
+    fn native_library_extraction_writes_allowed_native_files_only() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root
+            .path()
+            .join("cache/natives/1.21.8/native-1.0.0-natives-windows.jar");
+        write_zip_archive(
+            &archive,
+            &[
+                ("native.dll", b"dll".as_slice()),
+                ("libnative.so", b"so".as_slice()),
+                ("META-INF/MANIFEST.MF", b"manifest".as_slice()),
+                ("windows/x64/org/example/nested.dll", b"nested".as_slice()),
+                ("readme.txt", b"text".as_slice()),
+                (
+                    "windows/x64/org/example/nested.dll.sha1",
+                    b"sidecar".as_slice(),
+                ),
+            ],
+        );
+        let plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: vec![DownloadItem {
+                id: "native-library-example".to_owned(),
+                kind: DownloadKind::NativeLibrary,
+                url: "https://example.invalid/native.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive),
+            }],
+        };
+
+        let extracted = extract_native_libraries_from_download_plan(&plan)
+            .expect("native libraries should extract");
+
+        assert_eq!(extracted, 3);
+        assert_eq!(
+            fs::read(root.path().join("cache/natives/1.21.8/native.dll"))
+                .expect("native dll should extract"),
+            b"dll"
+        );
+        assert_eq!(
+            fs::read(root.path().join("cache/natives/1.21.8/libnative.so"))
+                .expect("native so should extract"),
+            b"so"
+        );
+        assert_eq!(
+            fs::read(root.path().join("cache/natives/1.21.8/nested.dll"))
+                .expect("nested native dll should extract flat"),
+            b"nested"
+        );
+        assert_eq!(
+            fs::read(root.path().join("cache/natives/1.21.8/java/native.dll"))
+                .expect("native dll should mirror into java child directory"),
+            b"dll"
+        );
+        assert_eq!(
+            fs::read(root.path().join("cache/natives/1.21.8/java/nested.dll"))
+                .expect("nested native dll should mirror flat into java child directory"),
+            b"nested"
+        );
+        assert!(!root
+            .path()
+            .join("cache/natives/1.21.8/META-INF/MANIFEST.MF")
+            .exists());
+        assert!(!root
+            .path()
+            .join("cache/natives/1.21.8/nested.dll.sha1")
+            .exists());
+    }
+
+    #[test]
+    fn native_library_extraction_rejects_path_traversal() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root
+            .path()
+            .join("cache/natives/1.21.8/native-1.0.0-natives-windows.jar");
+        write_zip_archive(&archive, &[("../escape.dll", b"escape".as_slice())]);
+        let plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: vec![DownloadItem {
+                id: "native-library-example".to_owned(),
+                kind: DownloadKind::NativeLibrary,
+                url: "https://example.invalid/native.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive),
+            }],
+        };
+
+        assert!(extract_native_libraries_from_download_plan(&plan).is_err());
+        assert!(!root.path().join("cache/natives/escape.dll").exists());
+    }
+
+    #[test]
+    fn managed_java_runtime_install_extracts_tar_gz_archive() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root
+            .path()
+            .join("runtimes/java-21/downloads/java-21.tar.gz");
+        write_tar_gz_archive(
+            &archive,
+            &[
+                ("bin/java", b"java binary".as_slice()),
+                ("release", b"JAVA_VERSION=\"21\"".as_slice()),
+            ],
+        );
+        let plan = DownloadPlan {
+            version_id: "java-21".to_owned(),
+            items: vec![DownloadItem {
+                id: "java-runtime-archive-java-21".to_owned(),
+                kind: DownloadKind::JavaRuntimeArchive,
+                url: "https://downloads.example/java-21.tar.gz".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive),
+            }],
+        };
+
+        let operation =
+            execute_managed_java_runtime_install(&plan).expect("runtime archive should install");
+
+        assert_eq!(operation.operation, LauncherOperation::InstallJavaRuntime);
+        assert_eq!(operation.subject_id, "java-21");
+        assert_eq!(
+            fs::read(root.path().join("runtimes/java-21/bin/java"))
+                .expect("java binary should extract"),
+            b"java binary"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("runtimes/java-21/release"))
+                .expect("release file should extract"),
+            "JAVA_VERSION=\"21\""
+        );
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message.contains("Extracted 2 Java runtime file")));
+    }
+
+    #[test]
+    fn managed_java_runtime_install_rejects_zip_path_traversal() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root.path().join("runtimes/java-21/downloads/java-21.zip");
+        write_zip_archive(&archive, &[("../escape.txt", b"escape".as_slice())]);
+        let plan = DownloadPlan {
+            version_id: "java-21".to_owned(),
+            items: vec![DownloadItem {
+                id: "java-runtime-archive-java-21".to_owned(),
+                kind: DownloadKind::JavaRuntimeArchive,
+                url: "https://downloads.example/java-21.zip".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive),
+            }],
+        };
+
+        assert!(execute_managed_java_runtime_install(&plan).is_err());
+        assert!(!root.path().join("runtimes/escape.txt").exists());
+    }
+
+    #[test]
+    fn managed_java_runtime_install_rejects_tar_gz_path_traversal() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive = root.path().join("runtimes/java-21/downloads/java-21.tgz");
+        write_raw_tar_gz_archive(&archive, &[("../escape.txt", b"escape".as_slice())]);
+        let plan = DownloadPlan {
+            version_id: "java-21".to_owned(),
+            items: vec![DownloadItem {
+                id: "java-runtime-archive-java-21".to_owned(),
+                kind: DownloadKind::JavaRuntimeArchive,
+                url: "https://downloads.example/java-21.tgz".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive),
+            }],
+        };
+
+        assert!(execute_managed_java_runtime_install(&plan).is_err());
+        assert!(!root.path().join("runtimes/escape.txt").exists());
+    }
+
+    #[test]
+    fn install_auxiliary_download_plan_combines_pack_files_and_modloader() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        let plan = build_install_auxiliary_download_plan("winterpack", &directories)
+            .expect("auxiliary plan should build");
+
+        assert_eq!(plan.version_id, "winterpack");
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::PackFile));
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::ModLoaderMetadata));
+    }
+
+    #[test]
+    fn install_auxiliary_download_plan_for_pack_profile_uses_packwiz_and_modloader() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_install_auxiliary_download_plan_for_pack_profile(&profile, &directories)
+            .expect("auxiliary plan should build");
+
+        assert_eq!(plan.version_id, "winterpack");
+        assert!(plan.items.iter().any(|item| {
+            item.kind == DownloadKind::PackFile
+                && item.url == "https://modpacks.dylan.lol/winterpack-modpack/pack.toml"
+        }));
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.kind == DownloadKind::ModLoaderInstaller));
+    }
+
+    #[test]
+    fn repair_auxiliary_download_plan_skips_modloader_for_vanilla_profiles() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "latest-release".to_owned(),
+            name: "Latest Release".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "1.21.8".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_repair_auxiliary_download_plan_for_profile(&profile, &directories)
+            .expect("auxiliary plan should build");
+
+        assert_eq!(plan.version_id, "latest-release-auxiliary");
+        assert!(plan.items.is_empty());
+    }
+
+    #[test]
+    fn repair_pack_file_planning_only_uses_catalog_for_installed_pack_profiles() {
+        let catalog = vec![ModpackCatalogEntry {
+            id: "winterpack".to_owned(),
+            display_name: Some("WinterPack".to_owned()),
+            pack_url: "https://modpacks.dylan.lol/winterpack-modpack/pack.toml".to_owned(),
+            instance_name: "WinterPack".to_owned(),
+            description: None,
+            author: None,
+            tags: Vec::new(),
+            last_updated: Some("10/30/2025".to_owned()),
+            category: None,
+            min_ram: None,
+            recommended_ram: None,
+            default_server: None,
+            changelog: None,
+            default: false,
+        }];
+        let installed_profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: Some("10/01/2025".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let manual_profile = ProfileSummary {
+            installed_pack_version: None,
+            ..installed_profile.clone()
+        };
+
+        assert_eq!(
+            repair_catalog_entry_for_profile(&installed_profile, &catalog)
+                .map(|entry| entry.id.as_str()),
+            Some("winterpack")
+        );
+        assert!(repair_catalog_entry_for_profile(&manual_profile, &catalog).is_none());
+    }
+
+    #[test]
+    fn packwiz_modloader_plan_uses_pack_metadata_over_stale_profile_loader() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let stale_profile = ProfileSummary {
+            id: "winterpack".to_owned(),
+            name: "WinterPack".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: Some("10/30/2025".to_owned()),
+            last_played: Some("Yesterday".to_owned()),
+            memory_mb: 6144,
+            jvm_args: vec!["-Dtheboyslauncher.pack=winterpack".to_owned()],
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let pack_info = PackwizPackInfo {
+            name: Some("WinterPack".to_owned()),
+            author: None,
+            pack_version: "2.3.7".to_owned(),
+            pack_format: Some("packwiz:1.1.0".to_owned()),
+            minecraft_version: "1.20.1".to_owned(),
+            loader: ModLoader::Forge,
+            loader_version: Some("47.4.0".to_owned()),
+            index_file: Some("index.toml".to_owned()),
+            index_hash_format: Some("sha256".to_owned()),
+            index_hash: Some(
+                "e2094593a8e660f9157ceb54bec8f3cf8194f833f3e31fd55a77324fb84fe701".to_owned(),
+            ),
+        };
+        let mut plan = DownloadPlan {
+            version_id: "winterpack".to_owned(),
+            items: Vec::new(),
+        };
+
+        append_modloader_items_for_pack_info(&mut plan, &stale_profile, &pack_info, &directories)
+            .expect(
+                "pack metadata should override stale profile loader during repair/update planning",
+            );
+
+        assert!(plan.items.iter().any(|item| {
+            item.kind == DownloadKind::ModLoaderInstaller
+                && item
+                    .destination
+                    .ends_with("modloaders/forge/1.20.1-47.4.0/forge-installer.jar")
+                && item.url.ends_with("/forge-1.20.1-47.4.0-installer.jar")
+        }));
+        assert!(!plan.items.iter().any(|item| item.url.contains("fabric")));
+    }
+
+    #[tokio::test]
+    async fn repair_auxiliary_download_plan_for_manual_profile_falls_back_to_modloader_only() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "manual-forge".to_owned(),
+            name: "Manual Forge".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = fetch_repair_auxiliary_download_plan_for_profile_with_catalog(
+            &profile,
+            &[],
+            &directories,
+        )
+        .await
+        .expect("manual profile repair should plan");
+
+        assert_eq!(plan.version_id, "manual-forge-auxiliary");
+        assert!(plan
+            .items
+            .iter()
+            .all(|item| item.kind == DownloadKind::ModLoaderInstaller));
+    }
+
+    #[test]
+    fn download_artifact_plan_reports_pending_items_without_execution() {
+        let plan = DownloadPlan {
+            version_id: "winterpack".to_owned(),
+            items: vec![
+                DownloadItem {
+                    id: "pack-file".to_owned(),
+                    kind: DownloadKind::PackFile,
+                    url: "https://cdn.theboys.example/pack-file.jar".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/data/profiles/winterpack/mods/pack-file.jar".to_owned(),
+                },
+                DownloadItem {
+                    id: "fabric-loader".to_owned(),
+                    kind: DownloadKind::ModLoaderMetadata,
+                    url: "https://meta.fabricmc.net/v2/versions/loader/1.21.8".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/cache/modloaders/fabric/metadata.json".to_owned(),
+                },
+            ],
+        };
+
+        let operation = plan_download_artifacts(&plan);
+
+        assert_eq!(operation.operation, LauncherOperation::DownloadArtifacts);
+        assert_eq!(operation.subject_id, "winterpack");
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "Artifact pending: pack-file (pack file)"));
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "Artifact pending: fabric-loader (modloader metadata)"));
+    }
+
+    #[test]
+    fn download_plan_rejects_invalid_asset_hashes() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let mut plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: Vec::new(),
+        };
+        let asset_index = MinecraftAssetIndexObjects {
+            objects: HashMap::from([(
+                "bad/hash".to_owned(),
+                MinecraftAssetObject {
+                    hash: "x".to_owned(),
+                    size: 1,
+                },
+            )]),
+        };
+
+        assert!(extend_download_plan_with_assets(&mut plan, &asset_index, &directories).is_err());
+    }
+
+    #[tokio::test]
+    async fn download_item_rejects_non_http_urls_before_requesting() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let item = DownloadItem {
+            id: "fixture".to_owned(),
+            kind: DownloadKind::ClientJar,
+            url: "file:///C:/temp/client.jar".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: display_path(&root.path().join("client.jar")),
+        };
+
+        assert!(download_item(&item).await.is_err());
+        assert!(!Path::new(&item.destination).exists());
+    }
+
+    #[tokio::test]
+    async fn download_item_retries_transient_http_status_and_writes_success() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let bytes = b"hello retry";
+        let (url, request_count) = serve_http_responses(vec![
+            http_response("503 Service Unavailable", ""),
+            http_response(
+                "200 OK",
+                std::str::from_utf8(bytes).expect("fixture is utf8"),
+            ),
+        ]);
+        let item = DownloadItem {
+            id: "retry-client".to_owned(),
+            kind: DownloadKind::ClientJar,
+            url,
+            sha1: Some(sha1_hex(bytes)),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(bytes.len() as u64),
+            destination: display_path(&root.path().join("client.jar")),
+        };
+
+        let outcome = download_item(&item)
+            .await
+            .expect("transient failure should retry");
+
+        assert_eq!(outcome, DownloadOutcome::Downloaded);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fs::read(Path::new(&item.destination)).expect("download should write"),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn download_item_does_not_retry_non_transient_http_status() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let (url, request_count) =
+            serve_http_responses(vec![http_response("404 Not Found", "missing")]);
+        let item = DownloadItem {
+            id: "missing-client".to_owned(),
+            kind: DownloadKind::ClientJar,
+            url,
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: display_path(&root.path().join("client.jar")),
+        };
+
+        let error = download_item(&item)
+            .await
+            .expect_err("404 should fail without retry");
+
+        assert!(error.to_string().contains("HTTP status 404"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(!Path::new(&item.destination).exists());
+    }
+
+    #[test]
+    fn download_retry_status_classification_is_conservative() {
+        assert!(is_retryable_download_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(is_retryable_download_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!is_retryable_download_status(reqwest::StatusCode::OK));
+        assert!(!is_retryable_download_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+    }
+
+    fn serve_http_responses(responses: Vec<String>) -> (String, Arc<AtomicU64>) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should expose local address");
+        let request_count = Arc::new(AtomicU64::new(0));
+        let server_request_count = Arc::clone(&request_count);
+
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("test server should accept");
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("test response should write");
+            }
+        });
+
+        (format!("http://{address}/artifact"), request_count)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn download_item_writer_persists_valid_bytes() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let bytes = b"hello launcher";
+        let item = DownloadItem {
+            id: "fixture".to_owned(),
+            kind: DownloadKind::ClientJar,
+            url: "https://example.invalid/client.jar".to_owned(),
+            sha1: Some(sha1_hex(bytes)),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(bytes.len() as u64),
+            destination: display_path(&root.path().join("versions/fixture/client.jar")),
+        };
+
+        let outcome = write_download_item_bytes(&item, bytes).expect("bytes should write");
+
+        assert_eq!(outcome, DownloadOutcome::Downloaded);
+        assert!(download_item_matches(Path::new(&item.destination), &item).expect("match checks"));
+    }
+
+    #[test]
+    fn download_item_writer_replaces_existing_stale_pack_file() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let bytes = b"fresh pack config";
+        let destination = root
+            .path()
+            .join("config/alexscaves_biome_generation/magnetic_caves.json");
+        fs::create_dir_all(destination.parent().expect("destination has parent"))
+            .expect("parent should create");
+        fs::write(&destination, b"old config").expect("stale pack file should write");
+        let item = DownloadItem {
+            id: "winterpack-file-config-alexscaves-biome-generation-magnetic-caves-json".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://example.invalid/magnetic_caves.json".to_owned(),
+            sha1: Some(sha1_hex(bytes)),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(bytes.len() as u64),
+            destination: display_path(&destination),
+        };
+
+        let outcome = write_download_item_bytes(&item, bytes).expect("stale file should replace");
+
+        assert_eq!(outcome, DownloadOutcome::Downloaded);
+        assert_eq!(
+            fs::read(&destination).expect("destination should read"),
+            bytes
+        );
+        assert!(download_item_matches(&destination, &item).expect("match checks"));
+    }
+
+    #[test]
+    fn download_item_writer_skips_existing_valid_file() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let bytes = b"already here";
+        let destination = root.path().join("libraries/example.jar");
+        fs::create_dir_all(destination.parent().expect("destination has parent"))
+            .expect("parent should create");
+        fs::write(&destination, bytes).expect("fixture should write");
+        let item = DownloadItem {
+            id: "fixture".to_owned(),
+            kind: DownloadKind::Library,
+            url: "https://example.invalid/example.jar".to_owned(),
+            sha1: Some(sha1_hex(bytes)),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(bytes.len() as u64),
+            destination: display_path(&destination),
+        };
+
+        let outcome = write_download_item_bytes(&item, bytes).expect("bytes should be accepted");
+
+        assert_eq!(outcome, DownloadOutcome::AlreadyPresent);
+    }
+
+    #[test]
+    fn download_item_writer_rejects_sha1_mismatch() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let item = DownloadItem {
+            id: "fixture".to_owned(),
+            kind: DownloadKind::ClientJar,
+            url: "https://example.invalid/client.jar".to_owned(),
+            sha1: Some("0000000000000000000000000000000000000000".to_owned()),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(5),
+            destination: display_path(&root.path().join("client.jar")),
+        };
+
+        assert!(write_download_item_bytes(&item, b"hello").is_err());
+        assert!(!Path::new(&item.destination).exists());
+    }
+
+    #[test]
+    fn download_item_writer_rejects_sha256_mismatch() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let item = DownloadItem {
+            id: "fixture".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://example.invalid/config/example.toml".to_owned(),
+            sha1: None,
+            sha256: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            ),
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(5),
+            destination: display_path(&root.path().join("config/example.toml")),
+        };
+
+        assert!(write_download_item_bytes(&item, b"hello").is_err());
+        assert!(!Path::new(&item.destination).exists());
+    }
+
+    #[test]
+    fn download_item_writer_validates_sha512_and_md5() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let bytes = b"extra digest coverage";
+        let item = DownloadItem {
+            id: "fixture".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://example.invalid/config/example.toml".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: Some(sha512_hex(bytes)),
+            md5: Some(md5_hex(bytes)),
+            murmur2: None,
+            size: Some(bytes.len() as u64),
+            destination: display_path(&root.path().join("config/example.toml")),
+        };
+
+        let outcome = write_download_item_bytes(&item, bytes).expect("bytes should write");
+
+        assert_eq!(outcome, DownloadOutcome::Downloaded);
+        assert!(download_item_matches(Path::new(&item.destination), &item).expect("match checks"));
+    }
+
+    #[test]
+    fn download_item_writer_rejects_sha512_and_md5_mismatch() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let sha512_item = DownloadItem {
+            id: "sha512-fixture".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://example.invalid/config/sha512.toml".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: Some("0".repeat(128)),
+            md5: None,
+            murmur2: None,
+            size: Some(5),
+            destination: display_path(&root.path().join("config/sha512.toml")),
+        };
+        let md5_item = DownloadItem {
+            id: "md5-fixture".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://example.invalid/config/md5.toml".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: Some("0".repeat(32)),
+            murmur2: None,
+            size: Some(5),
+            destination: display_path(&root.path().join("config/md5.toml")),
+        };
+
+        assert!(write_download_item_bytes(&sha512_item, b"hello").is_err());
+        assert!(write_download_item_bytes(&md5_item, b"hello").is_err());
+        assert!(!Path::new(&sha512_item.destination).exists());
+        assert!(!Path::new(&md5_item.destination).exists());
+    }
+
+    #[test]
+    fn download_item_writer_validates_murmur2() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let bytes = b"curseforge fingerprint coverage";
+        let item = DownloadItem {
+            id: "murmur2-fixture".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://example.invalid/mods/example.jar".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: Some(murmur2_fingerprint(bytes).to_string()),
+            size: Some(bytes.len() as u64),
+            destination: display_path(&root.path().join("mods/example.jar")),
+        };
+
+        let outcome = write_download_item_bytes(&item, bytes).expect("bytes should write");
+
+        assert_eq!(outcome, DownloadOutcome::Downloaded);
+        assert!(download_item_matches(Path::new(&item.destination), &item).expect("match checks"));
+    }
+
+    #[test]
+    fn download_item_writer_rejects_murmur2_mismatch() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let item = DownloadItem {
+            id: "murmur2-fixture".to_owned(),
+            kind: DownloadKind::PackFile,
+            url: "https://example.invalid/mods/example.jar".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: Some("0".to_owned()),
+            size: Some(5),
+            destination: display_path(&root.path().join("mods/example.jar")),
+        };
+
+        assert!(write_download_item_bytes(&item, b"hello").is_err());
+        assert!(!Path::new(&item.destination).exists());
+    }
+
+    #[test]
+    fn murmur2_fingerprint_ignores_curseforge_whitespace_bytes() {
+        assert_eq!(
+            murmur2_fingerprint(b"abc"),
+            murmur2_fingerprint(b"a b\r\n\tc")
+        );
+    }
+
+    #[test]
+    fn download_plan_executor_writes_items_and_reports_progress() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let client_bytes = b"client";
+        let library_bytes = b"library";
+        let plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: vec![
+                DownloadItem {
+                    id: "client-1.21.8".to_owned(),
+                    kind: DownloadKind::ClientJar,
+                    url: "https://example.invalid/client.jar".to_owned(),
+                    sha1: Some(sha1_hex(client_bytes)),
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(client_bytes.len() as u64),
+                    destination: display_path(&root.path().join("versions/1.21.8/client.jar")),
+                },
+                DownloadItem {
+                    id: "library-example".to_owned(),
+                    kind: DownloadKind::Library,
+                    url: "https://example.invalid/library.jar".to_owned(),
+                    sha1: Some(sha1_hex(library_bytes)),
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(library_bytes.len() as u64),
+                    destination: display_path(&root.path().join("libraries/example.jar")),
+                },
+            ],
+        };
+        let bytes_by_id = HashMap::from([
+            ("client-1.21.8".to_owned(), client_bytes.to_vec()),
+            ("library-example".to_owned(), library_bytes.to_vec()),
+        ]);
+
+        let operation =
+            execute_download_plan_with_bytes(&plan, &bytes_by_id).expect("plan should execute");
+
+        assert_eq!(operation.operation, LauncherOperation::DownloadArtifacts);
+        assert_eq!(operation.subject_id, "1.21.8");
+        assert!(Path::new(&plan.items[0].destination).is_file());
+        assert!(Path::new(&plan.items[1].destination).is_file());
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "Downloaded file: client-1.21.8 (client jar, 6 B)"));
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "Downloaded file: library-example (library, 7 B)"));
+        assert_eq!(
+            operation.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_plan_executor_streams_live_progress_events() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: vec![
+                DownloadItem {
+                    id: "client-1.21.8".to_owned(),
+                    kind: DownloadKind::ClientJar,
+                    url: "https://example.invalid/client.jar".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(6),
+                    destination: display_path(&root.path().join("versions/1.21.8/client.jar")),
+                },
+                DownloadItem {
+                    id: "library-example".to_owned(),
+                    kind: DownloadKind::Library,
+                    url: "https://example.invalid/library.jar".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(7),
+                    destination: display_path(&root.path().join("libraries/example.jar")),
+                },
+            ],
+        };
+        let mut streamed = Vec::new();
+
+        let operation = execute_download_plan_with_writer_and_events(
+            &plan,
+            |item| {
+                let outcome = if item.id == "client-1.21.8" {
+                    DownloadOutcome::Downloaded
+                } else {
+                    DownloadOutcome::AlreadyPresent
+                };
+                std::future::ready(Ok(outcome))
+            },
+            |event| {
+                streamed.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .expect("plan should execute");
+
+        assert_eq!(streamed.len(), (plan.items.len() * 2) + 4);
+        assert_eq!(operation.events, streamed);
+        assert!(streamed
+            .iter()
+            .all(|event| event.operation == Some(LauncherOperation::DownloadArtifacts)));
+        assert!(streamed
+            .iter()
+            .all(|event| event.subject_id.as_deref() == Some("1.21.8")));
+        assert_eq!(
+            streamed.first().map(|event| &event.kind),
+            Some(&LauncherEventKind::Queued)
+        );
+        assert!(streamed
+            .iter()
+            .any(|event| event.message == "Downloaded file: client-1.21.8 (client jar, 6 B)"));
+        assert!(streamed
+            .iter()
+            .any(|event| event.message == "File already present: library-example (library, 7 B)"));
+        let client_start_index = streamed
+            .iter()
+            .position(|event| event.message == "Downloading file: client-1.21.8 (client jar, 6 B)")
+            .expect("client start event should stream");
+        let client_done_index = streamed
+            .iter()
+            .position(|event| event.message == "Downloaded file: client-1.21.8 (client jar, 6 B)")
+            .expect("client done event should stream");
+        assert!(client_start_index < client_done_index);
+        assert!(streamed
+            .windows(2)
+            .all(|pair| pair[0].progress_percent.unwrap_or(0)
+                <= pair[1].progress_percent.unwrap_or(0)));
+        assert_eq!(
+            streamed.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_plan_executor_runs_independent_files_concurrently() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let plan = DownloadPlan {
+            version_id: "fast-pack".to_owned(),
+            items: (0..3)
+                .map(|index| DownloadItem {
+                    id: format!("file-{index}"),
+                    kind: DownloadKind::PackFile,
+                    url: format!("https://example.invalid/file-{index}.toml"),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(5),
+                    destination: display_path(
+                        &root.path().join(format!("config/file-{index}.toml")),
+                    ),
+                })
+                .collect(),
+        };
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active_for_writer = std::sync::Arc::clone(&active);
+        let max_for_writer = std::sync::Arc::clone(&max_active);
+
+        let operation = execute_download_plan_with_concurrent_writer_and_events(
+            &plan,
+            move |_item| {
+                let active = std::sync::Arc::clone(&active_for_writer);
+                let max_active = std::sync::Arc::clone(&max_for_writer);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(DownloadOutcome::Downloaded)
+                }
+            },
+            |_event| Ok(()),
+        )
+        .await
+        .expect("plan should execute");
+
+        assert!(max_active.load(Ordering::SeqCst) > 1);
+        assert_eq!(
+            operation.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_plan_executor_serializes_duplicate_destinations() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let shared_destination = display_path(&root.path().join("config/shared.toml"));
+        let plan = DownloadPlan {
+            version_id: "duplicate-pack".to_owned(),
+            items: (0..2)
+                .map(|index| DownloadItem {
+                    id: format!("file-{index}"),
+                    kind: DownloadKind::PackFile,
+                    url: format!("https://example.invalid/file-{index}.toml"),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(5),
+                    destination: shared_destination.clone(),
+                })
+                .collect(),
+        };
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active_for_writer = std::sync::Arc::clone(&active);
+        let max_for_writer = std::sync::Arc::clone(&max_active);
+
+        execute_download_plan_with_concurrent_writer_and_events(
+            &plan,
+            move |_item| {
+                let active = std::sync::Arc::clone(&active_for_writer);
+                let max_active = std::sync::Arc::clone(&max_for_writer);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(DownloadOutcome::Downloaded)
+                }
+            },
+            |_event| Ok(()),
+        )
+        .await
+        .expect("plan should execute");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn download_plan_empty_plan_completes_without_verification_step() {
+        let plan = DownloadPlan {
+            version_id: "empty-pack".to_owned(),
+            items: Vec::new(),
+        };
+
+        let operation = plan_download_artifacts(&plan);
+
+        assert_eq!(operation.events.len(), 3);
+        assert_eq!(
+            operation
+                .events
+                .iter()
+                .map(|event| &event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                &LauncherEventKind::Queued,
+                &LauncherEventKind::Planning,
+                &LauncherEventKind::Completed,
+            ]
+        );
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "Resolved no files for empty-pack."));
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "No files to download for empty-pack."));
+    }
+
+    #[tokio::test]
+    async fn download_plan_empty_stream_completes_without_calling_writer() {
+        let plan = DownloadPlan {
+            version_id: "empty-pack".to_owned(),
+            items: Vec::new(),
+        };
+        let mut streamed = Vec::new();
+
+        let operation = execute_download_plan_with_writer_and_events(
+            &plan,
+            |_item| std::future::ready(Err(anyhow!("writer should not be called"))),
+            |event| {
+                streamed.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .expect("empty plan should complete");
+
+        assert_eq!(streamed.len(), 3);
+        assert_eq!(operation.events, streamed);
+        assert_eq!(
+            streamed.last().map(|event| event.message.as_str()),
+            Some("No files to download for empty-pack.")
+        );
+    }
+
+    #[tokio::test]
+    async fn download_plan_executor_streams_failed_event_before_error() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: vec![DownloadItem {
+                id: "client-1.21.8".to_owned(),
+                kind: DownloadKind::ClientJar,
+                url: "https://example.invalid/client.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: Some(6),
+                destination: display_path(&root.path().join("versions/1.21.8/client.jar")),
+            }],
+        };
+        let mut streamed = Vec::new();
+
+        let error = execute_download_plan_with_writer_and_events(
+            &plan,
+            |_item| std::future::ready(Err(anyhow!("network unavailable"))),
+            |event| {
+                streamed.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("failed download should return error");
+
+        assert!(error
+            .to_string()
+            .contains("failed to download file 'client-1.21.8'"));
+        assert!(error.to_string().contains("network unavailable"));
+        assert!(streamed
+            .iter()
+            .any(|event| event.message == "Downloading file: client-1.21.8 (client jar, 6 B)"));
+        assert_eq!(
+            streamed.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Failed)
+        );
+        let failed = streamed.last().expect("failed event should stream");
+        assert_eq!(failed.operation, Some(LauncherOperation::DownloadArtifacts));
+        assert_eq!(failed.subject_id.as_deref(), Some("1.21.8"));
+        assert_eq!(
+            failed.message,
+            "Failed file: client-1.21.8 (client jar, 6 B)"
+        );
+    }
+
+    #[test]
+    fn download_plan_executor_reuses_existing_valid_items() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let bytes = b"client";
+        let destination = root.path().join("client.jar");
+        fs::write(&destination, bytes).expect("fixture should write");
+        let plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: vec![DownloadItem {
+                id: "client-1.21.8".to_owned(),
+                kind: DownloadKind::ClientJar,
+                url: "https://example.invalid/client.jar".to_owned(),
+                sha1: Some(sha1_hex(bytes)),
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: Some(bytes.len() as u64),
+                destination: display_path(&destination),
+            }],
+        };
+        let bytes_by_id = HashMap::from([("client-1.21.8".to_owned(), bytes.to_vec())]);
+
+        let operation =
+            execute_download_plan_with_bytes(&plan, &bytes_by_id).expect("plan should execute");
+
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "File already present: client-1.21.8 (client jar, 6 B)"));
+    }
+
+    #[test]
+    fn preserved_pack_file_executor_keeps_existing_destination() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let destination = root
+            .path()
+            .join("profiles/winterpack/config/user-options.txt");
+        fs::create_dir_all(destination.parent().expect("destination has parent"))
+            .expect("fixture directory should write");
+        fs::write(&destination, b"user edits").expect("fixture should write");
+        let remote_bytes = b"remote defaults";
+        let plan = DownloadPlan {
+            version_id: "winterpack".to_owned(),
+            items: vec![DownloadItem {
+                id: "winterpack-preserved-config-user-options".to_owned(),
+                kind: DownloadKind::PreservedPackFile,
+                url: "https://example.invalid/config/user-options.txt".to_owned(),
+                sha1: Some(sha1_hex(remote_bytes)),
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: Some(remote_bytes.len() as u64),
+                destination: display_path(&destination),
+            }],
+        };
+        let bytes_by_id = HashMap::from([(
+            "winterpack-preserved-config-user-options".to_owned(),
+            remote_bytes.to_vec(),
+        )]);
+
+        let operation =
+            execute_download_plan_with_bytes(&plan, &bytes_by_id).expect("plan should execute");
+
+        assert_eq!(
+            fs::read(&destination).expect("preserved file should remain readable"),
+            b"user edits"
+        );
+        assert!(operation.events.iter().any(|event| event.message
+            == "File already present: winterpack-preserved-config-user-options (preserved pack file, 15 B)"));
+    }
+
+    #[test]
+    fn download_item_label_includes_kind_and_human_size() {
+        let item = DownloadItem {
+            id: "java-runtime".to_owned(),
+            kind: DownloadKind::JavaRuntimeArchive,
+            url: "https://example.invalid/java.zip".to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(5 * 1024 * 1024),
+            destination: "C:/data/runtimes/java/downloads/java.zip".to_owned(),
+        };
+
+        assert_eq!(
+            download_item_label(&item),
+            "java-runtime (Java runtime archive, 5.0 MB)"
+        );
+        assert_eq!(format_download_size(1536), "1.5 KB");
+        assert_eq!(format_download_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    #[test]
+    fn download_plan_summary_includes_known_and_unknown_sizes() {
+        let plan = DownloadPlan {
+            version_id: "mixed-pack".to_owned(),
+            items: vec![
+                DownloadItem {
+                    id: "client".to_owned(),
+                    kind: DownloadKind::ClientJar,
+                    url: "https://example.invalid/client.jar".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(6),
+                    destination: "C:/cache/client.jar".to_owned(),
+                },
+                DownloadItem {
+                    id: "metadata".to_owned(),
+                    kind: DownloadKind::ModLoaderMetadata,
+                    url: "https://example.invalid/metadata.json".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: "C:/cache/metadata.json".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            download_plan_summary_message(&plan),
+            "Resolved 2 artifact(s), 6 B known plus 1 unknown-size file."
+        );
+        assert_eq!(
+            download_plan_size_label(&plan),
+            "6 B known plus 1 unknown-size file"
+        );
+    }
+
+    #[test]
+    fn download_plan_executor_rejects_missing_fixture_bytes() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let plan = DownloadPlan {
+            version_id: "1.21.8".to_owned(),
+            items: vec![DownloadItem {
+                id: "client-1.21.8".to_owned(),
+                kind: DownloadKind::ClientJar,
+                url: "https://example.invalid/client.jar".to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&root.path().join("client.jar")),
+            }],
+        };
+
+        assert!(execute_download_plan_with_bytes(&plan, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn scanner_detects_supported_launcher_roots() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let prism = root.path().join("PrismLauncher/instances/WinterPack");
+        let multimc = root.path().join("MultiMC/instances/Creative Night");
+        let gdlauncher = root.path().join("GDLauncher_next/instances/Sky Lab");
+        let atlauncher = root.path().join("ATLauncher/instances/Quest Pack");
+        let minecraft = root.path().join(".minecraft");
+
+        fs::create_dir_all(&prism).expect("create prism fixture");
+        fs::create_dir_all(&multimc).expect("create multimc fixture");
+        fs::create_dir_all(&gdlauncher).expect("create gdlauncher fixture");
+        fs::create_dir_all(&atlauncher).expect("create atlauncher fixture");
+        fs::create_dir_all(&minecraft).expect("create minecraft fixture");
+        fs::create_dir_all(prism.join("saves/world")).expect("create prism save fixture");
+        fs::write(prism.join("saves/world/level.dat"), "level").expect("write prism save");
+        fs::write(prism.join("options.txt"), "fov:0.5").expect("write prism options");
+        fs::write(prism.join("theboys-icon.png"), "png").expect("write prism icon");
+        fs::create_dir_all(multimc.join("mods")).expect("create multimc mods fixture");
+        fs::write(multimc.join("mods/example.jar"), "mod").expect("write multimc mod");
+        fs::write(multimc.join("logo.png"), "png").expect("write multimc icon");
+        fs::write(
+            prism.join("instance.cfg"),
+            "name=WinterPack\nnotes=Cozy import fixture\niconKey=theboys-icon",
+        )
+        .expect("write prism marker");
+        fs::write(
+            multimc.join("mmc-pack.json"),
+            r#"{
+              "components": [
+                { "uid": "net.minecraft", "version": "1.20.1" },
+                { "uid": "net.fabricmc.fabric-loader", "version": "0.15.11" }
+              ]
+            }"#,
+        )
+        .expect("write multimc marker");
+        fs::write(
+            multimc.join("manifest.json"),
+            r#"{
+              "name": "Creative Night",
+              "description": "Shared creative world import",
+              "icon": "logo.png"
+            }"#,
+        )
+        .expect("write multimc identity metadata");
+        fs::write(
+            gdlauncher.join("manifest.json"),
+            r#"{
+              "name": "Sky Lab",
+              "description": "GDLauncher lab fixture",
+              "minecraft": {
+                "version": "1.19.4",
+                "modLoaders": [
+                  { "id": "forge-45.4.0", "primary": false },
+                  { "id": "quilt-0.21.2", "primary": true }
+                ]
+              }
+            }"#,
+        )
+        .expect("write gdlauncher metadata");
+        fs::write(
+            atlauncher.join("minecraftinstance.json"),
+            r#"{
+              "name": "Quest Pack",
+              "summary": "ATLauncher quest fixture",
+              "modLoader": "forge",
+              "gameVersion": "1.18.2"
+            }"#,
+        )
+        .expect("write atlauncher metadata");
+        fs::write(
+            minecraft.join("launcher_profiles.json"),
+            r#"{
+              "selectedProfile": "snapshot-night",
+              "profiles": {
+                "release": {
+                  "name": "Latest Release",
+                  "lastVersionId": "1.21.8"
+                },
+                "snapshot-night": {
+                  "name": "Snapshot Night",
+                  "lastVersionId": "25w31a"
+                }
+              }
+            }"#,
+        )
+        .expect("write minecraft marker");
+
+        let candidates =
+            scan_imports_in_roots([root.path().to_path_buf()]).expect("scan should pass");
+
+        assert_eq!(candidates.len(), 5);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == ImportKind::Prism
+                && candidate.name == "WinterPack"
+                && candidate.detected_name.as_deref() == Some("WinterPack")
+                && candidate.detected_summary.as_deref() == Some("Cozy import fixture")
+                && candidate
+                    .detected_icon_path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("/theboys-icon.png"))
+                && candidate.importable_file_count == Some(2)
+                && candidate.importable_total_bytes == Some(12)
+                && candidate.last_modified_unix_seconds.is_some()));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == ImportKind::Multimc
+                && candidate.name == "Creative Night"
+                && candidate.detected_loader == Some(ModLoader::Fabric)
+                && candidate.detected_game_version.as_deref() == Some("1.20.1")
+                && candidate.detected_name.as_deref() == Some("Creative Night")
+                && candidate.detected_summary.as_deref() == Some("Shared creative world import")
+                && candidate
+                    .detected_icon_path
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with("/logo.png"))
+                && candidate.importable_file_count == Some(1)
+                && candidate.importable_total_bytes == Some(3)));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == ImportKind::Gdlauncher
+                && candidate.name == "Sky Lab"
+                && candidate.detected_loader == Some(ModLoader::Quilt)
+                && candidate.detected_game_version.as_deref() == Some("1.19.4")
+                && candidate.detected_summary.as_deref() == Some("GDLauncher lab fixture")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == ImportKind::Atlauncher
+                && candidate.name == "Quest Pack"
+                && candidate.detected_loader == Some(ModLoader::Forge)
+                && candidate.detected_game_version.as_deref() == Some("1.18.2")
+                && candidate.detected_summary.as_deref() == Some("ATLauncher quest fixture")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == ImportKind::Minecraft
+                && candidate.detected_loader == Some(ModLoader::Vanilla)
+                && candidate.detected_name.as_deref() == Some("Snapshot Night")
+                && candidate.detected_game_version.as_deref() == Some("25w31a")
+                && candidate.detected_summary.as_deref() == Some("2 launcher profiles detected")
+                && candidate.importable_file_count == Some(0)
+                && candidate.importable_total_bytes == Some(0)));
+    }
+
+    #[test]
+    fn scanner_ignores_unmarked_instance_folders() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        fs::create_dir_all(root.path().join("PrismLauncher/instances/Empty Folder"))
+            .expect("create unmarked fixture");
+
+        let candidates =
+            scan_imports_in_roots([root.path().to_path_buf()]).expect("scan should pass");
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn minecraft_version_detector_accepts_releases_snapshots_and_prereleases() {
+        assert!(looks_like_minecraft_version("1.21.8"));
+        assert!(looks_like_minecraft_version("25w31a"));
+        assert!(looks_like_minecraft_version("1.21-pre1"));
+        assert!(looks_like_minecraft_version("1.21-rc1"));
+        assert!(!looks_like_minecraft_version("2.0"));
+        assert!(!looks_like_minecraft_version("1.5.2"));
+        assert!(!looks_like_minecraft_version("1.21-pre"));
+        assert!(!looks_like_minecraft_version("profile-latest"));
+    }
+
+    #[test]
+    fn import_plan_reports_copy_candidates_without_mutating() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("PrismLauncher/instances/WinterPack");
+        fs::create_dir_all(source.join("saves/world-one")).expect("saves fixture");
+        fs::write(source.join("saves/world-one/level.dat"), "level").expect("save fixture");
+        fs::write(source.join("saves/world-one/session.lock"), "lock").expect("save lock fixture");
+        fs::create_dir_all(source.join("resourcepacks")).expect("resource packs fixture");
+        fs::write(source.join("resourcepacks/pack.zip"), "pack").expect("resource pack fixture");
+        fs::write(source.join("options.txt"), "fov:0.5").expect("options fixture");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("TheBoysLauncher")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+
+        let plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+
+        assert_eq!(plan.profile_id, "winterpack");
+        assert!(plan.destination_path.ends_with("/profiles/winterpack"));
+        assert!(plan.items.iter().any(|item| {
+            item.kind == ImportPlanItemKind::Saves
+                && item.exists
+                && item.destination.ends_with("/profiles/winterpack/saves")
+                && item.file_count == Some(2)
+                && item.total_bytes == Some(9)
+        }));
+        assert!(plan.items.iter().any(|item| {
+            item.kind == ImportPlanItemKind::Options
+                && item.exists
+                && item
+                    .destination
+                    .ends_with("/profiles/winterpack/options.txt")
+                && item.file_count == Some(1)
+                && item.total_bytes == Some(7)
+        }));
+        assert!(plan.items.iter().any(|item| {
+            item.kind == ImportPlanItemKind::ResourcePacks
+                && item.exists
+                && item.file_count == Some(1)
+                && item.total_bytes == Some(4)
+        }));
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| { item.kind == ImportPlanItemKind::Mods && !item.exists }));
+        assert!(!Path::new(&plan.destination_path).exists());
+    }
+
+    #[test]
+    fn import_plan_rejects_missing_source_directory() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("TheBoysLauncher")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+
+        assert!(build_import_plan(
+            ImportPlanRequest {
+                name: "Missing".to_owned(),
+                source_path: display_path(&root.path().join("missing")),
+            },
+            &directories,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn import_plan_execution_copies_existing_items_without_mutating_source() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("PrismLauncher/instances/WinterPack");
+        let save = source.join("saves/world-one");
+        fs::create_dir_all(&save).expect("save fixture");
+        fs::write(save.join("level.dat"), "world").expect("world fixture");
+        fs::write(source.join("options.txt"), "fov:0.5").expect("options fixture");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("TheBoysLauncher")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+
+        let events = execute_import_plan(&plan).expect("import should execute");
+
+        assert_eq!(events.operation, LauncherOperation::ImportProfile);
+        assert_eq!(events.subject_id, "winterpack");
+        assert!(Path::new(&plan.destination_path)
+            .join("saves/world-one/level.dat")
+            .is_file());
+        assert!(Path::new(&plan.destination_path)
+            .join("options.txt")
+            .is_file());
+        assert!(source.join("saves/world-one/level.dat").is_file());
+        assert_eq!(
+            events.events.last().map(|event| &event.kind),
+            Some(&LauncherEventKind::Completed)
+        );
+    }
+
+    #[test]
+    fn import_plan_execution_rejects_out_of_bounds_destination() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).expect("source fixture");
+        fs::write(source.join("options.txt"), "fov:0.5").expect("options fixture");
+        let mut plan = ImportPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            source_path: display_path(&source),
+            destination_path: display_path(&root.path().join("target")),
+            detected_loader: None,
+            detected_game_version: None,
+            items: vec![ImportPlanItem {
+                kind: ImportPlanItemKind::Options,
+                source: display_path(&source.join("options.txt")),
+                destination: display_path(&root.path().join("outside/options.txt")),
+                exists: true,
+                destination_exists: false,
+                resolution: None,
+                file_count: Some(1),
+                total_bytes: Some(7),
+            }],
+        };
+
+        assert!(execute_import_plan(&plan).is_err());
+
+        plan.items[0].destination = display_path(&root.path().join("target/options.txt"));
+        assert!(execute_import_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn import_plan_execution_rejects_existing_destinations() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("source");
+        let destination = root.path().join("target/profiles/winterpack/options.txt");
+        fs::create_dir_all(&source).expect("source fixture");
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("target fixture");
+        fs::write(source.join("options.txt"), "new").expect("source options");
+        fs::write(&destination, "existing").expect("destination options");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("target")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| { item.kind == ImportPlanItemKind::Options && item.destination_exists }));
+        assert!(execute_import_plan(&plan).is_err());
+        assert_eq!(
+            fs::read_to_string(&destination).expect("destination reads"),
+            "existing"
+        );
+    }
+
+    #[test]
+    fn import_plan_execution_can_skip_existing_destinations() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("source");
+        let destination = root.path().join("target/profiles/winterpack/options.txt");
+        fs::create_dir_all(&source).expect("source fixture");
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("target fixture");
+        fs::write(source.join("options.txt"), "new").expect("source options");
+        fs::write(&destination, "existing").expect("destination options");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("target")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let mut plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+        let item = plan
+            .items
+            .iter_mut()
+            .find(|item| item.kind == ImportPlanItemKind::Options)
+            .expect("options item exists");
+        item.resolution = Some(ImportConflictResolution::Skip);
+
+        let operation = execute_import_plan(&plan).expect("skip should execute");
+
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "Skipped existing options."));
+        assert_eq!(
+            fs::read_to_string(&destination).expect("destination reads"),
+            "existing"
+        );
+    }
+
+    #[test]
+    fn import_plan_execution_can_overwrite_existing_destinations() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("source");
+        let destination = root.path().join("target/profiles/winterpack/options.txt");
+        fs::create_dir_all(&source).expect("source fixture");
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("target fixture");
+        fs::write(source.join("options.txt"), "new").expect("source options");
+        fs::write(&destination, "existing").expect("destination options");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("target")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let mut plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+        let item = plan
+            .items
+            .iter_mut()
+            .find(|item| item.kind == ImportPlanItemKind::Options)
+            .expect("options item exists");
+        item.resolution = Some(ImportConflictResolution::Overwrite);
+
+        execute_import_plan(&plan).expect("overwrite should execute");
+
+        assert_eq!(
+            fs::read_to_string(&destination).expect("destination reads"),
+            "new"
+        );
+    }
+
+    #[test]
+    fn import_plan_execution_can_rename_existing_destinations() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("source");
+        let destination = root.path().join("target/profiles/winterpack/options.txt");
+        let renamed_destination = root
+            .path()
+            .join("target/profiles/winterpack/options-imported.txt");
+        fs::create_dir_all(&source).expect("source fixture");
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("target fixture");
+        fs::write(source.join("options.txt"), "new").expect("source options");
+        fs::write(&destination, "existing").expect("destination options");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("target")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let mut plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+        let item = plan
+            .items
+            .iter_mut()
+            .find(|item| item.kind == ImportPlanItemKind::Options)
+            .expect("options item exists");
+        item.resolution = Some(ImportConflictResolution::Rename);
+
+        let operation = execute_import_plan(&plan).expect("rename should execute");
+
+        assert!(operation
+            .events
+            .iter()
+            .any(|event| event.message == "Copied options to renamed destination."));
+        assert_eq!(
+            fs::read_to_string(&destination).expect("destination reads"),
+            "existing"
+        );
+        assert_eq!(
+            fs::read_to_string(&renamed_destination).expect("renamed destination reads"),
+            "new"
+        );
+    }
+
+    #[test]
+    fn import_plan_detects_multimc_loader_and_game_version_metadata() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("PrismLauncher/instances/Fabric Night");
+        fs::create_dir_all(&source).expect("source fixture");
+        fs::write(
+            source.join("mmc-pack.json"),
+            r#"{
+              "components": [
+                { "uid": "net.minecraft", "version": "1.20.1" },
+                { "uid": "net.fabricmc.fabric-loader", "version": "0.15.11" }
+              ]
+            }"#,
+        )
+        .expect("pack fixture");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("target")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+
+        let plan = build_import_plan(
+            ImportPlanRequest {
+                name: "Fabric Night".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+        let profile = imported_profile_from_plan(&plan);
+
+        assert_eq!(plan.detected_loader, Some(ModLoader::Fabric));
+        assert_eq!(plan.detected_game_version.as_deref(), Some("1.20.1"));
+        assert_eq!(profile.loader, ModLoader::Fabric);
+        assert_eq!(profile.game_version, "1.20.1");
+    }
+
+    #[test]
+    fn imported_profile_is_persisted_after_successful_import() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).expect("source fixture");
+        fs::write(source.join("options.txt"), "fov:0.5").expect("options fixture");
+        let profiles_path = root.path().join("profiles.json");
+        let plan = ImportPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack".to_owned(),
+            source_path: display_path(&source),
+            destination_path: display_path(&root.path().join("target/winterpack")),
+            detected_loader: None,
+            detected_game_version: None,
+            items: vec![ImportPlanItem {
+                kind: ImportPlanItemKind::Options,
+                source: display_path(&source.join("options.txt")),
+                destination: display_path(&root.path().join("target/winterpack/options.txt")),
+                exists: true,
+                destination_exists: false,
+                resolution: None,
+                file_count: Some(1),
+                total_bytes: Some(7),
+            }],
+        };
+
+        execute_import_plan(&plan).expect("import should execute");
+        let profile =
+            persist_imported_profile_at_path(&profiles_path, &plan).expect("profile persists");
+        let profiles = load_profiles_from_path(&profiles_path).expect("profiles load");
+
+        assert_eq!(profile.id, "winterpack");
+        assert_eq!(profile.loader, ModLoader::Vanilla);
+        assert_eq!(profile.game_version, "1.21.8");
+        assert!(profiles.iter().any(|existing| existing.id == "winterpack"));
+    }
+
+    #[test]
+    fn imported_profile_persistence_updates_existing_profile_id() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let profiles_path = root.path().join("profiles.json");
+        save_profiles_to_path(
+            &profiles_path,
+            &[ProfileSummary {
+                id: "winterpack".to_owned(),
+                name: "Old Name".to_owned(),
+                loader: ModLoader::Fabric,
+                game_version: "1.20.1".to_owned(),
+                installed_pack_version: None,
+                last_played: Some("Earlier".to_owned()),
+                memory_mb: 2048,
+                jvm_args: vec!["-Dkeep=me".to_owned()],
+                resolution: Some(ProfileResolution {
+                    width: 1280,
+                    height: 720,
+                }),
+                default_server: Some(ServerLaunchTarget {
+                    name: Some("Old Server".to_owned()),
+                    address: "old.theboys.example".to_owned(),
+                    port: Some(25565),
+                }),
+                java_runtime_override_path: None,
+            }],
+        )
+        .expect("fixture saves");
+        let plan = ImportPlan {
+            profile_id: "winterpack".to_owned(),
+            profile_name: "WinterPack Imported".to_owned(),
+            source_path: display_path(root.path()),
+            destination_path: display_path(&root.path().join("target/winterpack")),
+            detected_loader: None,
+            detected_game_version: None,
+            items: Vec::new(),
+        };
+
+        persist_imported_profile_at_path(&profiles_path, &plan).expect("profile updates");
+        let profiles = load_profiles_from_path(&profiles_path).expect("profiles load");
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "WinterPack Imported");
+        assert_eq!(profiles[0].loader, ModLoader::Vanilla);
+        assert_eq!(profiles[0].last_played, Some("Earlier".to_owned()));
+        assert_eq!(profiles[0].jvm_args, vec!["-Dkeep=me"]);
+        assert_eq!(
+            profiles[0].resolution,
+            Some(ProfileResolution {
+                width: 1280,
+                height: 720,
+            })
+        );
+        assert_eq!(
+            profiles[0].default_server,
+            Some(ServerLaunchTarget {
+                name: Some("Old Server".to_owned()),
+                address: "old.theboys.example".to_owned(),
+                port: Some(25565),
+            })
+        );
+    }
+
+    #[test]
+    fn settings_round_trip_to_json() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("settings.json");
+        let settings = LauncherSettings {
+            max_memory_mb: 8192,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: true,
+            java_runtime_override_path: None,
+        };
+
+        save_settings_to_path(&path, &settings).expect("settings should save");
+        let loaded = load_settings_from_path(&path).expect("settings should load");
+
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn settings_validation_rejects_invalid_memory_ranges() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let path = root.path().join("settings.json");
+        let settings = LauncherSettings {
+            max_memory_mb: 1024,
+            min_memory_mb: 2048,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+
+        assert!(save_settings_to_path(&path, &settings).is_err());
+    }
+
+    fn minecraft_manifest_fixture() -> MinecraftVersionManifest {
+        serde_json::from_str(
+            r#"{
+              "latest": {
+                "release": "1.21.8",
+                "snapshot": "25w31a"
+              },
+              "versions": [
+                {
+                  "id": "1.21.8",
+                  "type": "release",
+                  "url": "https://example.invalid/1.21.8.json",
+                  "sha1": "version-sha",
+                  "time": "2025-07-17T12:00:00+00:00",
+                  "releaseTime": "2025-07-17T12:00:00+00:00"
+                },
+                {
+                  "id": "25w31a",
+                  "type": "snapshot",
+                  "url": "https://example.invalid/25w31a.json",
+                  "time": "2025-07-30T12:00:00+00:00",
+                  "releaseTime": "2025-07-30T12:00:00+00:00"
+                }
+              ]
+            }"#,
+        )
+        .expect("fixture should deserialize")
+    }
+
+    fn minecraft_details_fixture() -> MinecraftVersionDetails {
+        serde_json::from_str(
+            r#"{
+              "id": "1.21.8",
+              "arguments": {
+                "game": [
+                  "--username",
+                  "${auth_player_name}",
+                  "--version",
+                  "${version_name}",
+                  "--gameDir",
+                  "${game_directory}",
+                  "--assetsDir",
+                  "${assets_root}",
+                  "--assetIndex",
+                  "${assets_index_name}",
+                  "--uuid",
+                  "${auth_uuid}",
+                  "--accessToken",
+                  "${auth_access_token}",
+                  {
+                    "rules": [
+                      {
+                        "action": "allow",
+                        "features": {
+                          "has_custom_resolution": true
+                        }
+                      }
+                    ],
+                    "value": [
+                      "--width",
+                      "${resolution_width}",
+                      "--height",
+                      "${resolution_height}"
+                    ]
+                  }
+                ],
+                "jvm": [
+                  {
+                    "rules": [
+                      {
+                        "action": "allow",
+                        "os": { "name": "windows" }
+                      }
+                    ],
+                    "value": "-Djava.library.path=${natives_directory}"
+                  },
+                  "-cp",
+                  "${classpath}"
+                ]
+              },
+              "assetIndex": {
+                "id": "17",
+                "sha1": "asset-sha",
+                "size": 123,
+                "url": "https://example.invalid/assets.json"
+              },
+              "downloads": {
+                "client": {
+                  "sha1": "client-sha",
+                  "size": 456,
+                  "url": "https://example.invalid/client.jar"
+                }
+              },
+              "libraries": [
+                {
+                  "name": "com.example:core:1.0.0",
+                  "downloads": {
+                    "artifact": {
+                      "path": "com/example/core/1.0.0/core-1.0.0.jar",
+                      "sha1": "core-sha",
+                      "size": 789,
+                      "url": "https://example.invalid/core.jar"
+                    }
+                  }
+                },
+                {
+                  "name": "com.example:windows-only:1.0.0",
+                  "rules": [
+                    {
+                      "action": "allow",
+                      "os": { "name": "windows" }
+                    }
+                  ],
+                  "downloads": {
+                    "artifact": {
+                      "path": "com/example/windows-only/1.0.0/windows-only-1.0.0.jar",
+                      "sha1": "windows-sha",
+                      "size": 111,
+                      "url": "https://example.invalid/windows.jar"
+                    }
+                  }
+                },
+                {
+                  "name": "com.example:native:1.0.0",
+                  "natives": {
+                    "windows": "natives-windows"
+                  },
+                  "downloads": {
+                    "classifiers": {
+                      "natives-windows": {
+                        "path": "com/example/native/1.0.0/native-1.0.0-natives-windows.jar",
+                        "sha1": "native-sha",
+                        "size": 222,
+                        "url": "https://example.invalid/native-windows.jar"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "org.lwjgl:lwjgl-glfw:3.3.1:natives-windows",
+                  "rules": [
+                    {
+                      "action": "allow",
+                      "os": { "name": "windows" }
+                    }
+                  ],
+                  "downloads": {
+                    "artifact": {
+                      "path": "org/lwjgl/lwjgl-glfw/3.3.1/lwjgl-glfw-3.3.1-natives-windows.jar",
+                      "sha1": "lwjgl-native-sha",
+                      "size": 333,
+                      "url": "https://example.invalid/lwjgl-glfw-natives-windows.jar"
+                    }
+                  }
+                }
+              ],
+              "mainClass": "com.example.minecraft.Main"
+            }"#,
+        )
+        .expect("fixture should deserialize")
+    }
+
+    fn minecraft_asset_index_fixture() -> MinecraftAssetIndexObjects {
+        serde_json::from_str(
+            r#"{
+              "objects": {
+                "minecraft/sounds/random/pop.ogg": {
+                  "hash": "abcdef1234567890",
+                  "size": 20
+                },
+                "minecraft/lang/en_us.json": {
+                  "hash": "1234567890abcdef",
+                  "size": 10
+                }
+              }
+            }"#,
+        )
+        .expect("fixture should deserialize")
+    }
+
+    fn fabric_loader_metadata_fixture() -> &'static str {
+        r#"[
+          {
+            "loader": {
+              "maven": "net.fabricmc:fabric-loader:0.19.3",
+              "version": "0.19.3"
+            },
+            "intermediary": {
+              "maven": "net.fabricmc:intermediary:1.21.8",
+              "version": "1.21.8"
+            },
+            "launcherMeta": {
+              "libraries": {
+                "client": [],
+                "common": [
+                  {
+                    "name": "org.ow2.asm:asm:9.10.1",
+                    "url": "https://maven.fabricmc.net/",
+                    "sha1": "ada2141c0cc52ee8f5c48cd5fa4ce0e794f22236",
+                    "sha256": "ed825d10ab1399c8c0cb669e688cf0c8c82629b4c8399b58352b68e92ca10fcb",
+                    "size": 126151
+                  }
+                ]
+              },
+              "mainClass": {
+                "client": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "server": "net.fabricmc.loader.impl.launch.knot.KnotServer"
+              }
+            }
+          }
+        ]"#
+    }
+
+    fn generated_forge_version_json_fixture() -> &'static str {
+        r#"{
+          "id": "1.21.8-forge-52.0.1",
+          "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "arguments": {
+              "jvm": [
+              "-Dforge.logging.console.level=info",
+              "-DlibraryDirectory=${library_directory}",
+              "-DlegacyClassPath=${library_directory}/example/example.jar${classpath_separator}${library_directory}/other/other.jar"
+            ],
+            "game": [
+              "--launchTarget",
+              "forgeclient",
+              "--fml.mcVersion",
+              "${version_name}"
+            ]
+          },
+          "libraries": [
+            {
+              "name": "net.minecraftforge:forge:1.21.8-52.0.1",
+              "downloads": {
+                "artifact": {
+                  "path": "net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1.jar",
+                  "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "size": 1234,
+                  "url": "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1.jar"
+                }
+              }
+            },
+            {
+              "name": "cpw.mods:bootstraplauncher:2.0.0",
+              "downloads": {
+                "artifact": {
+                  "path": "cpw/mods/bootstraplauncher/2.0.0/bootstraplauncher-2.0.0.jar",
+                  "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "size": 2345,
+                  "url": "https://maven.minecraftforge.net/cpw/mods/bootstraplauncher/2.0.0/bootstraplauncher-2.0.0.jar"
+                }
+              }
+            }
+          ]
+        }"#
+    }
+
+    fn generated_forge_install_profile_json_fixture() -> &'static str {
+        r#"{
+          "versionInfo": {
+            "id": "1.21.8-forge-52.0.1",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "arguments": {
+              "jvm": [
+                "-Dforge.logging.console.level=info"
+              ],
+              "game": [
+                "--launchTarget",
+                "forgeclient",
+                "--fml.mcVersion",
+                "${version_name}"
+              ]
+            },
+            "libraries": [
+              {
+                "name": "net.minecraftforge:forge:1.21.8-52.0.1",
+                "downloads": {
+                  "artifact": {
+                    "path": "net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1.jar",
+                    "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 1234,
+                    "url": "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.8-52.0.1/forge-1.21.8-52.0.1.jar"
+                  }
+                }
+              },
+              {
+                "name": "cpw.mods:bootstraplauncher:2.0.0",
+                "downloads": {
+                  "artifact": {
+                    "path": "cpw/mods/bootstraplauncher/2.0.0/bootstraplauncher-2.0.0.jar",
+                    "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "size": 2345,
+                    "url": "https://maven.minecraftforge.net/cpw/mods/bootstraplauncher/2.0.0/bootstraplauncher-2.0.0.jar"
+                  }
+                }
+              }
+            ]
+          },
+          "processors": [
+            {
+              "jar": "net.minecraftforge:installertools:1.4.0",
+              "classpath": ["net.minecraftforge:installertools:1.4.0"],
+              "args": ["--task", "extract", "--input", "{MINECRAFT_JAR}"]
+            },
+            {
+              "sides": ["client"],
+              "jar": "net.minecraftforge:binarypatcher:1.1.1",
+              "classpath": ["net.minecraftforge:binarypatcher:1.1.1"],
+              "args": ["--clean", "{MINECRAFT_JAR}", "--output", "{BINPATCHED}"],
+              "outputs": {
+                "{BINPATCHED}": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              }
+            },
+            {
+              "sides": ["server"],
+              "jar": "net.minecraftforge:server-only:1.0.0",
+              "args": ["--server-only"]
+            }
+          ]
+        }"#
+    }
+
+    fn generated_neoforge_version_json_fixture() -> &'static str {
+        r#"{
+          "id": "neoforge-21.1.1",
+          "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+          "arguments": {
+            "jvm": [
+              "-DlibraryDirectory=${library_directory}"
+            ],
+            "game": [
+              "--fml.neoForgeVersion",
+              "21.1.1",
+              "--launchTarget",
+              "forgeclient"
+            ]
+          },
+          "libraries": [
+            {
+              "name": "cpw.mods:bootstraplauncher:2.0.2",
+              "downloads": {
+                "artifact": {
+                  "path": "cpw/mods/bootstraplauncher/2.0.2/bootstraplauncher-2.0.2.jar",
+                  "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "size": 2345,
+                  "url": "https://maven.neoforged.net/releases/cpw/mods/bootstraplauncher/2.0.2/bootstraplauncher-2.0.2.jar"
+                }
+              }
+            }
+          ]
+        }"#
+    }
+
+    fn generated_neoforge_install_profile_with_top_level_libraries_fixture() -> &'static str {
+        r#"{
+          "data": {},
+          "processors": [],
+          "libraries": [
+            {
+              "name": "net.neoforged:neoforge:21.1.1:universal",
+              "downloads": {
+                "artifact": {
+                  "path": "net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar",
+                  "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "size": 2873474,
+                  "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar"
+                }
+              }
+            }
+          ]
+        }"#
+    }
+}

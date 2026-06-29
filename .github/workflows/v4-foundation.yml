@@ -1,0 +1,232 @@
+name: V4 Foundation
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish the Windows installer artifacts to a GitHub release"
+        required: false
+        default: false
+        type: boolean
+      package_windows:
+        description: "Build Windows installer artifacts without publishing a release"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "Release tag to publish when running manually; defaults to the selected ref name"
+        required: false
+        type: string
+      release_draft:
+        description: "Create or update the release as a draft"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - ".github/workflows/v4-foundation.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "src-tauri/**"
+      - "frontend/**"
+      - "package.json"
+      - "package-lock.json"
+      - "playwright.config.ts"
+      - "scripts/stage-social-backend.mjs"
+      - "scripts/verify-package-resources.mjs"
+      - "scripts/verify-tauri-bundles.mjs"
+      - "scripts/verify-tauri-security-config.mjs"
+      - "tests/e2e/**"
+      - "docs/REWRITE_HANDOFF.md"
+  push:
+    branches:
+      - main
+      - dev
+      - "codex/**"
+    tags:
+      - "v*"
+    paths:
+      - ".github/workflows/v4-foundation.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "src-tauri/**"
+      - "frontend/**"
+      - "package.json"
+      - "package-lock.json"
+      - "playwright.config.ts"
+      - "scripts/stage-social-backend.mjs"
+      - "scripts/verify-package-resources.mjs"
+      - "scripts/verify-tauri-bundles.mjs"
+      - "scripts/verify-tauri-security-config.mjs"
+      - "tests/e2e/**"
+      - "docs/REWRITE_HANDOFF.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v4-foundation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify v4 desktop foundation
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Check Rust workspace
+        run: cargo check --workspace
+
+      - name: Run launcher-core tests
+        run: cargo test -p launcher-core --lib -- --test-threads=1
+
+      - name: Run social-backend tests
+        run: cargo test -p social-backend --lib -- --test-threads=1
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Verify Tauri security config
+        run: npm run verify:tauri-security
+
+      - name: Build and stage debug social backend resource
+        run: |
+          npm run build:social-backend:debug
+          npm run stage:social-backend:debug
+          npm run verify:package-resources:debug
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium
+
+      - name: Run minimum desktop Playwright smoke
+        run: npx playwright test tests/e2e/launcher-shell.spec.ts --project=tauri-minimum-desktop-chromium --grep "home screen renders|configured desktop minimum|dense desktop panels"
+
+  package-windows:
+    name: Package Windows Tauri app
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.package_windows || inputs.publish_release))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build signed Tauri bundles
+        run: npm run tauri:build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          THEBOYS_RELEASE_TAG: ${{ inputs.release_tag }}
+
+      - name: Verify Windows bundles
+        run: npm run verify:tauri-bundles
+
+      - name: Upload Windows installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TheBoysLauncher-windows-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*setup.exe
+            target/release/bundle/**/*.sig
+            target/release/bundle/latest.json
+
+  publish-release:
+    name: Publish tagged Windows release
+    runs-on: ubuntu-latest
+    needs: package-windows
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TheBoysLauncher-windows-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            release_tag="${{ inputs.release_tag }}"
+          fi
+
+          if [[ -z "${release_tag}" || "${release_tag}" != v* ]]; then
+            echo "::error::Manual release publishing requires a release_tag that starts with v, such as v4.0.0."
+            exit 1
+          fi
+
+          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: TheBoysLauncher ${{ steps.release.outputs.tag }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.release_draft || false }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/release/**/*.msi
+            dist/release/**/*setup.exe
+            dist/release/**/*.sig
+            dist/release/latest.json

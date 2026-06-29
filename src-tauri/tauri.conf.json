@@ -1,0 +1,45 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "TheBoysLauncher",
+  "version": "4.0.0",
+  "identifier": "com.theboys.launcher",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TheBoysLauncher",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 1100,
+        "minHeight": 720
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://launcher.dylan.lol wss://launcher.dylan.lol http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:* http://[::1]:* ws://[::1]:*; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": "all",
+    "resources": [
+      "resources"
+    ],
+    "icon": [
+      "../icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgwMUJBQ0Y5OEU5Njg1MkUKUldRdWhaYU8rYXdiZ0lTN3NITENWZ2p0UnNuTVV1TTVJZ1Jpa1RRdzFkZlpobFNiNFY0MTQzME0K",
+      "endpoints": [
+        "https://github.com/dilllxd/theboyslauncher/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

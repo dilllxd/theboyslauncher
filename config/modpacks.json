@@ -12,19 +12,5 @@
     "minRam": 4096,
     "recommendedRam": 6144,
     "changelog": "Version 1.0.3: Added performance optimizations and new winter-themed content"
-  },
-  {
-    "id": "examplepack",
-    "displayName": "ExamplePack (Dev Preview)",
-    "packUrl": "https://raw.githubusercontent.com/dilllxd/examplepack-modpack/main/pack.toml",
-    "instanceName": "examplepack",
-    "description": "Development preview slot for staging new modpacks. This modpack is used for testing new features and experimental content. May contain bugs and unfinished features.",
-    "author": "Dylan",
-    "tags": ["development", "preview", "experimental", "testing", "unstable"],
-    "lastUpdated": "10/19/2025",
-    "category": "development",
-    "minRam": 2048,
-    "recommendedRam": 4096,
-    "changelog": "Development preview - latest changes and experimental features"
   }
 ]

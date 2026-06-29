@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: theboyslauncher-postgres
+    environment:
+      POSTGRES_DB: ${THEBOYS_POSTGRES_DB:-theboyslauncher}
+      POSTGRES_USER: ${THEBOYS_POSTGRES_USER:-theboyslauncher}
+      POSTGRES_PASSWORD: ${THEBOYS_POSTGRES_PASSWORD:-theboyslauncher}
+    ports:
+      - "${THEBOYS_POSTGRES_HOST:-127.0.0.1}:${THEBOYS_POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${THEBOYS_POSTGRES_USER:-theboyslauncher} -d ${THEBOYS_POSTGRES_DB:-theboyslauncher}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - theboyslauncher-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  theboyslauncher-postgres-data:

@@ -117,3 +117,7 @@ src-tauri/target/
 frontend/dist/
 frontend/node_modules/
 data/
+playwright-report/
+test-results/
+src-tauri/resources/social-backend
+src-tauri/resources/social-backend.exe
