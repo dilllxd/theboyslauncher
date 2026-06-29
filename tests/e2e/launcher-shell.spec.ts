@@ -48,6 +48,91 @@ test("settings exposes stable and dev launcher update channels", async ({ page }
   await expect(page.getByText("Installed: Stable. Selected: Dev.")).toBeVisible();
 });
 
+test("settings dev channel check opens trusted dev installer", async ({ page }) => {
+  let openedUrl = "";
+  await page.route("https://github.com/dilllxd/theboyslauncher/releases/download/dev-latest/latest-dev.json", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        version: "4.0.2-1",
+        url: "https://github.com/dilllxd/theboyslauncher/releases/download/dev-latest/TheBoysLauncher_4.0.2-1_x64-setup.exe",
+      }),
+    });
+  });
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "__openedDevInstallerUrl", {
+      value: "",
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string, args?: { url?: string }) => {
+          if (cmd === "bootstrap_snapshot") {
+            return {
+              settings: {
+                maxMemoryMb: 6144,
+                minMemoryMb: 2048,
+                offlineUsername: "Player",
+                telemetryEnabled: false,
+              },
+              directories: {
+                dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+                configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+                cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+                logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+              },
+              friends: [],
+              packs: [],
+              profiles: [],
+              imports: [],
+            };
+          }
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "open_external_url") {
+            (window as typeof window & { __openedDevInstallerUrl: string }).__openedDevInstallerUrl = args?.url ?? "";
+            return undefined;
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByLabel("Launcher update channel").getByRole("button", { name: "Dev" }).click();
+  await page.getByRole("button", { name: "Check" }).click();
+  await expect(page.getByLabel("Settings overview")).toContainText(
+    "Dev build 4.0.2-1 is ready. Installing will open the signed installer.",
+  );
+  await page.getByRole("button", { name: "Open Dev installer" }).click();
+  await expect(page.getByText("Dev installer opened")).toBeVisible();
+  openedUrl = await page.evaluate(() => (window as typeof window & { __openedDevInstallerUrl: string }).__openedDevInstallerUrl);
+  expect(openedUrl).toBe(
+    "https://github.com/dilllxd/theboyslauncher/releases/download/dev-latest/TheBoysLauncher_4.0.2-1_x64-setup.exe",
+  );
+});
+
 test("discover shows provider plan and archive install entry point", async ({ page }) => {
   await page.goto("/");
 
