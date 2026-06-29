@@ -2412,6 +2412,9 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
   await page.getByLabel("New profile name").fill("Native Fabric");
   await page.getByLabel("New profile version type").selectOption("snapshot");
   await page.getByLabel("New profile game version").selectOption("26w01a");
+  await expect(page.getByLabel("New profile advanced settings")).toHaveCount(0);
+  await page.getByRole("button", { name: "Advanced" }).click();
+  await expect(page.getByLabel("New profile advanced settings")).toBeVisible();
   await page.getByLabel("New profile loader").selectOption("fabric");
   await page.getByLabel("New profile memory").fill("8192");
   await page.getByRole("button", { name: "Create" }).click();
@@ -6631,6 +6634,9 @@ test("library new profile action falls back to web preview mock", async ({ page 
   await expect(page.getByRole("button", { name: "Create" })).toBeDisabled();
   await page.getByLabel("New profile name").fill("Preview NeoForge");
   await page.getByLabel("New profile game version").selectOption("1.21.1");
+  await expect(page.getByLabel("New profile advanced settings")).toHaveCount(0);
+  await page.getByRole("button", { name: "Advanced" }).click();
+  await expect(page.getByLabel("New profile advanced settings")).toBeVisible();
   await page.getByLabel("New profile loader").selectOption("neoforge");
   await page.getByLabel("New profile memory").fill("7168");
   await expect(page.getByRole("button", { name: "Create" })).toBeEnabled();

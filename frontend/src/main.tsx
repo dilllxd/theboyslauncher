@@ -1553,6 +1553,7 @@ function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(fallbackSnapshot);
   const [settingsDraft, setSettingsDraft] = useState<LauncherSettings>(fallbackSnapshot.settings);
   const [profileCreatorOpen, setProfileCreatorOpen] = useState(false);
+  const [newProfileAdvancedOpen, setNewProfileAdvancedOpen] = useState(false);
   const [newProfileName, setNewProfileName] = useState("New Vanilla Profile");
   const [newProfileLoader, setNewProfileLoader] = useState<ProfileSummary["loader"]>("vanilla");
   const [newProfileVersionType, setNewProfileVersionType] = useState<MinecraftVersionType>("release");
@@ -3672,6 +3673,7 @@ function App() {
     setNewProfileVersionType("release");
     setNewProfileGameVersion(minecraftVersionsForType(versions, "release")[0]?.id ?? "1.21.8");
     setNewProfileMemoryMb(snapshot.settings.maxMemoryMb);
+    setNewProfileAdvancedOpen(false);
     setProfileCreatorOpen(true);
   }
 
@@ -3693,6 +3695,7 @@ function App() {
       const profile = await invoke<ProfileSummary>("create_profile", { request });
       await loadBootstrapSnapshot();
       setProfileCreatorOpen(false);
+      setNewProfileAdvancedOpen(false);
       setActivity(`${profile.name} created. Setting up files...`);
       if (isNative) {
         setSetupInProgressProfileId(profile.id);
@@ -3735,6 +3738,7 @@ function App() {
         profiles: [...current.profiles, profile],
       }));
       setProfileCreatorOpen(false);
+      setNewProfileAdvancedOpen(false);
       setActivity("Creating profile is mocked in web preview");
     }
   }
@@ -4821,32 +4825,46 @@ function App() {
                         ))}
                       </select>
                     </label>
-                    <label>
-                      <span>Loader</span>
-                      <select
-                        aria-label="New profile loader"
-                        value={newProfileLoader}
-                        onChange={(event) => setNewProfileLoader(event.target.value as ProfileSummary["loader"])}
+                    <div className="profile-advanced-toggle">
+                      <button
+                        className="secondary-button compact subtle-button"
+                        type="button"
+                        onClick={() => setNewProfileAdvancedOpen((current) => !current)}
                       >
-                        {profileLoaders.map((item) => (
-                          <option key={item} value={item}>
-                            {item}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      <span>Memory</span>
-                      <input
-                        aria-label="New profile memory"
-                        min={512}
-                        max={32768}
-                        step={512}
-                        type="number"
-                        value={newProfileMemoryMb}
-                        onChange={(event) => setNewProfileMemoryMb(Number(event.target.value))}
-                      />
-                    </label>
+                        <Wrench size={16} />
+                        {newProfileAdvancedOpen ? "Hide advanced" : "Advanced"}
+                      </button>
+                    </div>
+                    {newProfileAdvancedOpen && (
+                      <div className="profile-advanced-fields" aria-label="New profile advanced settings">
+                        <label>
+                          <span>Loader</span>
+                          <select
+                            aria-label="New profile loader"
+                            value={newProfileLoader}
+                            onChange={(event) => setNewProfileLoader(event.target.value as ProfileSummary["loader"])}
+                          >
+                            {profileLoaders.map((item) => (
+                              <option key={item} value={item}>
+                                {item}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          <span>Memory</span>
+                          <input
+                            aria-label="New profile memory"
+                            min={512}
+                            max={32768}
+                            step={512}
+                            type="number"
+                            value={newProfileMemoryMb}
+                            onChange={(event) => setNewProfileMemoryMb(Number(event.target.value))}
+                          />
+                        </label>
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="profile-actions" aria-label="New profile actions">
@@ -4859,7 +4877,13 @@ function App() {
                       <Save size={17} />
                       Create
                     </button>
-                    <button className="secondary-button compact" onClick={() => setProfileCreatorOpen(false)}>
+                    <button
+                      className="secondary-button compact"
+                      onClick={() => {
+                        setProfileCreatorOpen(false);
+                        setNewProfileAdvancedOpen(false);
+                      }}
+                    >
                       Cancel
                     </button>
                   </div>
