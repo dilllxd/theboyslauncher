@@ -4420,7 +4420,7 @@ function App() {
       await loadManagedProcesses(true).catch(() => undefined);
       setActiveView("activity");
       setActivityMode("processes");
-      setActivity(`Exported process log (${processLogExportSummary(log)}) to ${log.path}`);
+      setActivity(`Process log saved (${processLogExportSummary(log)})`);
     } catch (error) {
       setLastProcessLogExport(null);
       if (isNative) {

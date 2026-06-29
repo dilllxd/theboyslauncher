@@ -9376,9 +9376,8 @@ test("native process log export refreshes exited process state", async ({ page }
   await expect(processRow).toContainText("Running");
   await processRow.getByRole("button", { name: "Save log" }).click();
 
-  await expect(page.getByRole("complementary")).toContainText(
-    "Exported process log (2/5 lines retained - 3 dropped) to C:/TheBoysLauncher/logs/processes/winterpack.log",
-  );
+  await expect(page.getByLabel("Launcher status message")).toContainText("Process log saved (2/5 lines retained - 3 dropped)");
+  await expect(page.getByLabel("Launcher status message")).not.toContainText("C:/TheBoysLauncher/logs/processes/winterpack.log");
   const logExportPanel = page.getByLabel("Last process log export");
   await expect(logExportPanel).toContainText("Process log exported");
   await expect(logExportPanel).toContainText("pid 4242 - 2/5 lines retained - 3 dropped");

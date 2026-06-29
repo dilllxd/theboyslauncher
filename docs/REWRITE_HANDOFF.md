@@ -1229,6 +1229,8 @@ Latest process-stop status polish: rechecked the documented vanilla compatibilit
 
 Latest profile-edit setup automation: native profile saves now automatically run `prepare_profile` when the saved profile's Minecraft version or loader changes, including canonical values returned by the Rust command. The Library row uses the same setup busy state as profile creation, refreshes the bootstrap snapshot and launcher events after setup, and falls back to `updated; setup will retry on Play` if setup fails, so changing a custom profile version no longer leaves the next Play click to discover missing artifacts. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "creating a profile refreshes|library profile editor syncs native refreshed|library profile editor can choose snapshot"`, `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "library profile editor saves preview changes"`, and `npm run build`.
 
+Latest process-log status polish: saving a managed-process log no longer pushes the full filesystem export path into the bottom-left launcher status. The global status now says `Process log saved (...)`, while the Activity log-export receipt still shows the exact path plus `Open logs` for users who intentionally need it. Existing local MSI/NSIS/updater artifacts remain valid after the current checks. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "process log export"`, `npm run verify:tauri-security`, `npm run verify:tauri-bundles`, and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
