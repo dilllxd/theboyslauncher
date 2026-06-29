@@ -29,6 +29,7 @@
     "social:logs": "node scripts/manage-hosted-social-backend.mjs logs",
     "social:status": "node scripts/manage-hosted-social-backend.mjs status",
     "social:secret": "node scripts/manage-hosted-social-backend.mjs secret",
+    "social:check": "node scripts/check-hosted-social-backend.mjs",
     "test:backend:postgres": "node scripts/test-social-backend-postgres.mjs",
     "smoke:live:winterpack:metadata": "node scripts/run-live-winterpack-smoke.mjs metadata",
     "smoke:live:winterpack:plan": "node scripts/run-live-winterpack-smoke.mjs plan",

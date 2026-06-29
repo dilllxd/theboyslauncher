@@ -30,11 +30,30 @@ Useful commands:
 npm run social:status
 npm run social:logs
 npm run social:down
+npm run social:check
 ```
 
 The GitHub Container Registry image workflow lives at `.github/workflows/social-backend-image.yml`.
 GitHub only exposes newly added workflows after they exist on the default branch, so this workflow
 becomes manually dispatchable after the v4 branch replaces `main` or after a release tag includes it.
+
+Production DNS/reverse proxy:
+
+1. Point `launcher.dylan.lol` at the machine hosting the backend.
+2. Run the hosted backend on that machine:
+
+   ```powershell
+   $env:THEBOYS_BACKEND_IMAGE="ghcr.io/dilllxd/theboyslauncher/social-backend:v4.0.0"
+   $env:THEBOYS_BACKEND_SESSION_SECRET="<strong secret>"
+   npm run social:up
+   ```
+
+3. Put an HTTPS reverse proxy in front of `http://127.0.0.1:4074`. A Caddy example is in `deploy/hosted-backend/Caddyfile.example`.
+4. Verify both local and public health:
+
+   ```powershell
+   npm run social:check
+   ```
 
 ## Release Build
 
