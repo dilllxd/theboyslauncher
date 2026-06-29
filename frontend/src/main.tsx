@@ -1577,11 +1577,16 @@ function App() {
   const [newProfileMemoryMb, setNewProfileMemoryMb] = useState(fallbackSnapshot.settings.maxMemoryMb);
   const [minecraftVersions, setMinecraftVersions] = useState<MinecraftVersionSummary[]>(fallbackMinecraftVersions);
   const [minecraftVersionsLoading, setMinecraftVersionsLoading] = useState(false);
-  const newProfileVersionOptions = minecraftVersionsForType(minecraftVersions, newProfileVersionType);
+  const [minecraftVersionsLoadFailed, setMinecraftVersionsLoadFailed] = useState(false);
+  const newProfileVersionOptions = minecraftVersionsLoadFailed
+    ? []
+    : minecraftVersionsForType(minecraftVersions, newProfileVersionType);
   const newProfileVersionUnavailableMessage =
-    !minecraftVersionsLoading && newProfileVersionOptions.length === 0
-      ? minecraftVersionUnavailableMessage(newProfileVersionType)
-      : null;
+    minecraftVersionsLoadFailed
+      ? "Minecraft versions could not load. Check your connection and try again."
+      : !minecraftVersionsLoading && newProfileVersionOptions.length === 0
+        ? minecraftVersionUnavailableMessage(newProfileVersionType)
+        : null;
   const newProfileDraft: CreateProfileRequest = {
     name: newProfileName.trim(),
     loader: newProfileLoader,
@@ -3693,12 +3698,20 @@ function App() {
 
   async function loadMinecraftVersionsForProfileCreator() {
     setMinecraftVersionsLoading(true);
+    setMinecraftVersionsLoadFailed(false);
     try {
       const versions = await invoke<MinecraftVersionSummary[]>("list_minecraft_versions");
       setMinecraftVersions(versions);
       return versions;
-    } catch {
+    } catch (error) {
+      if (isNative) {
+        setMinecraftVersions([]);
+        setMinecraftVersionsLoadFailed(true);
+        setActivity(nativeFailureActivity(error, "Minecraft versions failed to load"));
+        return [];
+      }
       setMinecraftVersions(fallbackMinecraftVersions);
+      setMinecraftVersionsLoadFailed(false);
       return fallbackMinecraftVersions;
     } finally {
       setMinecraftVersionsLoading(false);
@@ -3711,14 +3724,14 @@ function App() {
     setNewProfileName(`Custom Profile ${nextIndex}`);
     setNewProfileLoader("vanilla");
     setNewProfileVersionType("release");
-    setNewProfileGameVersion(minecraftVersionsForType(versions, "release")[0]?.id ?? "1.21.8");
+    setNewProfileGameVersion(versions.length > 0 ? minecraftVersionsForType(versions, "release")[0]?.id ?? "" : "");
     setNewProfileMemoryMb(snapshot.settings.maxMemoryMb);
     setNewProfileAdvancedOpen(false);
     setProfileCreatorOpen(true);
   }
 
   function selectNewProfileVersionType(versionType: MinecraftVersionType) {
-    const options = minecraftVersionsForType(minecraftVersions, versionType);
+    const options = minecraftVersionsLoadFailed ? [] : minecraftVersionsForType(minecraftVersions, versionType);
     setNewProfileVersionType(versionType);
     setNewProfileGameVersion(options[0]?.id ?? "");
   }

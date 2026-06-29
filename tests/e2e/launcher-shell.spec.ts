@@ -2805,6 +2805,93 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
   expect(invoked.indexOf("bootstrap_snapshot", invoked.indexOf("prepare_profile"))).toBeGreaterThan(invoked.indexOf("prepare_profile"));
 });
 
+test("profile creator blocks native profile creation when Minecraft versions fail to load", async ({ page }) => {
+  await page.addInitScript(() => {
+    const invoked: string[] = [];
+    let callbackId = 1;
+    const callbacks = new Map<number, (...args: unknown[]) => unknown>();
+
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string) => {
+          invoked.push(cmd);
+          if (cmd === "bootstrap_snapshot") {
+            return {
+              settings: {
+                maxMemoryMb: 6144,
+                minMemoryMb: 2048,
+                offlineUsername: "Player",
+                telemetryEnabled: false,
+              },
+              directories: {
+                dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+                configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+                cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+                logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+              },
+              friends: [],
+              packs: [],
+              profiles: [],
+              imports: [],
+            };
+          }
+          if (cmd === "list_minecraft_versions") {
+            throw new Error("Mojang manifest unavailable");
+          }
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: (callback: (...args: unknown[]) => unknown) => {
+          const id = callbackId++;
+          callbacks.set(id, callback);
+          return id;
+        },
+        unregisterCallback: (id: number) => {
+          callbacks.delete(id);
+        },
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__nativeVersionFailureInvokes", {
+      value: invoked,
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.getByRole("button", { name: "New profile" }).click();
+
+  await expect(page.getByText("Minecraft versions could not load. Check your connection and try again.")).toBeVisible();
+  await expect(page.getByLabel("New profile game version")).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Create" })).toBeDisabled();
+  await expect(page.getByText("Mojang manifest unavailable")).toBeVisible();
+
+  const invoked = await page.evaluate(
+    () => (window as typeof window & { __nativeVersionFailureInvokes: string[] }).__nativeVersionFailureInvokes,
+  );
+  expect(invoked).toContain("list_minecraft_versions");
+  expect(invoked).not.toContain("create_profile");
+  expect(invoked).not.toContain("prepare_profile");
+});
+
 test("home screen replaces preview friends with social backend presence", async ({ page }) => {
   const accountId = "00000000-0000-4000-8000-000000000001";
   const issuedAtUnixSeconds = Math.floor(Date.now() / 1000);
