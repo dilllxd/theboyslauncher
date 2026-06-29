@@ -2877,7 +2877,7 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
   await expect(page.getByLabel("New profile advanced settings")).toBeVisible();
   await page.getByLabel("New profile loader").selectOption("fabric");
   await page.getByLabel("New profile memory").fill("8192");
-  await page.getByRole("button", { name: "Create and set up" }).click();
+  await page.getByRole("button", { name: "Create and set up", exact: true }).click();
 
   await expect(page.getByText("Native Fabric created and ready")).toBeVisible();
   const createdProfile = page.locator(".profile-row").filter({ hasText: "Native Fabric" });
@@ -7361,6 +7361,7 @@ test("library profile editor saves preview changes", async ({ page }) => {
 test("library profile editor can choose snapshot versions from the manifest", async ({ page }) => {
   await page.addInitScript(() => {
     let savedVersion = "1.21.8";
+    let prepared = false;
     const updateRequests: unknown[] = [];
     const snapshot = () => ({
       settings: {
@@ -7426,6 +7427,31 @@ test("library profile editor can choose snapshot versions from the manifest", as
               jvmArgs: [],
             };
           }
+          if (cmd === "prepare_profile") {
+            prepared = true;
+            return {
+              action: "repair_profile",
+              subjectId: "snapshot-profile",
+              status: "completed",
+              message: "Profile setup completed.",
+            };
+          }
+          if (cmd === "list_launcher_events") {
+            return prepared
+              ? [
+                  {
+                    id: "snapshot-profile-setup-completed",
+                    operationId: "snapshot-profile-setup",
+                    operation: "repair_profile",
+                    subjectId: "snapshot-profile",
+                    kind: "completed",
+                    message: "Profile setup completed.",
+                    progressPercent: 100,
+                    occurredAtUnixSeconds: 1_710_000_000,
+                  },
+                ]
+              : [];
+          }
           if (cmd === "social_backend_status") {
             return {
               bindAddr: "127.0.0.1:4074",
@@ -7460,7 +7486,7 @@ test("library profile editor can choose snapshot versions from the manifest", as
   await profile.getByLabel("Snapshot Profile game version").selectOption("26w01a");
   await profile.getByRole("button", { name: "Save" }).click();
 
-  await expect(page.getByText("Snapshot Profile updated")).toBeVisible();
+  await expect(page.getByText("Snapshot Profile updated and ready")).toBeVisible();
   await expect(profile.getByLabel("Snapshot Profile profile summary")).toContainText("26w01a");
   const updateRequests = await page.evaluate(
     () => (window as typeof window & { __snapshotProfileUpdateRequests: unknown[] }).__snapshotProfileUpdateRequests,
@@ -7471,6 +7497,7 @@ test("library profile editor can choose snapshot versions from the manifest", as
 test("library profile editor syncs native refreshed profile values after save", async ({ page }) => {
   await page.addInitScript(() => {
     let saved = false;
+    let prepared = false;
     const invoked: string[] = [];
     const updateRequests: unknown[] = [];
     const snapshot = () => ({
@@ -7528,6 +7555,31 @@ test("library profile editor syncs native refreshed profile values after save", 
               javaRuntimeOverridePath: "C:/Java/21/bin/java.exe",
             };
           }
+          if (cmd === "prepare_profile") {
+            prepared = true;
+            return {
+              action: "repair_profile",
+              subjectId: "winterpack",
+              status: "completed",
+              message: "Profile setup completed.",
+            };
+          }
+          if (cmd === "list_launcher_events") {
+            return prepared
+              ? [
+                  {
+                    id: "profile-update-setup-completed",
+                    operationId: "profile-update-setup",
+                    operation: "repair_profile",
+                    subjectId: "winterpack",
+                    kind: "completed",
+                    message: "Profile setup completed.",
+                    progressPercent: 100,
+                    occurredAtUnixSeconds: 1_710_000_000,
+                  },
+                ]
+              : [];
+          }
           if (cmd === "social_backend_status") {
             return {
               bindAddr: "127.0.0.1:4074",
@@ -7562,13 +7614,13 @@ test("library profile editor syncs native refreshed profile values after save", 
   await page.getByLabel("WinterPack Java override path").fill("C:/Java/21/bin/java.exe");
   await page.getByRole("button", { name: "Save" }).click();
 
-  await expect(page.getByText("WinterPack Canonical updated")).toBeVisible();
+  await expect(page.getByText("WinterPack Canonical updated and ready")).toBeVisible();
   await page.getByRole("button", { name: "Customize" }).click();
   await expect(page.getByLabel("WinterPack Canonical profile name")).toHaveValue("WinterPack Canonical");
+  await page.getByRole("button", { name: "Advanced" }).click();
   await expect(page.getByLabel("WinterPack Canonical game version")).toHaveValue("1.20.1");
   await expect(page.getByLabel("WinterPack Canonical loader")).toHaveValue("forge");
   await expect(page.getByLabel("WinterPack Canonical memory")).toHaveValue("6144");
-  await page.getByRole("button", { name: "Advanced" }).click();
   await expect(page.getByLabel("WinterPack Canonical Java override path")).toHaveValue("C:/Java/21/bin/java.exe");
   await expect(page.getByLabel("WinterPack Canonical profile summary")).toContainText("1.20.1");
   await expect(page.getByLabel("WinterPack Canonical profile summary")).not.toContainText("Java");
@@ -7576,8 +7628,12 @@ test("library profile editor syncs native refreshed profile values after save", 
   const requests = await page.evaluate(
     () => (window as typeof window & { __profileSyncUpdateRequests: Array<{ javaRuntimeOverridePath?: string }> }).__profileSyncUpdateRequests,
   );
-  expect(invoked.filter((cmd) => cmd === "bootstrap_snapshot")).toHaveLength(2);
+  expect(invoked.filter((cmd) => cmd === "bootstrap_snapshot").length).toBeGreaterThanOrEqual(3);
   expect(invoked).toContain("update_profile");
+  expect(invoked.indexOf("update_profile")).toBeLessThan(invoked.indexOf("prepare_profile"));
+  expect(invoked.indexOf("list_launcher_events", invoked.indexOf("prepare_profile"))).toBeGreaterThan(
+    invoked.indexOf("prepare_profile"),
+  );
   expect(requests[0]?.javaRuntimeOverridePath).toBe("C:/Java/21/bin/java.exe");
 });
 

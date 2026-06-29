@@ -3846,11 +3846,43 @@ function App() {
 
   async function updateProfile(request: UpdateProfileRequest) {
     if (lifecycleActionInProgress || activeProcessProfileIds.has(request.id)) return;
+    const existingProfile = snapshot.profiles.find((profile) => profile.id === request.id);
+    const requestedLaunchSetupChanged =
+      Boolean(existingProfile) &&
+      ((request.gameVersion !== undefined && request.gameVersion !== existingProfile?.gameVersion) ||
+        (request.loader !== undefined && request.loader !== existingProfile?.loader));
     setActivity("Saving profile");
     try {
       const profile = await invoke<ProfileSummary>("update_profile", { request });
       await loadBootstrapSnapshot();
-      setActivity(`${profile.name} updated`);
+      const savedLaunchSetupChanged =
+        Boolean(existingProfile) &&
+        (profile.gameVersion !== existingProfile?.gameVersion || profile.loader !== existingProfile?.loader);
+      const launchSetupChanged = requestedLaunchSetupChanged || savedLaunchSetupChanged;
+      if (isNative && launchSetupChanged) {
+        const operationKey = `setup:${profile.id}`;
+        setSetupInProgressProfileId(profile.id);
+        setLifecycleActionInProgressKey(operationKey);
+        lifecycleActionInProgressRef.current = operationKey;
+        setActivity(`${profile.name} updated. Setting up files...`);
+        try {
+          await invoke<ActionReceipt>("prepare_profile", { profileId: profile.id });
+          await loadBootstrapSnapshot();
+          await loadLauncherEvents(true).catch(() => undefined);
+          setActivity(`${profile.name} updated and ready`);
+        } catch (setupError) {
+          await loadLauncherEvents(true).catch(() => undefined);
+          setActivity(nativeFailureActivity(setupError, `${profile.name} updated; setup will retry on Play`));
+        } finally {
+          setSetupInProgressProfileId((current) => (current === profile.id ? null : current));
+          if (lifecycleActionInProgressRef.current === operationKey) {
+            lifecycleActionInProgressRef.current = null;
+            setLifecycleActionInProgressKey(null);
+          }
+        }
+      } else {
+        setActivity(`${profile.name} updated`);
+      }
     } catch (error) {
       if (isNative) {
         setActivity(nativeFailureActivity(error, "Saving profile failed"));
