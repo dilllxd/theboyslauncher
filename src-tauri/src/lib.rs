@@ -139,19 +139,6 @@ impl LifecycleOperationGate {
         Ok(LifecycleOperationGuard { gate: self })
     }
 
-    fn ensure_idle(&self, attempted_operation: &str) -> Result<(), String> {
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| "launcher lifecycle operation lock poisoned".to_owned())?;
-        if let Some(active) = active.as_ref() {
-            return Err(format!(
-                "cannot {attempted_operation} while another launcher lifecycle operation is already running: {active}"
-            ));
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     fn active_description(&self) -> Result<Option<String>, String> {
         self.active
@@ -1870,9 +1857,8 @@ async fn start_launch_process(
     profile_id: String,
     registry: State<'_, ProcessRegistry>,
     event_log: State<'_, LauncherEventLog>,
-    lifecycle_gate: State<'_, LifecycleOperationGate>,
+    _lifecycle_gate: State<'_, LifecycleOperationGate>,
 ) -> Result<ManagedProcessSummary, String> {
-    lifecycle_gate.ensure_idle("launch a profile")?;
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Ok(process);
     }
@@ -1906,9 +1892,8 @@ async fn start_authenticated_launch_process(
     server: Option<ServerLaunchTarget>,
     registry: State<'_, ProcessRegistry>,
     event_log: State<'_, LauncherEventLog>,
-    lifecycle_gate: State<'_, LifecycleOperationGate>,
+    _lifecycle_gate: State<'_, LifecycleOperationGate>,
 ) -> Result<ManagedProcessSummary, String> {
-    lifecycle_gate.ensure_idle("launch a profile")?;
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Ok(process);
     }
@@ -1952,9 +1937,8 @@ async fn start_stored_authenticated_launch_process(
     server: Option<ServerLaunchTarget>,
     registry: State<'_, ProcessRegistry>,
     event_log: State<'_, LauncherEventLog>,
-    lifecycle_gate: State<'_, LifecycleOperationGate>,
+    _lifecycle_gate: State<'_, LifecycleOperationGate>,
 ) -> Result<ManagedProcessSummary, String> {
-    lifecycle_gate.ensure_idle("launch a profile")?;
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Ok(process);
     }
@@ -1999,9 +1983,8 @@ async fn start_launch_process_for_server(
     server: ServerLaunchTarget,
     registry: State<'_, ProcessRegistry>,
     event_log: State<'_, LauncherEventLog>,
-    lifecycle_gate: State<'_, LifecycleOperationGate>,
+    _lifecycle_gate: State<'_, LifecycleOperationGate>,
 ) -> Result<ManagedProcessSummary, String> {
-    lifecycle_gate.ensure_idle("launch a profile")?;
     if let Some(process) = active_managed_process_summary(&registry, &profile_id)? {
         return Ok(process);
     }
@@ -3237,29 +3220,6 @@ mod tests {
             gate.active_description().unwrap().as_deref(),
             Some("repairing profile 'winterpack'")
         );
-    }
-
-    #[test]
-    fn lifecycle_operation_gate_blocks_launch_while_busy() {
-        let gate = LifecycleOperationGate::default();
-        let _guard = gate
-            .acquire("installing pack 'winterpack'")
-            .expect("first lifecycle operation should acquire gate");
-
-        let error = gate
-            .ensure_idle("launch a profile")
-            .expect_err("launch should be rejected while install is running");
-
-        assert!(error.contains("cannot launch a profile"));
-        assert!(error.contains("installing pack 'winterpack'"));
-    }
-
-    #[test]
-    fn lifecycle_operation_gate_allows_launch_when_idle() {
-        let gate = LifecycleOperationGate::default();
-
-        gate.ensure_idle("launch a profile")
-            .expect("idle gate should allow launch checks");
     }
 
     #[test]

@@ -1165,6 +1165,8 @@ Latest automatic-setup status polish: the frontend now says `Setting up missing 
 
 Latest renderer setup-wording fallback: renderer-side native error sanitization now also rewrites legacy/cached `Automatic profile repair before launch failed:` messages to `Automatic profile setup before launch failed:`. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "launch command preflight failure offers setup recovery|failed native repair surfaces"` and `npm run build`.
 
+Latest launch concurrency backend fix: the Tauri launch commands no longer reject profile launches just because an unrelated install/setup/delete lifecycle operation is active. Launch still reuses or rejects by per-profile active process state, while mutating lifecycle operations keep the global gate. This matches the intended UI behavior where a ready instance can be opened while another pack is installing. Verified with `cargo test -p theboyslauncher lifecycle_operation_gate -- --test-threads=1`, `cargo test -p theboyslauncher active_managed_process_for_profile_matches_running_and_stop_requested_processes -- --test-threads=1`, and `cargo fmt --all --check`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
