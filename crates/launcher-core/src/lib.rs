@@ -42,6 +42,12 @@ use uuid::Uuid;
 
 const VERSION_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+const COMPAT_JNA_COORDINATE: &str = "net.java.dev.jna:jna:5.14.0";
+const COMPAT_JNA_PATH: &str = "net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar";
+const COMPAT_JNA_URL: &str =
+    "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar";
+const COMPAT_JNA_SHA1: &str = "67bf3eaea4f0718cb376a181a629e5f88fa1c9dd";
+const COMPAT_JNA_SIZE: u64 = 1_878_533;
 const MICROSOFT_AUTHORIZE_URL: &str = "https://login.live.com/oauth20_authorize.srf";
 const MICROSOFT_TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
 const MICROSOFT_REDIRECT_URI: &str = "http://localhost:53682/";
@@ -2802,9 +2808,12 @@ fn split_minecraft_argument_string(arguments: &str) -> Result<Vec<String>> {
 }
 
 fn base_jvm_arguments(context: &MinecraftLaunchContext<'_>) -> Vec<String> {
+    let java_temp_dir = format!("{}/tmp", context.working_dir);
     let mut arguments = vec![
         format!("-Xms{}M", context.settings.min_memory_mb),
         format!("-Xmx{}M", context.memory_mb),
+        format!("-Djava.io.tmpdir={java_temp_dir}"),
+        format!("-Djna.tmpdir={java_temp_dir}/jna"),
     ];
     arguments.extend(
         context
@@ -2827,8 +2836,18 @@ fn minecraft_classpath(
     if let Some(metadata) = modloader_metadata {
         entries.extend(metadata.classpath_entries.clone());
     }
+    let use_modern_jna_override = minecraft_version_needs_modern_jna_override(details);
+    if use_modern_jna_override {
+        entries.push(format!(
+            "{}/libraries/{}",
+            directories.cache_dir, COMPAT_JNA_PATH
+        ));
+    }
     for library in &details.libraries {
         if !library_allowed_on_current_os(library) {
+            continue;
+        }
+        if use_modern_jna_override && library.name == "net.java.dev.jna:jna:4.2.2" {
             continue;
         }
         if let Some(artifact) = library.downloads.artifact.as_ref() {
@@ -2851,6 +2870,13 @@ fn minecraft_classpath(
     deduplicate_classpath_entries(&mut entries);
     let separator = if cfg!(windows) { ";" } else { ":" };
     Ok(entries.join(separator))
+}
+
+fn minecraft_version_needs_modern_jna_override(details: &MinecraftVersionDetails) -> bool {
+    details
+        .libraries
+        .iter()
+        .any(|library| library.name == "net.java.dev.jna:jna:4.2.2")
 }
 
 fn deduplicate_classpath_entries(entries: &mut Vec<String>) {
@@ -5025,6 +5051,7 @@ pub fn prepare_process_working_dir(spec: &ProcessCommandSpec) -> Result<()> {
         "working directory is required"
     );
     fs::create_dir_all(&spec.working_dir)?;
+    fs::create_dir_all(Path::new(&spec.working_dir).join("tmp/jna"))?;
     Ok(())
 }
 
@@ -6350,6 +6377,20 @@ pub fn build_download_plan(
                 ),
             });
         }
+    }
+    if minecraft_version_needs_modern_jna_override(details) {
+        items.push(DownloadItem {
+            id: format!("library-{COMPAT_JNA_COORDINATE}"),
+            kind: DownloadKind::Library,
+            url: COMPAT_JNA_URL.to_owned(),
+            sha1: Some(COMPAT_JNA_SHA1.to_owned()),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: Some(COMPAT_JNA_SIZE),
+            destination: format!("{}/libraries/{}", directories.cache_dir, COMPAT_JNA_PATH),
+        });
     }
 
     Ok(DownloadPlan {
@@ -14668,6 +14709,75 @@ hash = "987654321"
     }
 
     #[test]
+    fn launch_plan_prepends_modern_jna_for_old_narrator_snapshots() {
+        let _java = JavaRuntimeDiscoveryGuard::java_8();
+        let settings = LauncherSettings {
+            max_memory_mb: 4096,
+            min_memory_mb: 1024,
+            offline_username: "Builder".to_owned(),
+            telemetry_enabled: false,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "vanilla-17w17a".to_owned(),
+            name: "Vanilla 17w17a".to_owned(),
+            loader: ModLoader::Vanilla,
+            game_version: "17w17a".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let mut details = minecraft_details_fixture();
+        details.id = "17w17a".to_owned();
+        details.libraries.push(
+            serde_json::from_str(
+                r#"{
+                  "name": "net.java.dev.jna:jna:4.2.2",
+                  "downloads": {
+                    "artifact": {
+                      "path": "net/java/dev/jna/jna/4.2.2/jna-4.2.2.jar",
+                      "sha1": "old-jna-sha",
+                      "size": 1137286,
+                      "url": "https://libraries.minecraft.net/net/java/dev/jna/jna/4.2.2/jna-4.2.2.jar"
+                    }
+                  }
+                }"#,
+            )
+            .expect("old JNA library should deserialize"),
+        );
+
+        let plan = build_launch_plan_for_profile_with_version_details(
+            &profile,
+            &settings,
+            &directories,
+            None,
+            None,
+            Some(&details),
+        )
+        .expect("launch plan should build");
+        let classpath = launch_argument_value(&plan.arguments, "-cp").expect("classpath exists");
+        let first_entry = classpath_entries(&classpath)
+            .into_iter()
+            .next()
+            .expect("classpath should have entries");
+
+        assert_eq!(
+            first_entry,
+            "C:/cache/libraries/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar"
+        );
+    }
+
+    #[test]
     fn launch_plan_uses_legacy_minecraft_arguments_string() {
         let _java = JavaRuntimeDiscoveryGuard::java_8();
         let settings = LauncherSettings {
@@ -20895,6 +21005,46 @@ JAVA_VERSION="21.0.4"
             .any(|item| item.id == "library-org.lwjgl:lwjgl-glfw:3.3.1:natives-windows");
         assert_eq!(has_modern_native, cfg!(target_os = "windows"));
         assert!(!modern_native_on_classpath);
+    }
+
+    #[test]
+    fn download_plan_adds_modern_jna_for_old_narrator_snapshots() {
+        let mut details = minecraft_details_fixture();
+        details.libraries.push(
+            serde_json::from_str(
+                r#"{
+                  "name": "net.java.dev.jna:jna:4.2.2",
+                  "downloads": {
+                    "artifact": {
+                      "path": "net/java/dev/jna/jna/4.2.2/jna-4.2.2.jar",
+                      "sha1": "old-jna-sha",
+                      "size": 1137286,
+                      "url": "https://libraries.minecraft.net/net/java/dev/jna/jna/4.2.2/jna-4.2.2.jar"
+                    }
+                  }
+                }"#,
+            )
+            .expect("old JNA library should deserialize"),
+        );
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+
+        let plan = build_download_plan(&details, &directories).expect("plan should build");
+        let compat_jna = plan
+            .items
+            .iter()
+            .find(|item| item.id == format!("library-{COMPAT_JNA_COORDINATE}"))
+            .expect("compat JNA should be planned");
+
+        assert_eq!(
+            compat_jna.destination,
+            "C:/cache/libraries/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar"
+        );
+        assert_eq!(compat_jna.sha1.as_deref(), Some(COMPAT_JNA_SHA1));
     }
 
     #[test]
