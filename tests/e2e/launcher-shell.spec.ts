@@ -1976,6 +1976,176 @@ test("live file download events surface in the sidebar status card", async ({ pa
   await expect(page.getByLabel("Launcher status progress")).toHaveCount(0);
 });
 
+test("activity play stays available during an unrelated install", async ({ page }) => {
+  await page.addInitScript(() => {
+    const callbacks = new Map<number, (event: unknown) => unknown>();
+    let callbackId = 1;
+    const invoked: Array<{ cmd: string; profileId?: string; packId?: string }> = [];
+    Object.defineProperty(window, "__activityConcurrentInvokes", {
+      value: invoked,
+      configurable: true,
+    });
+    Object.defineProperty(window, "__emitReadyPackCompletedEvent", {
+      value: () => {
+        const event = {
+          event: "launcher-event",
+          payload: {
+            id: "ready-pack-completed",
+            operationId: "ready-pack-install",
+            operation: "install_pack",
+            subjectId: "ready-pack",
+            kind: "completed",
+            message: "Pack installed successfully.",
+            progressPercent: 100,
+            occurredAtUnixSeconds: 1_710_000_002,
+          },
+        };
+        callbacks.forEach((callback) => {
+          try {
+            callback(event);
+          } catch {
+            // Other Tauri listeners may receive a different payload shape in this test.
+          }
+        });
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string, args?: { profileId?: string; packId?: string }) => {
+          invoked.push({ cmd, profileId: args?.profileId, packId: args?.packId });
+          if (cmd === "bootstrap_snapshot") {
+            return {
+              settings: {
+                maxMemoryMb: 6144,
+                minMemoryMb: 2048,
+                offlineUsername: "Player",
+                telemetryEnabled: false,
+              },
+              directories: {
+                dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+                configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+                cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+                logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+              },
+              friends: [],
+              packs: [
+                {
+                  id: "winterpack",
+                  name: "WinterPack",
+                  tagline: "Cozy survival with friends.",
+                  version: "10/30/2025",
+                  status: "not_installed",
+                  accent: "#67e8b9",
+                  installedPlayers: 0,
+                  defaultServer: "The Cabin",
+                },
+                {
+                  id: "ready-pack",
+                  name: "Ready Pack",
+                  tagline: "Already installed.",
+                  version: "1.0.0",
+                  status: "installed",
+                  accent: "#6ee7f9",
+                  installedPlayers: 0,
+                  defaultServer: "Ready Server",
+                },
+              ],
+              profiles: [
+                {
+                  id: "ready-pack",
+                  name: "Ready Pack",
+                  loader: "vanilla",
+                  gameVersion: "1.21.8",
+                  memoryMb: 4096,
+                  jvmArgs: [],
+                },
+              ],
+              imports: [],
+            };
+          }
+          if (cmd === "plan_install_pack") {
+            return {
+              operationId: "winterpack-install",
+              operation: "install_pack",
+              subjectId: "winterpack",
+              events: [
+                { kind: "queued", message: "Install queued for WinterPack", progressPercent: 0 },
+                { kind: "completed", message: "Install plan is ready to execute.", progressPercent: 100 },
+              ],
+            };
+          }
+          if (cmd === "install_pack") {
+            return new Promise(() => undefined);
+          }
+          if (cmd === "start_launch_process") {
+            return {
+              id: "ready-process",
+              processId: 4400,
+              command: {
+                executable: "javaw.exe",
+                args: ["net.minecraft.client.main.Main"],
+                workingDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/profiles/ready-pack",
+                env: [{ key: "THEBOYSLAUNCHER_PROFILE_ID", value: args?.profileId ?? "ready-pack" }],
+              },
+              state: "running",
+              startedAtUnixSeconds: 1_710_000_003,
+              runtimeSeconds: 0,
+              totalOutputLineCount: 0,
+              droppedOutputLineCount: 0,
+              output: [],
+            };
+          }
+          if (cmd === "list_launcher_events" || cmd === "list_managed_processes") return [];
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: (callback: (event: unknown) => unknown) => {
+          const id = callbackId++;
+          callbacks.set(id, callback);
+          return id;
+        },
+        unregisterCallback: (id: number) => {
+          callbacks.delete(id);
+        },
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+  await page.locator(".pack-card").filter({ hasText: "WinterPack" }).getByRole("button", { name: "Install" }).click();
+  await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
+  await page.evaluate(() =>
+    (window as typeof window & { __emitReadyPackCompletedEvent: () => void }).__emitReadyPackCompletedEvent(),
+  );
+
+  const readyEvent = page.locator(".event-row").filter({ hasText: "Ready Pack" });
+  await expect(readyEvent.getByRole("button", { name: "Play" })).toBeEnabled();
+  await readyEvent.getByRole("button", { name: "Play" }).click();
+
+  const invoked = await page.evaluate(
+    () => (window as typeof window & { __activityConcurrentInvokes: Array<{ cmd: string; profileId?: string }> }).__activityConcurrentInvokes,
+  );
+  expect(invoked).toContainEqual(expect.objectContaining({ cmd: "start_launch_process", profileId: "ready-pack" }));
+});
+
 test("pending native install polls launcher events into the sidebar without refresh", async ({ page }) => {
   await page.addInitScript(() => {
     const invoked: string[] = [];

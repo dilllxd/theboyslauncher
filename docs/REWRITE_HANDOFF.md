@@ -1149,6 +1149,8 @@ Latest profile-picker polish: the new-profile and customize profile version drop
 
 Latest sidebar progress hardening: the bottom-left launcher status now clears older active `download_artifacts` events after any later install/setup lifecycle completion, even when the download subject is a shared Minecraft version like `1.20.1` rather than the pack id. This covers the previously observed `Verified modloader installer processor 6/6 outputs` message sticking after the pack had already completed. Newer active download events still surface normally. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "live file download events surface"` and `npm run build`.
 
+Latest launch-concurrency polish: Activity completion rows now use per-profile lifecycle checks for their `Play` action instead of the global install/setup lock, so a user can launch a ready profile while an unrelated pack install is still running. Pack cards already used per-profile lifecycle checks for Play; this closes the remaining Activity surface. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "activity play stays available"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:

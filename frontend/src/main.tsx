@@ -5625,7 +5625,10 @@ function App() {
                   const playableProfileIsActive = Boolean(
                     playableProfile && activeProcessProfileIds.has(playableProfile.id),
                   );
-                  const playableProfileIsBlocked = playableProfileIsActive || lifecycleActionInProgress;
+                  const playableProfileLifecycleBlocked = Boolean(
+                    playableProfile && profileLifecycleInProgress(playableProfile.id),
+                  );
+                  const playableProfileIsBlocked = playableProfileIsActive || playableProfileLifecycleBlocked;
                   const repairableFailedLaunchProfile =
                     event.kind === "failed" &&
                     event.subjectId &&
@@ -5691,7 +5694,11 @@ function App() {
                           onClick={() => launchProfile(playableProfile.id, playableProfile.name)}
                         >
                           <Play size={17} />
-                          {playableProfileIsActive ? "Running" : lifecycleActionInProgress ? lifecycleActionLabel : "Play"}
+                          {playableProfileIsActive
+                            ? "Running"
+                            : playableProfileLifecycleBlocked
+                              ? profileLifecycleLabel(playableProfile?.id)
+                              : "Play"}
                         </button>
                       )}
                       {repairableFailedLaunchProfile && (
