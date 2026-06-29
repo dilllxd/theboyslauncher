@@ -1221,6 +1221,8 @@ Latest live Modrinth archive validation: added `npm run smoke:live:modrinth:inst
 
 Latest setup wording source cleanup: native lifecycle-gate descriptions and the launcher-core direct setup receipt no longer say `repairing profile` / `Profile repair planned and queued`; they now say `setting up profile files...` and `Profile setup planned and queued.` so concurrent-operation errors or receipts cannot leak repair wording into normal UI surfaces. Legacy renderer sanitizers still translate older cached repair messages. Verified with `cargo test -p theboyslauncher lifecycle_operation_gate -- --test-threads=1`, `cargo test -p launcher-core native_actions_validate_required_subjects -- --test-threads=1`, `cargo test -p launcher-core repair_profile_rejects_unknown_profiles -- --test-threads=1`, `cargo fmt --all --check`, and `npm run build`.
 
+Latest packaged-app verification refresh: current release-mode `target/release/theboyslauncher.exe` was rebuilt with `npx tauri build --no-bundle` after the Modrinth archive and setup-wording changes. Release/security/package checks still pass with `npm run verify:tauri-security`, `npm run verify:package-resources`, and `npm run verify:tauri-bundles`. A fresh packaged smoke launched the rebuilt exe against isolated `target/packaged-goal-smoke-current-clean` with hosted backend URL override, opened a `TheBoysLauncher` window, created `data/`, `config/`, `cache/`, `logs/`, `config/profiles.json`, and `config/settings.json`, then closed cleanly with no remaining `theboyslauncher` process.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
