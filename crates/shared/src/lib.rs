@@ -743,6 +743,14 @@ pub struct ImportPlanRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct InstallModpackArchiveRequest {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportPlan {
     pub profile_id: String,
     pub profile_name: String,
@@ -828,6 +836,7 @@ pub enum LauncherAction {
     MicrosoftLogin,
     LaunchProfile,
     InstallPack,
+    InstallModpackArchive,
     RepairProfile,
     DeleteProfile,
     ScanImports,

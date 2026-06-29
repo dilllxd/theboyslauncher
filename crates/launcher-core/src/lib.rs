@@ -105,6 +105,9 @@ const IMPORTABLE_PROFILE_PATHS: &[(ImportPlanItemKind, &str)] = &[
     (ImportPlanItemKind::Config, "config"),
     (ImportPlanItemKind::Mods, "mods"),
 ];
+const CURSEFORGE_MANIFEST_FILE: &str = "manifest.json";
+const CURSEFORGE_PROFILE_METADATA_DIR: &str = ".theboys/curseforge";
+const CURSEFORGE_PROFILE_MANIFEST_PATH: &str = ".theboys/curseforge/manifest.json";
 
 pub fn bootstrap_snapshot() -> Result<AppSnapshot> {
     let directories = prepare_launcher_directories()?;
@@ -1357,6 +1360,361 @@ pub fn build_import_plan(
         detected_game_version: detect_import_game_version(&source_path),
         items,
     })
+}
+
+#[derive(Clone, Debug)]
+pub struct CurseForgeModpackArchiveInstallPlan {
+    pub profile: ProfileSummary,
+    pub loader_version: Option<String>,
+    pub overrides_dir: String,
+    pub mod_download_plan: DownloadPlan,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeModpackManifest {
+    name: String,
+    version: Option<String>,
+    minecraft: CurseForgeMinecraftManifest,
+    manifest_type: String,
+    manifest_version: u32,
+    #[serde(default)]
+    files: Vec<CurseForgeManifestFile>,
+    #[serde(default = "default_curseforge_overrides_dir")]
+    overrides: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeMinecraftManifest {
+    version: String,
+    #[serde(default)]
+    mod_loaders: Vec<CurseForgeModLoaderManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeModLoaderManifest {
+    id: String,
+    #[serde(default)]
+    primary: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeManifestFile {
+    #[serde(alias = "projectID")]
+    project_id: u64,
+    #[serde(alias = "fileID")]
+    file_id: u64,
+    #[serde(default)]
+    download_url: Option<String>,
+    #[serde(default = "default_true")]
+    required: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_curseforge_overrides_dir() -> String {
+    "overrides".to_owned()
+}
+
+pub fn build_curseforge_modpack_archive_install_plan(
+    archive_path: &Path,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+) -> Result<CurseForgeModpackArchiveInstallPlan> {
+    let manifest = read_curseforge_modpack_manifest_from_archive(archive_path)?;
+    let profile_name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| manifest.name.trim());
+    ensure!(
+        !profile_name.is_empty(),
+        "CurseForge modpack name is required"
+    );
+    let profile_id = profile_id_from_name(profile_name);
+    ensure_safe_path_segment(&profile_id, "profile id")?;
+    let (loader, loader_version) = curseforge_primary_modloader(&manifest)?;
+    let profile_root = profile_data_dir(directories, &profile_id)?;
+    let mod_download_plan =
+        build_curseforge_modpack_mod_download_plan(&manifest, &profile_id, &profile_root)?;
+
+    Ok(CurseForgeModpackArchiveInstallPlan {
+        profile: ProfileSummary {
+            id: profile_id,
+            name: profile_name.to_owned(),
+            loader,
+            game_version: manifest.minecraft.version.trim().to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: default_settings().max_memory_mb.max(6144),
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        },
+        loader_version,
+        overrides_dir: manifest.overrides,
+        mod_download_plan,
+    })
+}
+
+pub fn extract_curseforge_modpack_archive(
+    archive_path: &Path,
+    plan: &CurseForgeModpackArchiveInstallPlan,
+    directories: &LauncherDirectories,
+) -> Result<OperationPlan> {
+    validate_profiles(std::slice::from_ref(&plan.profile))?;
+    let profile_root = profile_data_dir(directories, &plan.profile.id)?;
+    fs::create_dir_all(&profile_root)?;
+
+    let manifest = read_curseforge_modpack_manifest_from_archive(archive_path)?;
+    let metadata_dir = profile_root.join(CURSEFORGE_PROFILE_METADATA_DIR);
+    fs::create_dir_all(&metadata_dir)?;
+    fs::write(
+        profile_root.join(CURSEFORGE_PROFILE_MANIFEST_PATH),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    extract_curseforge_overrides_from_archive(archive_path, &profile_root, &plan.overrides_dir)?;
+
+    let operation_id = Uuid::new_v4();
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::ImportProfile,
+        subject_id: plan.profile.id.clone(),
+        events: vec![
+            operation_event(
+                operation_id,
+                LauncherEventKind::Planning,
+                format!("Prepared CurseForge modpack {}", plan.profile.name),
+                Some(20),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Completed,
+                "Copied modpack overrides and saved the CurseForge manifest.",
+                Some(100),
+            ),
+        ],
+    })
+}
+
+fn read_curseforge_modpack_manifest_from_archive(
+    archive_path: &Path,
+) -> Result<CurseForgeModpackManifest> {
+    let file = fs::File::open(archive_path).with_context(|| {
+        format!(
+            "failed to open CurseForge archive {}",
+            display_path(archive_path)
+        )
+    })?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut manifest_entry = archive
+        .by_name(CURSEFORGE_MANIFEST_FILE)
+        .map_err(|_| anyhow!("CurseForge archive is missing manifest.json"))?;
+    let mut body = String::new();
+    manifest_entry.read_to_string(&mut body)?;
+    let manifest = serde_json::from_str::<CurseForgeModpackManifest>(&body)?;
+    validate_curseforge_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_curseforge_manifest(manifest: &CurseForgeModpackManifest) -> Result<()> {
+    ensure!(
+        manifest.manifest_type == "minecraftModpack",
+        "CurseForge manifestType must be minecraftModpack"
+    );
+    ensure!(
+        manifest.manifest_version == 1,
+        "unsupported CurseForge manifestVersion {}",
+        manifest.manifest_version
+    );
+    ensure!(
+        !manifest.name.trim().is_empty(),
+        "CurseForge pack name is required"
+    );
+    ensure!(
+        looks_like_minecraft_version(&manifest.minecraft.version),
+        "CurseForge pack has unsupported Minecraft version '{}'",
+        manifest.minecraft.version
+    );
+    ensure_safe_relative_path(&manifest.overrides, "CurseForge overrides path")?;
+    for file in &manifest.files {
+        if file.required {
+            let url = file.download_url.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "CurseForge file {}:{} is required but does not include a direct download URL yet",
+                    file.project_id,
+                    file.file_id
+                )
+            })?;
+            validate_http_download_url(url)?;
+        }
+    }
+    Ok(())
+}
+
+fn curseforge_primary_modloader(
+    manifest: &CurseForgeModpackManifest,
+) -> Result<(ModLoader, Option<String>)> {
+    let loader = manifest
+        .minecraft
+        .mod_loaders
+        .iter()
+        .find(|loader| loader.primary)
+        .or_else(|| manifest.minecraft.mod_loaders.first());
+    let Some(loader) = loader else {
+        return Ok((ModLoader::Vanilla, None));
+    };
+    let (kind, version) = loader
+        .id
+        .split_once('-')
+        .ok_or_else(|| anyhow!("CurseForge modLoader id '{}' is invalid", loader.id))?;
+    let mod_loader = match kind.to_ascii_lowercase().as_str() {
+        "forge" => ModLoader::Forge,
+        "neoforge" | "neoforged" => ModLoader::Neoforge,
+        "fabric" => ModLoader::Fabric,
+        "quilt" => ModLoader::Quilt,
+        other => return Err(anyhow!("unsupported CurseForge modLoader '{other}'")),
+    };
+    ensure_safe_path_segment(version, "CurseForge modloader version")?;
+    Ok((mod_loader, Some(version.to_owned())))
+}
+
+fn build_curseforge_modpack_mod_download_plan(
+    manifest: &CurseForgeModpackManifest,
+    profile_id: &str,
+    profile_root: &Path,
+) -> Result<DownloadPlan> {
+    let mods_dir = profile_root.join("mods");
+    let mut items = Vec::new();
+    for file in manifest.files.iter().filter(|file| file.required) {
+        let url = file.download_url.as_deref().ok_or_else(|| {
+            anyhow!(
+                "CurseForge file {}:{} is missing downloadUrl",
+                file.project_id,
+                file.file_id
+            )
+        })?;
+        let filename = filename_from_download_url(url)?;
+        ensure_safe_path_segment(&filename, "CurseForge mod filename")?;
+        let destination = mods_dir.join(filename);
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "CurseForge mod destination is outside the profile directory"
+        );
+        items.push(DownloadItem {
+            id: format!("curseforge-mod-{}-{}", file.project_id, file.file_id),
+            kind: DownloadKind::PackFile,
+            url: url.to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: None,
+            destination: display_path(&destination),
+        });
+    }
+
+    Ok(DownloadPlan {
+        version_id: format!("{profile_id}-curseforge-mods"),
+        items,
+    })
+}
+
+fn filename_from_download_url(url: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|error| anyhow!("download URL '{url}' is invalid: {error}"))?;
+    let segment = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.trim().is_empty())
+        .ok_or_else(|| anyhow!("download URL '{url}' does not include a file name"))?;
+    percent_decode_url_path_segment(segment)
+}
+
+fn percent_decode_url_path_segment(segment: &str) -> Result<String> {
+    let bytes = segment.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            ensure!(
+                index + 2 < bytes.len(),
+                "URL path segment has incomplete percent escape"
+            );
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])?;
+            let value = u8::from_str_radix(hex, 16)
+                .map_err(|_| anyhow!("URL path segment has invalid percent escape"))?;
+            output.push(value);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output)
+        .map_err(|error| anyhow!("URL path segment is not valid UTF-8: {error}"))
+}
+
+fn extract_curseforge_overrides_from_archive(
+    archive_path: &Path,
+    profile_root: &Path,
+    overrides_dir: &str,
+) -> Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let overrides_prefix = format!("{}/", overrides_dir.trim_end_matches('/'));
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let raw_name = entry.name().replace('\\', "/");
+        if !raw_name.starts_with(&overrides_prefix) || raw_name == overrides_prefix {
+            continue;
+        }
+        let relative = raw_name
+            .strip_prefix(&overrides_prefix)
+            .ok_or_else(|| anyhow!("override entry prefix mismatch"))?;
+        if relative.is_empty() {
+            continue;
+        }
+        ensure_safe_relative_path(relative.trim_end_matches('/'), "CurseForge override path")?;
+        let destination = profile_root.join(relative);
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "CurseForge override destination is outside the profile directory"
+        );
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut output = fs::File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+        }
+    }
+    Ok(())
+}
+
+fn local_curseforge_loader_version_for_profile(
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<Option<String>> {
+    let manifest_path =
+        profile_data_dir(directories, &profile.id)?.join(CURSEFORGE_PROFILE_MANIFEST_PATH);
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let manifest = serde_json::from_slice::<CurseForgeModpackManifest>(&fs::read(manifest_path)?)?;
+    let (loader, version) = curseforge_primary_modloader(&manifest)?;
+    if loader == profile.loader {
+        return Ok(version);
+    }
+    Ok(None)
 }
 
 pub fn execute_import_plan(plan: &ImportPlan) -> Result<OperationPlan> {
@@ -6256,6 +6614,18 @@ pub fn build_modloader_download_plan(
         .find(|profile| profile.id == profile_id)
         .ok_or_else(|| anyhow!("profile '{profile_id}' was not found"))?;
     build_modloader_download_plan_for_profile(&profile, directories)
+}
+
+pub fn build_modloader_download_plan_for_profile_with_loader_version(
+    profile: &ProfileSummary,
+    loader_version_override: Option<&str>,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    build_modloader_download_plan_for_profile_and_version(
+        profile,
+        loader_version_override,
+        directories,
+    )
 }
 
 pub fn build_modloader_dependency_download_plan(
@@ -11167,7 +11537,12 @@ fn build_modloader_download_plan_for_profile(
     profile: &ProfileSummary,
     directories: &LauncherDirectories,
 ) -> Result<DownloadPlan> {
-    build_modloader_download_plan_for_profile_and_version(profile, None, directories)
+    let loader_version = local_curseforge_loader_version_for_profile(profile, directories)?;
+    build_modloader_download_plan_for_profile_and_version(
+        profile,
+        loader_version.as_deref(),
+        directories,
+    )
 }
 
 fn build_modloader_download_plan_for_profile_and_version(
@@ -22494,6 +22869,109 @@ JAVA_VERSION="21.0.4"
         };
 
         assert!(execute_download_plan_with_bytes(&plan, &HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn curseforge_archive_plan_reads_manifest_and_extracts_overrides() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive_path = root.path().join("Enigmatica9Expert.zip");
+        let data_dir = root.path().join("data");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&data_dir),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let manifest = br#"{
+          "name": "Enigmatica9Expert",
+          "minecraft": {
+            "version": "1.19.2",
+            "modLoaders": [{ "primary": true, "id": "forge-43.4.23" }]
+          },
+          "manifestVersion": 1,
+          "manifestType": "minecraftModpack",
+          "version": "1.27.0",
+          "files": [{
+            "projectID": 306770,
+            "fileID": 4031402,
+            "downloadUrl": "https://edge.forgecdn.net/files/4031/402/Patchouli-1.19.2-77.jar",
+            "required": true
+          }],
+          "overrides": "overrides"
+        }"#;
+        write_zip_archive(
+            &archive_path,
+            &[
+                ("manifest.json", manifest),
+                ("overrides/config/example.toml", b"enabled=true"),
+            ],
+        );
+
+        let plan = build_curseforge_modpack_archive_install_plan(&archive_path, None, &directories)
+            .expect("curseforge archive should plan");
+
+        assert_eq!(plan.profile.id, "enigmatica9expert");
+        assert_eq!(plan.profile.loader, ModLoader::Forge);
+        assert_eq!(plan.profile.game_version, "1.19.2");
+        assert_eq!(plan.loader_version.as_deref(), Some("43.4.23"));
+        assert_eq!(plan.mod_download_plan.items.len(), 1);
+        assert!(plan.mod_download_plan.items[0]
+            .destination
+            .ends_with("profiles/enigmatica9expert/mods/Patchouli-1.19.2-77.jar"));
+
+        extract_curseforge_modpack_archive(&archive_path, &plan, &directories)
+            .expect("overrides should extract");
+
+        assert_eq!(
+            fs::read_to_string(data_dir.join("profiles/enigmatica9expert/config/example.toml"))
+                .expect("override should write"),
+            "enabled=true"
+        );
+        assert!(data_dir
+            .join("profiles/enigmatica9expert/.theboys/curseforge/manifest.json")
+            .is_file());
+        assert_eq!(
+            local_curseforge_loader_version_for_profile(&plan.profile, &directories)
+                .expect("local manifest should parse")
+                .as_deref(),
+            Some("43.4.23")
+        );
+    }
+
+    #[test]
+    fn curseforge_archive_extract_rejects_escaping_overrides() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive_path = root.path().join("BadPack.zip");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let manifest = br#"{
+          "name": "BadPack",
+          "minecraft": { "version": "1.20.1", "modLoaders": [] },
+          "manifestVersion": 1,
+          "manifestType": "minecraftModpack",
+          "files": [],
+          "overrides": "overrides"
+        }"#;
+        write_zip_archive(
+            &archive_path,
+            &[
+                ("manifest.json", manifest),
+                ("overrides/../escape.txt", b"nope"),
+            ],
+        );
+        let plan = build_curseforge_modpack_archive_install_plan(&archive_path, None, &directories)
+            .expect("manifest should plan");
+
+        let error = extract_curseforge_modpack_archive(&archive_path, &plan, &directories)
+            .expect_err("escaping override should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("CurseForge override path must be a safe relative path"));
     }
 
     #[test]

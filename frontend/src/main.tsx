@@ -90,7 +90,14 @@ type LauncherUpdateManifest = {
 
 type ActionReceipt = {
   id: string;
-  action: "microsoft_login" | "launch_profile" | "install_pack" | "repair_profile" | "delete_profile" | "scan_imports";
+  action:
+    | "microsoft_login"
+    | "launch_profile"
+    | "install_pack"
+    | "install_modpack_archive"
+    | "repair_profile"
+    | "delete_profile"
+    | "scan_imports";
   subjectId?: string;
   status: "queued" | "mocked" | "completed";
   message: string;
@@ -535,6 +542,15 @@ type ImportPlan = {
 
 type ImportConflictResolution = "abort" | "skip" | "overwrite" | "rename";
 
+type DiscoverProviderId = "curseforge" | "modrinth" | "atlauncher" | "ftb" | "ftb_legacy" | "technic";
+
+type DiscoverProvider = {
+  id: DiscoverProviderId;
+  name: string;
+  status: "available" | "coming_soon";
+  summary: string;
+};
+
 type AppSnapshot = {
   settings: LauncherSettings;
   directories: LauncherDirectories;
@@ -629,6 +645,45 @@ const fallbackSnapshot: AppSnapshot = {
   ],
   imports: [],
 };
+
+const discoverProviders: DiscoverProvider[] = [
+  {
+    id: "curseforge",
+    name: "CurseForge",
+    status: "available",
+    summary: "Install exported CurseForge zip packs now; searchable catalog support can follow.",
+  },
+  {
+    id: "modrinth",
+    name: "Modrinth",
+    status: "coming_soon",
+    summary: "Planned support for .mrpack archives and Modrinth catalog browsing.",
+  },
+  {
+    id: "atlauncher",
+    name: "ATLauncher",
+    status: "coming_soon",
+    summary: "Planned provider browsing based on ATLauncher pack metadata.",
+  },
+  {
+    id: "ftb",
+    name: "FTB",
+    status: "coming_soon",
+    summary: "Planned support for current FTB app pack metadata.",
+  },
+  {
+    id: "ftb_legacy",
+    name: "FTB Legacy",
+    status: "coming_soon",
+    summary: "Planned support for the legacy FTB pack feeds.",
+  },
+  {
+    id: "technic",
+    name: "Technic",
+    status: "coming_soon",
+    summary: "Planned Technic and Solder provider support.",
+  },
+];
 
 const fallbackBackendStatus: SocialBackendStatus = {
   endpointKind: "local",
@@ -1593,6 +1648,12 @@ function App() {
   const [blockedAccounts, setBlockedAccounts] = useState<BlockedAccountSummary[]>([]);
   const [mutedAccounts, setMutedAccounts] = useState<MutedAccountSummary[]>([]);
   const [activeView, setActiveView] = useState("home");
+  const [discoverProvider, setDiscoverProvider] = useState<DiscoverProviderId>("curseforge");
+  const [discoverArchiveUrl, setDiscoverArchiveUrl] = useState(
+    "https://i.dylan.lol/dylan/Enigmatica9Expert-1.27.0.zip",
+  );
+  const [discoverArchiveName, setDiscoverArchiveName] = useState("Enigmatica 9 Expert");
+  const [discoverInstallInProgress, setDiscoverInstallInProgress] = useState(false);
   const [selectedPackDetailsId, setSelectedPackDetailsId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [activity, setActivity] = useState("Launcher ready");
@@ -3025,6 +3086,42 @@ function App() {
     }
   }
 
+  async function installDiscoveredArchive(event?: React.FormEvent) {
+    event?.preventDefault();
+    const url = discoverArchiveUrl.trim();
+    if (!url) {
+      setActivity("Paste a modpack archive URL first");
+      return;
+    }
+    setDiscoverInstallInProgress(true);
+    setActivity("Installing discovered modpack");
+    if (isNative) {
+      try {
+        const receipt = await invoke<ActionReceipt>("install_modpack_archive", {
+          request: {
+            url,
+            name: discoverArchiveName.trim() || undefined,
+          },
+        });
+        setActivity(receipt.message);
+        await Promise.all([loadBootstrapSnapshot(), loadLauncherEvents(true)]);
+        setActiveView("library");
+      } catch (error) {
+        setActivity(nativeFailureActivity(error, "Modpack install failed"));
+        await loadLauncherEvents(true);
+        setActiveView("activity");
+        setActivityMode("events");
+      } finally {
+        setDiscoverInstallInProgress(false);
+      }
+      return;
+    }
+    window.setTimeout(() => {
+      setActivity("Discover installs require the desktop app");
+      setDiscoverInstallInProgress(false);
+    }, 350);
+  }
+
   async function saveSettings() {
     const validationMessage = settingsDraftValidationMessage(settingsDraft);
     if (validationMessage) {
@@ -4246,6 +4343,7 @@ function App() {
         <nav>
           {[
             ["home", Gamepad2, "Play"],
+            ["discover", Download, "Discover"],
             ["library", Library, "Library"],
             ["friends", MessageCircle, "Friends"],
             ["imports", FolderInput, "Import"],
@@ -4566,6 +4664,87 @@ function App() {
               </div>
             </section>
           </div>
+        )}
+
+        {activeView === "discover" && (
+          <section className="panel full discover-panel">
+            <div className="section-title">
+              <div>
+                <h2>Discover Modpacks</h2>
+                <span>Browse providers, install packs, and keep setup automatic.</span>
+              </div>
+            </div>
+            <div className="discover-layout">
+              <section className="discover-main">
+                <div className="discover-hero">
+                  <span className="section-kicker">Install from archive</span>
+                  <h3>Paste a modpack download link</h3>
+                  <p>
+                    Standard CurseForge zip exports can be installed now. The launcher copies overrides,
+                    downloads mods in parallel, prepares Minecraft, and sets up Forge automatically.
+                  </p>
+                  <form className="discover-install-form" onSubmit={installDiscoveredArchive}>
+                    <label>
+                      <span>Pack name</span>
+                      <input
+                        value={discoverArchiveName}
+                        onChange={(event) => setDiscoverArchiveName(event.target.value)}
+                        placeholder="Enigmatica 9 Expert"
+                      />
+                    </label>
+                    <label>
+                      <span>Archive URL</span>
+                      <input
+                        value={discoverArchiveUrl}
+                        onChange={(event) => setDiscoverArchiveUrl(event.target.value)}
+                        placeholder="https://example.com/modpack.zip"
+                      />
+                    </label>
+                    <button
+                      className="primary-button"
+                      disabled={discoverInstallInProgress || lifecycleActionInProgress}
+                      type="submit"
+                    >
+                      <Download size={17} />
+                      {discoverInstallInProgress ? "Installing..." : "Install"}
+                    </button>
+                  </form>
+                </div>
+                <div className="discover-provider-grid" aria-label="Discover providers">
+                  {discoverProviders.map((provider) => (
+                    <button
+                      key={provider.id}
+                      className={discoverProvider === provider.id ? "discover-provider-card active" : "discover-provider-card"}
+                      onClick={() => setDiscoverProvider(provider.id)}
+                      type="button"
+                    >
+                      <div>
+                        <strong>{provider.name}</strong>
+                        <span className={provider.status === "available" ? "status-pill ready" : "status-pill muted"}>
+                          {provider.status === "available" ? "Available" : "Planned"}
+                        </span>
+                      </div>
+                      <p>{provider.summary}</p>
+                    </button>
+                  ))}
+                </div>
+              </section>
+              <aside className="discover-side">
+                <span className="section-kicker">Provider plan</span>
+                <h3>{discoverProviders.find((provider) => provider.id === discoverProvider)?.name}</h3>
+                <p>
+                  Discover will grow into searchable tabs for ATLauncher, CurseForge, FTB, FTB Legacy,
+                  Modrinth, and Technic. Profile imports should later move into a first-run suggestion flow.
+                </p>
+                <div className="settings-mini-grid">
+                  <Setting label="Archive imports" value="CurseForge zip" />
+                  <Setting label="Search catalogs" value="Next slice" />
+                  <Setting label="Mod downloads" value="Parallel" />
+                  <Setting label="Java" value="Automatic" />
+                </div>
+              </aside>
+            </div>
+          </section>
         )}
 
         {activeView === "library" && (

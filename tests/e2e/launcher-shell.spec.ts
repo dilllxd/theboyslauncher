@@ -48,6 +48,24 @@ test("settings exposes stable and dev launcher update channels", async ({ page }
   await expect(page.getByText("Installed: Stable. Selected: Dev.")).toBeVisible();
 });
 
+test("discover shows provider plan and archive install entry point", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByRole("navigation").getByRole("button", { name: "Discover" }).click();
+
+  await expect(page.getByRole("heading", { name: "Discover Modpacks" })).toBeVisible();
+  await expect(page.getByText("Browse providers, install packs, and keep setup automatic.")).toBeVisible();
+  await expect(page.getByLabel("Discover providers")).toContainText("CurseForge");
+  await expect(page.getByLabel("Discover providers")).toContainText("Modrinth");
+  await expect(page.getByLabel("Discover providers")).toContainText("ATLauncher");
+  await expect(page.getByLabel("Discover providers")).toContainText("FTB Legacy");
+  await expect(page.getByLabel("Pack name")).toHaveValue("Enigmatica 9 Expert");
+  await expect(page.getByLabel("Archive URL")).toHaveValue(/Enigmatica9Expert-1\.27\.0\.zip/);
+
+  await page.getByRole("button", { name: "Install", exact: true }).click();
+  await expect(page.getByText("Discover installs require the desktop app")).toBeVisible();
+});
+
 test("backend pack refresh preserves native installed pack state", async ({ page }) => {
   await page.route("**/packs", async (route) => {
     await route.fulfill({

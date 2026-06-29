@@ -19,6 +19,7 @@ use launcher_core::{
     bootstrap_snapshot_with_remote_catalog as core_bootstrap_snapshot_with_remote_catalog,
     build_authenticated_launch_plan as core_build_authenticated_launch_plan,
     build_curated_pack_file_download_plan as core_build_curated_pack_file_download_plan,
+    build_curseforge_modpack_archive_install_plan as core_build_curseforge_modpack_archive_install_plan,
     build_install_auxiliary_download_plan as core_build_install_auxiliary_download_plan,
     build_launch_failed_operation_plan as core_build_launch_failed_operation_plan,
     build_launch_operation_plan as core_build_launch_operation_plan,
@@ -26,6 +27,7 @@ use launcher_core::{
     build_managed_java_runtime_download_plan as core_build_managed_java_runtime_download_plan,
     build_modloader_dependency_download_plan_for_profile as core_build_modloader_dependency_download_plan_for_profile,
     build_modloader_download_plan as core_build_modloader_download_plan,
+    build_modloader_download_plan_for_profile_with_loader_version as core_build_modloader_download_plan_for_profile_with_loader_version,
     build_offline_launch_plan as core_build_offline_launch_plan,
     build_offline_launch_plan_with_server as core_build_offline_launch_plan_with_server,
     build_process_command_spec as core_build_process_command_spec,
@@ -41,6 +43,7 @@ use launcher_core::{
     execute_import_plan_and_persist_profile as core_execute_import_plan_and_persist_profile,
     execute_managed_java_runtime_install as core_execute_managed_java_runtime_install,
     execute_modloader_installer_processors_for_profile_with_event_callback as core_execute_modloader_installer_processors_for_profile_with_event_callback,
+    extract_curseforge_modpack_archive as core_extract_curseforge_modpack_archive,
     extract_modloader_installer_metadata_for_profile as core_extract_modloader_installer_metadata_for_profile,
     extract_native_libraries_from_download_plan as core_extract_native_libraries_from_download_plan,
     fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog as core_fetch_install_auxiliary_download_plan_for_pack_profile_with_remote_catalog,
@@ -77,14 +80,14 @@ use launcher_core::{
 use reqwest::Url;
 use shared::{
     ActionReceipt, ActionStatus, AppSnapshot, ArchiveProfileRequest, CreateProfileRequest,
-    DeleteProfileRequest, DownloadKind, DownloadPlan, ImportCandidate, ImportPlan,
-    ImportPlanRequest, JavaRuntimeDownloadRequest, JavaRuntimeManifestEntry, JavaRuntimeSummary,
-    LaunchPlan, LauncherAction, LauncherDirectories, LauncherEvent, LauncherEventKind,
-    LauncherOperation, LauncherSettings, ManagedProcessSummary, MicrosoftAuthCallback,
-    MicrosoftAuthStart, MicrosoftOAuthTokens, MicrosoftTokenExchangePlan, MinecraftEntitlements,
-    MinecraftProfile, MinecraftServicesToken, MinecraftSession, MinecraftVersionSummary,
-    OperationPlan, ProcessCommandSpec, ProcessLogExport, ProfileSummary, ServerLaunchTarget,
-    SocialBackendStatus, StoredMinecraftAccountSummary, StoredMinecraftSession,
+    DeleteProfileRequest, DownloadItem, DownloadKind, DownloadPlan, ImportCandidate, ImportPlan,
+    ImportPlanRequest, InstallModpackArchiveRequest, JavaRuntimeDownloadRequest,
+    JavaRuntimeManifestEntry, JavaRuntimeSummary, LaunchPlan, LauncherAction, LauncherDirectories,
+    LauncherEvent, LauncherEventKind, LauncherOperation, LauncherSettings, ManagedProcessSummary,
+    MicrosoftAuthCallback, MicrosoftAuthStart, MicrosoftOAuthTokens, MicrosoftTokenExchangePlan,
+    MinecraftEntitlements, MinecraftProfile, MinecraftServicesToken, MinecraftSession,
+    MinecraftVersionSummary, OperationPlan, ProcessCommandSpec, ProcessLogExport, ProfileSummary,
+    ServerLaunchTarget, SocialBackendStatus, StoredMinecraftAccountSummary, StoredMinecraftSession,
     UpdateProfileRequest, XboxLiveAuthToken,
 };
 use tauri::{Emitter, Manager, State};
@@ -2276,6 +2279,157 @@ fn install_pack_completion_message(plan: &OperationPlan) -> &'static str {
     }
 }
 
+fn modpack_archive_file_name_from_url(url: &str) -> Result<String, String> {
+    let parsed =
+        Url::parse(url.trim()).map_err(|error| format!("modpack URL is invalid: {error}"))?;
+    let file_name = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.trim().is_empty())
+        .unwrap_or("modpack.zip");
+    if file_name.to_ascii_lowercase().ends_with(".zip")
+        || file_name.to_ascii_lowercase().ends_with(".mrpack")
+    {
+        Ok(file_name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect())
+    } else {
+        Ok("modpack.zip".to_owned())
+    }
+}
+
+fn build_modpack_archive_download_plan(
+    request: &InstallModpackArchiveRequest,
+    directories: &LauncherDirectories,
+) -> Result<(DownloadPlan, PathBuf), String> {
+    let url = request.url.trim();
+    if url.is_empty() {
+        return Err("modpack URL is required".to_owned());
+    }
+    Url::parse(url).map_err(|error| format!("modpack URL is invalid: {error}"))?;
+    let file_name = modpack_archive_file_name_from_url(url)?;
+    let archive_id = uuid::Uuid::new_v4().to_string();
+    let archive_path = PathBuf::from(&directories.cache_dir)
+        .join("modpack-archives")
+        .join(&archive_id)
+        .join(file_name);
+    Ok((
+        DownloadPlan {
+            version_id: format!("modpack-archive-{archive_id}"),
+            items: vec![DownloadItem {
+                id: "modpack-archive".to_owned(),
+                kind: DownloadKind::PackFile,
+                url: url.to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: archive_path.to_string_lossy().replace('\\', "/"),
+            }],
+        },
+        archive_path,
+    ))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn install_modpack_archive(
+    request: InstallModpackArchiveRequest,
+    event_log: State<'_, LauncherEventLog>,
+    lifecycle_gate: State<'_, LifecycleOperationGate>,
+) -> Result<ActionReceipt, String> {
+    let label = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("modpack archive")
+        .to_owned();
+    let _lifecycle_guard = lifecycle_gate.acquire(format!("installing {label}"))?;
+    let directories = core_prepare_launcher_directories().map_err(|error| error.to_string())?;
+    let (archive_download_plan, archive_path) =
+        build_modpack_archive_download_plan(&request, &directories)?;
+    execute_download_plan_recording_events(&archive_download_plan, &event_log).await?;
+
+    let install_plan = core_build_curseforge_modpack_archive_install_plan(
+        &archive_path,
+        request.name.as_deref(),
+        &directories,
+    )
+    .map_err(|error| {
+        native_operation_failure_message("Modpack install failed", &error.to_string())
+    })?;
+    let profile = install_plan.profile.clone();
+    let extraction =
+        core_extract_curseforge_modpack_archive(&archive_path, &install_plan, &directories)
+            .map_err(|error| {
+                native_operation_failure_message("Modpack install failed", &error.to_string())
+            })?;
+    event_log
+        .record_plan(&extraction)
+        .map_err(|error| error.to_string())?;
+
+    let vanilla_plan =
+        core_build_vanilla_download_plan(Some(profile.game_version.as_str()), &directories)
+            .await
+            .map_err(|error| {
+                native_operation_failure_message("Modpack install failed", &error.to_string())
+            })?;
+    execute_download_plan_recording_events(&vanilla_plan, &event_log).await?;
+    core_extract_native_libraries_from_download_plan(&vanilla_plan).map_err(|error| {
+        native_operation_failure_message("Modpack install failed", &error.to_string())
+    })?;
+
+    let mut auxiliary_plan = install_plan.mod_download_plan.clone();
+    if profile.loader != shared::ModLoader::Vanilla {
+        let modloader_plan = core_build_modloader_download_plan_for_profile_with_loader_version(
+            &profile,
+            install_plan.loader_version.as_deref(),
+            &directories,
+        )
+        .map_err(|error| {
+            native_operation_failure_message("Modpack install failed", &error.to_string())
+        })?;
+        auxiliary_plan.items.extend(modloader_plan.items);
+    }
+
+    execute_direct_pack_files_from_auxiliary_plan(&auxiliary_plan, &event_log).await?;
+    execute_modloader_metadata_and_dependencies_for_profile(
+        &profile,
+        &auxiliary_plan,
+        &directories,
+        &event_log,
+    )
+    .await
+    .map_err(|error| native_operation_failure_message("Modpack install failed", &error))?;
+
+    core_persist_installed_pack_profile(profile.clone()).map_err(|error| {
+        native_operation_failure_message("Modpack install failed", &error.to_string())
+    })?;
+    let message = format!("{} installed successfully.", profile.name);
+    event_log
+        .record_event(completed_planned_native_operation_event(
+            extraction.operation_id,
+            LauncherOperation::InstallPack,
+            profile.id.clone(),
+            &message,
+        ))
+        .map_err(|error| error.to_string())?;
+    Ok(completed_action_receipt(
+        LauncherAction::InstallModpackArchive,
+        profile.id,
+        &message,
+    ))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 async fn install_pack(
     pack_id: String,
@@ -2893,6 +3047,7 @@ pub fn run() {
             stop_managed_process,
             export_managed_process_log,
             reveal_exported_process_log,
+            install_modpack_archive,
             install_pack,
             plan_install_pack,
             repair_profile,
