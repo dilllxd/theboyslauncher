@@ -1022,7 +1022,7 @@ h1 {
 
 .profile-editor {
   display: grid;
-  grid-template-columns: minmax(140px, 1.1fr) minmax(100px, 0.8fr) minmax(100px, 0.7fr) minmax(100px, 0.7fr);
+  grid-template-columns: minmax(150px, 1.1fr) minmax(128px, 0.8fr) minmax(128px, 0.7fr) minmax(150px, max-content);
   gap: 8px;
   margin-top: 10px;
   padding: 10px;
@@ -1047,7 +1047,9 @@ h1 {
 }
 
 .profile-advanced-toggle .secondary-button {
+  min-width: 150px;
   width: 100%;
+  white-space: nowrap;
 }
 
 .profile-advanced-fields {

@@ -1199,6 +1199,8 @@ Latest Activity noise polish: the Events tab now keeps high-signal lifecycle fai
 
 Latest profile customization cleanup: Library profile customization now mirrors the beginner-friendly New profile flow. The default customize surface keeps only Name, Version type, and Version visible; loader, memory, window size, server, JVM args, and per-profile Java override all live under the collapsed Advanced section. This keeps Java/loader/memory controls out of normal screens while preserving full power-user edits. Verified with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "library profile editor saves preview changes|library profile editor can choose snapshot versions from the manifest|library new profile action"` and `npm run build`.
 
+Latest packaged profile-customize smoke: after rebuilding `target/release/theboyslauncher.exe` with `npx tauri build --no-bundle`, the real desktop app was launched against `target/packaged-goal-smoke-ui-latest` and Library > Latest Release > Customize was inspected with Computer Use. The default editor shows only Name/Version controls, Advanced opens loader/memory/window/server/JVM/Java override, and the Advanced/Basic toggle now has a fixed-width action column so its label no longer collapses in the packaged app. Verified again with `npx playwright test tests/e2e/launcher-shell.spec.ts --project desktop-chromium --grep "library profile editor saves preview changes|library new profile action"` and `npm run build`.
+
 ## Prompt For Next Session
 
 Use this prompt in the new Codex session on the development PC:
