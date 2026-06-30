@@ -181,11 +181,14 @@ function summarize(rows, activeCampaigns = new Map()) {
   const campaignSummaries = [...campaigns.values()]
     .map((campaign) => {
       const finalRows = [...campaign.versions.values()];
+      const expected = expectedVersionCountFromCampaign(campaign.campaign);
+      const remaining = typeof expected === "number" ? Math.max(0, expected - finalRows.length) : "";
       return {
         campaign: campaign.campaign,
         rows: campaign.rows,
         versions: finalRows.length,
-        expected: expectedVersionCountFromCampaign(campaign.campaign),
+        expected,
+        remaining,
         passed: finalRows.filter((row) => row.status === "passed").length,
         failed: finalRows.filter((row) => row.status !== "passed").length,
         lastVersion: campaign.last.version,
@@ -231,6 +234,7 @@ function printTable(summary) {
     ["Rows", "rows"],
     ["Versions", "versions"],
     ["Expected", "expected"],
+    ["Remaining", "remaining"],
     ["Passed", "passed"],
     ["Failed", "failed"],
     ["Last", "lastVersion"],
