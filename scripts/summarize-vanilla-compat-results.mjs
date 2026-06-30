@@ -58,10 +58,6 @@ function parseRows(file) {
     });
 }
 
-function versionKey(row) {
-  return `${row.campaign ?? "unknown"}\u0000${row.version ?? "unknown"}`;
-}
-
 function safePathSegment(value) {
   return String(value)
     .replace(/[^a-zA-Z0-9._-]+/gu, "-")
@@ -159,7 +155,7 @@ function summarize(rows, activeCampaigns = new Map()) {
     campaignSummary.last = row;
     campaignSummary.versions.set(row.version ?? "unknown", row);
     campaigns.set(campaign, campaignSummary);
-    finalByVersion.set(versionKey(row), row);
+    finalByVersion.set(row.version ?? "unknown", row);
   }
 
   for (const [campaign, active] of activeCampaigns.entries()) {
