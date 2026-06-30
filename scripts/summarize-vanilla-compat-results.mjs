@@ -156,6 +156,22 @@ function summarize(rows, activeCampaigns = new Map()) {
     finalByVersion.set(versionKey(row), row);
   }
 
+  for (const [campaign, active] of activeCampaigns.entries()) {
+    if (!campaigns.has(campaign)) {
+      campaigns.set(campaign, {
+        campaign,
+        rows: 0,
+        versions: new Map(),
+        last: {
+          version: "",
+          status: "running",
+          attempt: "",
+        },
+        activeOnly: true,
+      });
+    }
+  }
+
   const campaignSummaries = [...campaigns.values()]
     .map((campaign) => {
       const finalRows = [...campaign.versions.values()];
