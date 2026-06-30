@@ -2325,6 +2325,36 @@ fn build_modpack_archive_download_plan(
     ))
 }
 
+fn staged_modpack_archive_dir(
+    archive_path: &Path,
+    directories: &LauncherDirectories,
+) -> Option<PathBuf> {
+    let archive_root = PathBuf::from(&directories.cache_dir).join("modpack-archives");
+    let archive_dir = archive_path.parent()?;
+    if archive_dir.parent() == Some(archive_root.as_path()) && archive_dir != archive_root {
+        return Some(archive_dir.to_path_buf());
+    }
+    None
+}
+
+fn cleanup_staged_modpack_archive(
+    archive_path: &Path,
+    directories: &LauncherDirectories,
+) -> Result<(), String> {
+    let Some(archive_dir) = staged_modpack_archive_dir(archive_path, directories) else {
+        return Ok(());
+    };
+    if archive_dir.exists() {
+        fs::remove_dir_all(&archive_dir).map_err(|error| {
+            format!(
+                "failed to clean staged modpack archive {}: {error}",
+                archive_dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 async fn install_modpack_archive(
     request: InstallModpackArchiveRequest,
@@ -2397,6 +2427,7 @@ async fn install_modpack_archive(
     event_log
         .record_plan(&extraction)
         .map_err(|error| error.to_string())?;
+    let _ = cleanup_staged_modpack_archive(&archive_path, &directories);
 
     let vanilla_plan =
         core_build_vanilla_download_plan(Some(profile.game_version.as_str()), &directories)
@@ -3556,6 +3587,83 @@ mod tests {
             "https://example.com/packs/awesome.mrpack"
         );
         assert!(archive_path.ends_with("awesome.mrpack"));
+    }
+
+    #[test]
+    fn staged_modpack_archive_cleanup_removes_only_archive_directory() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive_dir = root.path().join("cache/modpack-archives/archive-id");
+        let archive_path = archive_dir.join("example.zip");
+        fs::create_dir_all(&archive_dir).expect("archive dir should create");
+        fs::write(&archive_path, b"zip").expect("archive fixture should write");
+        let unrelated = root.path().join("cache/modpack-archives/keep/example.zip");
+        fs::create_dir_all(unrelated.parent().expect("unrelated parent should exist"))
+            .expect("unrelated dir should create");
+        fs::write(&unrelated, b"keep").expect("unrelated archive should write");
+        let directories = LauncherDirectories {
+            data_dir: root
+                .path()
+                .join("data")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            config_dir: root
+                .path()
+                .join("config")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            cache_dir: root
+                .path()
+                .join("cache")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            log_dir: root
+                .path()
+                .join("logs")
+                .to_string_lossy()
+                .replace('\\', "/"),
+        };
+
+        cleanup_staged_modpack_archive(&archive_path, &directories)
+            .expect("staged archive cleanup should succeed");
+
+        assert!(!archive_dir.exists());
+        assert!(unrelated.is_file());
+    }
+
+    #[test]
+    fn staged_modpack_archive_cleanup_ignores_unexpected_paths() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let archive_dir = root.path().join("downloads");
+        let archive_path = archive_dir.join("example.zip");
+        fs::create_dir_all(&archive_dir).expect("archive dir should create");
+        fs::write(&archive_path, b"zip").expect("archive fixture should write");
+        let directories = LauncherDirectories {
+            data_dir: root
+                .path()
+                .join("data")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            config_dir: root
+                .path()
+                .join("config")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            cache_dir: root
+                .path()
+                .join("cache")
+                .to_string_lossy()
+                .replace('\\', "/"),
+            log_dir: root
+                .path()
+                .join("logs")
+                .to_string_lossy()
+                .replace('\\', "/"),
+        };
+
+        cleanup_staged_modpack_archive(&archive_path, &directories)
+            .expect("unexpected path cleanup should be a no-op");
+
+        assert!(archive_path.is_file());
     }
 
     #[test]

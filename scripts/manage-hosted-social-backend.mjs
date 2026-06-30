@@ -13,7 +13,8 @@ const databasePassword =
 const hostAddress = process.env.THEBOYS_BACKEND_HOST ?? "127.0.0.1";
 const hostPort = process.env.THEBOYS_BACKEND_PORT ?? "4074";
 const corsOrigins =
-  process.env.THEBOYS_BACKEND_CORS_ORIGINS ?? "https://launcher.dylan.lol";
+  process.env.THEBOYS_BACKEND_CORS_ORIGINS ??
+  "https://launcher.dylan.lol,tauri://localhost,http://tauri.localhost,https://tauri.localhost";
 
 function usage() {
   console.error(

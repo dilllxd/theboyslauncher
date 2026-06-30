@@ -1095,6 +1095,10 @@ h1 {
   line-height: 1.35;
 }
 
+.action-hint {
+  grid-column: 1 / -1;
+}
+
 .profile-editor option {
   color: #0f172a;
 }

@@ -36,6 +36,9 @@ const DEFAULT_CORS_ORIGINS: &[&str] = &[
     "http://127.0.0.1:1420",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
 ];
 pub const POSTGRES_INITIAL_SCHEMA_SQL: &str =
     include_str!("../migrations/0001_initial_social_state.sql");
@@ -292,8 +295,10 @@ fn validate_cors_origin(origin: &str) -> anyhow::Result<String> {
         .scheme_str()
         .ok_or_else(|| anyhow!("THEBOYS_BACKEND_CORS_ORIGINS origins require a scheme"))?;
     ensure!(
-        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"),
-        "THEBOYS_BACKEND_CORS_ORIGINS origins must use http or https"
+        scheme.eq_ignore_ascii_case("http")
+            || scheme.eq_ignore_ascii_case("https")
+            || scheme.eq_ignore_ascii_case("tauri"),
+        "THEBOYS_BACKEND_CORS_ORIGINS origins must use http, https, or tauri"
     );
     ensure!(
         uri.host().is_some(),
@@ -2561,7 +2566,7 @@ mod tests {
             Some("hosted-secret-that-is-long-enough-for-hmac".to_owned()),
             Some("http://127.0.0.1:9000/profile".to_owned()),
             None,
-            Some("https://launcher.dylan.lol, http://127.0.0.1:1420".to_owned()),
+            Some("https://launcher.dylan.lol, http://127.0.0.1:1420, tauri://localhost".to_owned()),
         )
         .expect("Postgres mode should accept strong explicit secret");
 
@@ -2584,9 +2589,19 @@ mod tests {
             config.cors_origins,
             vec![
                 "https://launcher.dylan.lol".to_owned(),
-                "http://127.0.0.1:1420".to_owned()
+                "http://127.0.0.1:1420".to_owned(),
+                "tauri://localhost".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn default_cors_origins_include_packaged_tauri_origins() {
+        let origins = default_cors_origins();
+
+        assert!(origins.contains(&"tauri://localhost".to_owned()));
+        assert!(origins.contains(&"http://tauri.localhost".to_owned()));
+        assert!(origins.contains(&"https://tauri.localhost".to_owned()));
     }
 
     #[test]
@@ -3469,7 +3484,12 @@ mod tests {
     async fn configured_cors_preflight_allows_only_configured_hosted_origin() {
         let response = app_with_cors_origins(
             BackendState::default(),
-            vec!["https://launcher.dylan.lol".to_owned()],
+            vec![
+                "https://launcher.dylan.lol".to_owned(),
+                "tauri://localhost".to_owned(),
+                "http://tauri.localhost".to_owned(),
+                "https://tauri.localhost".to_owned(),
+            ],
         )
         .oneshot(
             Request::builder()
@@ -3490,9 +3510,44 @@ mod tests {
             Some(&HeaderValue::from_static("https://launcher.dylan.lol"))
         );
 
+        let tauri_response = app_with_cors_origins(
+            BackendState::default(),
+            vec![
+                "https://launcher.dylan.lol".to_owned(),
+                "tauri://localhost".to_owned(),
+                "http://tauri.localhost".to_owned(),
+                "https://tauri.localhost".to_owned(),
+            ],
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/sessions/current")
+                .header(header::ORIGIN, "tauri://localhost")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+        assert_eq!(tauri_response.status(), StatusCode::OK);
+        assert_eq!(
+            tauri_response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("tauri://localhost"))
+        );
+
         let rejected = app_with_cors_origins(
             BackendState::default(),
-            vec!["https://launcher.dylan.lol".to_owned()],
+            vec![
+                "https://launcher.dylan.lol".to_owned(),
+                "tauri://localhost".to_owned(),
+                "http://tauri.localhost".to_owned(),
+                "https://tauri.localhost".to_owned(),
+            ],
         )
         .oneshot(
             Request::builder()

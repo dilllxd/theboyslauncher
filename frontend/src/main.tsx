@@ -373,6 +373,8 @@ type DeleteProfileRequest = {
 };
 
 const profileLoaders: ProfileSummary["loader"][] = ["vanilla", "fabric", "quilt", "forge", "neoforge"];
+const seededForgeMinecraftVersions = new Set(["1.20.1"]);
+const seededNeoForgeMinecraftVersions = new Set(["1.21.1"]);
 const previewAccountId = "00000000-0000-4000-8000-000000000001";
 const fallbackMinecraftVersions: MinecraftVersionSummary[] = ["1.21.8", "1.21.4", "1.21.1", "1.20.1", "1.19.4", "1.18.2", "1.16.5", "1.12.2", "1.8.9", "1.7.10"].map((id) => ({
   id,
@@ -998,6 +1000,8 @@ function settingsDraftValidationMessage(settings: LauncherSettings) {
 function createProfileValidationMessage(request: CreateProfileRequest) {
   if (!request.name.trim()) return "Profile name is required";
   if (!request.gameVersion.trim()) return "Profile game version is required";
+  const loaderSupportMessage = manualProfileLoaderSupportMessage(request.loader, request.gameVersion);
+  if (loaderSupportMessage) return loaderSupportMessage;
   if (!Number.isFinite(request.memoryMb) || request.memoryMb < 512) return "Profile memory must be at least 512 MB";
   if (request.memoryMb > 32768) return "Profile memory must be 32768 MB or lower";
   return null;
@@ -1037,6 +1041,42 @@ function minecraftVersionsForType(versions: MinecraftVersionSummary[], versionTy
 
 function minecraftVersionTypeForVersion(versionId: string, versions: MinecraftVersionSummary[]) {
   return versions.find((version) => version.id === versionId)?.versionType ?? "release";
+}
+
+function profileLoaderLabel(loader: ProfileSummary["loader"]) {
+  switch (loader) {
+    case "vanilla":
+      return "Vanilla";
+    case "fabric":
+      return "Fabric";
+    case "quilt":
+      return "Quilt";
+    case "forge":
+      return "Forge";
+    case "neoforge":
+      return "NeoForge";
+    default:
+      return loader;
+  }
+}
+
+function supportedManualLoaderVersions(loader: ProfileSummary["loader"]) {
+  if (loader === "forge") return [...seededForgeMinecraftVersions];
+  if (loader === "neoforge") return [...seededNeoForgeMinecraftVersions];
+  return [];
+}
+
+function manualProfileLoaderSupported(loader: ProfileSummary["loader"], gameVersion: string) {
+  if (loader === "forge") return seededForgeMinecraftVersions.has(gameVersion.trim());
+  if (loader === "neoforge") return seededNeoForgeMinecraftVersions.has(gameVersion.trim());
+  return true;
+}
+
+function manualProfileLoaderSupportMessage(loader: ProfileSummary["loader"], gameVersion: string) {
+  if (manualProfileLoaderSupported(loader, gameVersion)) return null;
+  const versions = supportedManualLoaderVersions(loader);
+  const versionList = versions.length > 0 ? versions.join(", ") : "curated pack installs";
+  return `${profileLoaderLabel(loader)} setup is available for Minecraft ${versionList} right now. Pick Vanilla, Fabric, Quilt, or a supported ${profileLoaderLabel(loader)} version.`;
 }
 
 function profileVersionOptions(currentVersion: string, versions: MinecraftVersionSummary[], useReleaseFallback = true) {
@@ -5272,11 +5312,21 @@ function App() {
                             onChange={(event) => setNewProfileLoader(event.target.value as ProfileSummary["loader"])}
                           >
                             {profileLoaders.map((item) => (
-                              <option key={item} value={item}>
-                                {item}
+                              <option
+                                disabled={!manualProfileLoaderSupported(item, newProfileGameVersion)}
+                                key={item}
+                                value={item}
+                              >
+                                {profileLoaderLabel(item)}
+                                {!manualProfileLoaderSupported(item, newProfileGameVersion) ? " (not available)" : ""}
                               </option>
                             ))}
                           </select>
+                          {manualProfileLoaderSupportMessage(newProfileLoader, newProfileGameVersion) && (
+                            <span className="field-hint">
+                              {manualProfileLoaderSupportMessage(newProfileLoader, newProfileGameVersion)}
+                            </span>
+                          )}
                         </label>
                         <label>
                           <span>Memory</span>
@@ -5296,6 +5346,7 @@ function App() {
                 </div>
                 <div className="profile-actions" aria-label="New profile actions">
                   <div className="profile-action-group">
+                    {newProfileValidationMessage && <span className="field-hint action-hint">{newProfileValidationMessage}</span>}
                     <button
                       className="primary-button compact"
                       disabled={Boolean(newProfileValidationMessage) || profileCreatorSetupInProgress}
@@ -7138,9 +7189,11 @@ function ProfileEditor({
   const serverPortValid =
     !defaultServerPort.trim() ||
     (Number.isInteger(parsedServerPort) && parsedServerPort >= 1 && parsedServerPort <= 65535);
+  const loaderSupportMessage = manualProfileLoaderSupportMessage(loader, trimmedGameVersion);
   const canSave =
     trimmedName.length > 0 &&
     trimmedGameVersion.length > 0 &&
+    !loaderSupportMessage &&
     memoryMb >= 512 &&
     memoryMb <= 32768 &&
     resolutionComplete &&
@@ -7242,11 +7295,13 @@ function ProfileEditor({
                     onChange={(event) => setLoader(event.target.value as ProfileSummary["loader"])}
                   >
                     {profileLoaders.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
+                      <option disabled={!manualProfileLoaderSupported(item, gameVersion)} key={item} value={item}>
+                        {profileLoaderLabel(item)}
+                        {!manualProfileLoaderSupported(item, gameVersion) ? " (not available)" : ""}
                       </option>
                     ))}
                   </select>
+                  {loaderSupportMessage && <span className="field-hint">{loaderSupportMessage}</span>}
                 </label>
                 <label>
                   <span>Memory</span>
@@ -7372,6 +7427,7 @@ function ProfileEditor({
           </div>
         )}
         <div className="profile-action-group" aria-label={`${profile.name} edit actions`}>
+          {customizing && loaderSupportMessage && <span className="field-hint action-hint">{loaderSupportMessage}</span>}
           <button
             className="secondary-button compact"
             disabled={hasActiveProcess || globalLifecycleActionInProgress}
