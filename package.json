@@ -44,6 +44,7 @@
     "smoke:live:winterpack:delete": "node scripts/run-live-winterpack-smoke.mjs delete",
     "smoke:live:vanilla:compat": "node scripts/run-vanilla-compat-campaign.mjs",
     "smoke:live:vanilla:summary": "node scripts/summarize-vanilla-compat-results.mjs",
+    "smoke:live:vanilla:coverage": "node scripts/summarize-vanilla-compat-results.mjs --coverage",
     "smoke:live:fabric:plan": "node scripts/run-live-winterpack-smoke.mjs fabricPlan",
     "smoke:live:fabric:install": "node scripts/run-live-winterpack-smoke.mjs fabricInstall --root target/live-smoke/fabric",
     "smoke:live:fabric:launch": "node scripts/run-live-winterpack-smoke.mjs fabricLaunch --root target/live-smoke/fabric",
