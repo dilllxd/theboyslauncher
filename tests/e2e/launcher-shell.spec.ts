@@ -2880,8 +2880,15 @@ test("creating a profile refreshes the native bootstrap snapshot", async ({ page
   await page.getByRole("button", { name: "Library" }).click();
   await expect(page.locator(".profile-row")).toHaveCount(0);
   await page.getByRole("button", { name: "New profile" }).click();
-  await page.getByLabel("New profile name").fill("Native Fabric");
+  await expect(page.getByLabel("New profile name")).toHaveValue("Minecraft 1.21.8");
   await page.getByLabel("New profile version type").selectOption("snapshot");
+  await expect(page.getByLabel("New profile game version")).toHaveValue("26w01a");
+  await expect(page.getByLabel("New profile name")).toHaveValue("Minecraft 26w01a");
+  await page.getByLabel("New profile name").fill("Native Fabric");
+  await page.getByLabel("New profile version type").selectOption("release");
+  await expect(page.getByLabel("New profile name")).toHaveValue("Native Fabric");
+  await page.getByLabel("New profile version type").selectOption("snapshot");
+  await expect(page.getByLabel("New profile name")).toHaveValue("Native Fabric");
   await page.getByLabel("New profile game version").selectOption("26w01a");
   await expect(page.getByLabel("New profile advanced settings")).toHaveCount(0);
   await page.getByRole("button", { name: "Advanced" }).click();
