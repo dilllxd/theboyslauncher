@@ -4,14 +4,16 @@ import { resolve } from "node:path";
 
 const defaultResultLogPath = resolve("target", "live-smoke", "vanilla-compat-results.jsonl");
 const defaultCompatRoot = resolve("target", "live-smoke", "vanilla-compat");
+const defaultVersionManifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
 function usage() {
   console.log(`Usage:
-  node scripts/summarize-vanilla-compat-results.mjs [--file <path>] [--json]
+  node scripts/summarize-vanilla-compat-results.mjs [--file <path>] [--json] [--coverage]
 
 Options:
   --file <path>  Read a specific JSONL result log. Defaults to ${defaultResultLogPath}
   --json         Print machine-readable JSON instead of a text table.
+  --coverage     Fetch Mojang's current version manifest and print missing/pass ranges by version type.
 `);
 }
 
@@ -19,6 +21,7 @@ function parseArgs(argv) {
   const options = {
     file: defaultResultLogPath,
     json: false,
+    coverage: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -29,6 +32,8 @@ function parseArgs(argv) {
       options.file = resolve(argv[index]);
     } else if (arg === "--json") {
       options.json = true;
+    } else if (arg === "--coverage") {
+      options.coverage = true;
     } else if (arg === "--help" || arg === "-h") {
       usage();
       process.exit(0);
@@ -38,6 +43,72 @@ function parseArgs(argv) {
   }
 
   return options;
+}
+
+async function fetchVersionManifest() {
+  const response = await fetch(defaultVersionManifestUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Minecraft version manifest request failed with HTTP ${response.status}`,
+    );
+  }
+  return response.json();
+}
+
+function missingRangesForOrderedVersions(versions, finalByVersion) {
+  const missingRanges = [];
+  let startIndex = null;
+  let previousIndex = null;
+
+  for (let index = 0; index < versions.length; index += 1) {
+    const version = versions[index];
+    if (finalByVersion.get(version.id)?.status === "passed") {
+      if (startIndex !== null) {
+        missingRanges.push([startIndex, previousIndex]);
+        startIndex = null;
+        previousIndex = null;
+      }
+      continue;
+    }
+    if (startIndex === null) {
+      startIndex = index;
+    }
+    previousIndex = index;
+  }
+
+  if (startIndex !== null) {
+    missingRanges.push([startIndex, previousIndex]);
+  }
+
+  return missingRanges.map(([start, end]) => ({
+    start,
+    end,
+    count: end - start + 1,
+    first: versions[start].id,
+    last: versions[end].id,
+  }));
+}
+
+async function buildManifestCoverage(rows) {
+  const finalByVersion = new Map();
+  for (const row of rows) {
+    finalByVersion.set(row.version ?? "unknown", row);
+  }
+
+  const manifest = await fetchVersionManifest();
+  const versionTypes = ["release", "snapshot", "old_beta", "old_alpha"];
+  return versionTypes.map((type) => {
+    const versions = manifest.versions.filter((version) => version.type === type);
+    const missingRanges = missingRangesForOrderedVersions(versions, finalByVersion);
+    const missing = missingRanges.reduce((sum, range) => sum + range.count, 0);
+    return {
+      type,
+      total: versions.length,
+      passed: versions.length - missing,
+      missing,
+      ranges: missingRanges,
+    };
+  });
 }
 
 function parseRows(file) {
@@ -260,11 +331,28 @@ function printTable(summary) {
   }
 }
 
+function printCoverage(coverage) {
+  console.log("\nMinecraft manifest coverage:");
+  for (const row of coverage) {
+    console.log(`${row.type}: ${row.passed}/${row.total} passed, ${row.missing} missing or not final-pass`);
+    for (const range of row.ranges.slice(0, 24)) {
+      console.log(`  ${range.start}-${range.end}: ${range.first} .. ${range.last} (${range.count})`);
+    }
+    if (row.ranges.length > 24) {
+      console.log(`  ... ${row.ranges.length - 24} more ranges`);
+    }
+  }
+}
+
 const options = parseArgs(process.argv.slice(2));
 const rows = parseRows(options.file);
 const summary = summarize(rows, activeCampaignsByLock());
+const coverage = options.coverage ? await buildManifestCoverage(rows) : null;
 if (options.json) {
-  console.log(JSON.stringify(summary, null, 2));
+  console.log(JSON.stringify(coverage ? { ...summary, coverage } : summary, null, 2));
 } else {
   printTable(summary);
+  if (coverage) {
+    printCoverage(coverage);
+  }
 }
