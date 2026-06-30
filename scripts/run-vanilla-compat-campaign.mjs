@@ -28,6 +28,8 @@ Options:
   --limit <n>     With --all, test at most n selected versions for resumable chunks.
   --keep          Keep each per-version launcher root after the run.
   --jobs <n>      Run up to n isolated version smokes at once. Defaults to 1.
+  --retry-failures <n>
+                  Retry failed versions up to n extra times before failing the campaign. Defaults to 1.
   --shared-cache  Reuse one shared launcher cache across versions. Serial only for now.
   --quiet         Capture cargo output and print only concise progress plus failure tails.
   --dry-run       Print selected versions without downloading or launching Minecraft.
@@ -52,6 +54,7 @@ function parseArgs(argv) {
     limit: null,
     offset: 0,
     quiet: false,
+    retryFailures: 1,
     sample: false,
     sharedCache: false,
     types: [],
@@ -84,6 +87,9 @@ function parseArgs(argv) {
       options.offset = parseNonNegativeInteger(argv[index], "--offset");
     } else if (arg === "--quiet") {
       options.quiet = true;
+    } else if (arg === "--retry-failures") {
+      index += 1;
+      options.retryFailures = parseNonNegativeInteger(argv[index], "--retry-failures");
     } else if (arg === "--sample") {
       options.sample = true;
     } else if (arg === "--shared-cache") {
@@ -243,7 +249,7 @@ function campaignLockName(options, versions) {
   return safePathSegment(`versions-${versions.join("+")}`);
 }
 
-function recordResult(options, campaignLabel, result) {
+function recordResult(options, campaignLabel, result, attemptLabel = "initial") {
   mkdirSync(dirname(defaultResultLogPath), { recursive: true });
   appendFileSync(
     defaultResultLogPath,
@@ -253,6 +259,7 @@ function recordResult(options, campaignLabel, result) {
       type: options.types.length === 1 ? options.types[0] : options.types,
       offset: options.offset,
       limit: options.limit,
+      attempt: attemptLabel,
       version: result.version,
       status: result.code === 0 ? "passed" : "failed",
       exitCode: result.code,
@@ -430,13 +437,13 @@ function runVersion(version, options) {
   });
 }
 
-async function runVersions(versions, options) {
+async function runVersions(versions, options, attemptLabel = "initial") {
   if (options.jobs === 1) {
     const results = [];
     for (const version of versions) {
       const result = await runVersion(version, options);
       results.push(result);
-      if (options.campaignLabel) recordResult(options, options.campaignLabel, result);
+      if (options.campaignLabel) recordResult(options, options.campaignLabel, result, attemptLabel);
     }
     return results;
   }
@@ -451,11 +458,16 @@ async function runVersions(versions, options) {
         nextIndex += 1;
         const result = await runVersion(versions[currentIndex], options);
         results[currentIndex] = result;
-        if (options.campaignLabel) recordResult(options, options.campaignLabel, result);
+        if (options.campaignLabel) recordResult(options, options.campaignLabel, result, attemptLabel);
       }
     }),
   );
   return results;
+}
+
+function mergeRetryResults(results, retryResults) {
+  const byVersion = new Map(retryResults.map((result) => [result.version, result]));
+  return results.map((result) => byVersion.get(result.version) ?? result);
 }
 
 const options = parseArgs(process.argv.slice(2));
@@ -493,6 +505,15 @@ options.campaignLabel = campaignLockName(options, versions);
 let results;
 try {
   results = await runVersions(versions, options);
+  for (let retryAttempt = 1; retryAttempt <= options.retryFailures; retryAttempt += 1) {
+    const failedVersions = results.filter((result) => result.code !== 0).map((result) => result.version);
+    if (failedVersions.length === 0) break;
+    console.log(
+      `\nRetrying ${failedVersions.length} failed Minecraft version(s), attempt ${retryAttempt}/${options.retryFailures}: ${failedVersions.join(", ")}`,
+    );
+    const retryResults = await runVersions(failedVersions, options, `retry-${retryAttempt}`);
+    results = mergeRetryResults(results, retryResults);
+  }
 } finally {
   rmSync(campaignLockPath, { recursive: true, force: true });
 }
