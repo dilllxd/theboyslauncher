@@ -128,6 +128,7 @@ function activeCampaignsByLock(compatRoot = defaultCompatRoot) {
     try {
       const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
       const commandLine = commandsByPid.get(Number(owner.pid));
+      if (!commandLine) continue;
       const campaign = campaignLockNameFromCommand(commandLine);
       if (!campaign) continue;
       active.set(campaign, {
