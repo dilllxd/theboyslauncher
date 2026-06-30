@@ -91,6 +91,11 @@ function campaignLockNameFromCommand(commandLine) {
   return safePathSegment(`all-${types.length > 0 ? types.join("+") : "all-types"}-offset-${offset}-limit-${limit}`);
 }
 
+function expectedVersionCountFromCampaign(campaign) {
+  const match = /^all-.+-offset-\d+-limit-(\d+)$/u.exec(String(campaign));
+  return match ? Number(match[1]) : "";
+}
+
 function readWindowsNodeCommandsByPid() {
   if (process.platform !== "win32") return new Map();
   try {
@@ -179,6 +184,7 @@ function summarize(rows, activeCampaigns = new Map()) {
         campaign: campaign.campaign,
         rows: campaign.rows,
         versions: finalRows.length,
+        expected: expectedVersionCountFromCampaign(campaign.campaign),
         passed: finalRows.filter((row) => row.status === "passed").length,
         failed: finalRows.filter((row) => row.status !== "passed").length,
         lastVersion: campaign.last.version,
@@ -223,6 +229,7 @@ function printTable(summary) {
     ["Campaign", "campaign"],
     ["Rows", "rows"],
     ["Versions", "versions"],
+    ["Expected", "expected"],
     ["Passed", "passed"],
     ["Failed", "failed"],
     ["Last", "lastVersion"],
