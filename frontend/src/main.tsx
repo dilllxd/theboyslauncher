@@ -1865,6 +1865,8 @@ function App() {
   const profileCreatorSetupInProgress =
     setupInProgressProfileId === uniqueProfileIdFromName(newProfileName, snapshot.profiles);
   const [importInProgress, setImportInProgress] = useState(false);
+  const [customImportName, setCustomImportName] = useState("");
+  const [customImportPath, setCustomImportPath] = useState("");
   const [managedJavaInstallInProgress, setManagedJavaInstallInProgress] = useState(false);
   const lifecycleActionInProgressRef = useRef<string | null>(null);
   const [launchInProgressProfileIds, setLaunchInProgressProfileIds] = useState<Set<string>>(() => new Set());
@@ -3231,6 +3233,30 @@ function App() {
       });
       setActivity("Import planning is mocked in web preview");
     }
+  }
+
+  async function planCustomImport(event?: React.FormEvent) {
+    event?.preventDefault();
+    const sourcePath = customImportPath.trim();
+    if (!sourcePath) {
+      setActivity("Paste the profile folder path first");
+      return;
+    }
+    const fallbackName =
+      sourcePath
+        .split(/[\\/]+/u)
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .pop() ?? "Imported profile";
+    await planImport({
+      id: uniqueProfileIdFromName(customImportName.trim() || fallbackName, snapshot.profiles),
+      source: "Custom folder",
+      name: customImportName.trim() || fallbackName,
+      path: sourcePath,
+      kind: "multimc",
+      detectedName: customImportName.trim() || fallbackName,
+      detectedSummary: "Custom folder selected by path.",
+    });
   }
 
   function setImportConflictResolution(kind: string, destination: string, resolution: ImportConflictResolution) {
@@ -5694,6 +5720,35 @@ function App() {
                 </div>
               </div>
             </div>
+            <form className="import-custom-form" aria-label="Import custom folder" onSubmit={planCustomImport}>
+              <div>
+                <span className="section-kicker">Custom folder</span>
+                <strong>Import from a folder path</strong>
+                <p>Use this when your launcher profiles are on another drive or the scan misses them.</p>
+              </div>
+              <label>
+                <span>Profile name</span>
+                <input
+                  aria-label="Custom import profile name"
+                  value={customImportName}
+                  onChange={(event) => setCustomImportName(event.target.value)}
+                  placeholder="Leave blank to use the folder name"
+                />
+              </label>
+              <label>
+                <span>Folder path</span>
+                <input
+                  aria-label="Custom import folder path"
+                  value={customImportPath}
+                  onChange={(event) => setCustomImportPath(event.target.value)}
+                  placeholder="D:\\Games\\PrismLauncher\\instances\\WinterPack"
+                />
+              </label>
+              <button className="secondary-button" type="submit">
+                <FolderInput size={17} />
+                Review folder
+              </button>
+            </form>
             {snapshot.imports.length > 0 ? (
               <div className="import-list">
                 {snapshot.imports.map((candidate) => (

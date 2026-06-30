@@ -8498,6 +8498,107 @@ test("import screen exposes scan action", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Scan" })).toBeVisible();
 });
 
+test("import screen can review a custom folder path", async ({ page }) => {
+  await page.addInitScript(() => {
+    let plannedRequest: unknown = null;
+    const snapshot = {
+      settings: {
+        maxMemoryMb: 6144,
+        minMemoryMb: 2048,
+        offlineUsername: "Player",
+        telemetryEnabled: false,
+      },
+      directories: {
+        dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+        configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+        cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+        logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+      },
+      friends: [],
+      packs: [],
+      profiles: [],
+      imports: [],
+    };
+
+    Object.defineProperty(window, "__customImportPlannedRequest", {
+      get: () => plannedRequest,
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string, args?: { request?: unknown }) => {
+          if (cmd === "bootstrap_snapshot") return snapshot;
+          if (cmd === "list_minecraft_accounts") return [];
+          if (cmd === "list_launcher_events") return [];
+          if (cmd === "list_managed_processes") return [];
+          if (cmd === "list_minecraft_versions") return [];
+          if (cmd === "plan_profile_import") {
+            plannedRequest = args?.request ?? null;
+            return {
+              profileId: "custom-family-world",
+              profileName: "Family World",
+              sourcePath: "D:/Games/PrismLauncher/instances/FamilyWorld",
+              destinationPath: "C:/Users/test/AppData/Roaming/TheBoysLauncher/data/profiles/custom-family-world",
+              detectedLoader: "vanilla",
+              detectedGameVersion: "1.21.8",
+              items: [
+                {
+                  kind: "saves",
+                  source: "D:/Games/PrismLauncher/instances/FamilyWorld/.minecraft/saves",
+                  destination: "C:/Users/test/AppData/Roaming/TheBoysLauncher/data/profiles/custom-family-world/saves",
+                  exists: true,
+                  destinationExists: false,
+                  fileCount: 1,
+                  totalBytes: 2048,
+                },
+              ],
+            };
+          }
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("navigation").getByRole("button", { name: "Import" }).click();
+  await page.getByLabel("Custom import profile name").fill("Family World");
+  await page.getByLabel("Custom import folder path").fill("D:/Games/PrismLauncher/instances/FamilyWorld");
+  await page.getByRole("button", { name: "Review folder" }).click();
+
+  const importDialog = page.getByRole("dialog", { name: "Review profile import" });
+  await expect(importDialog.getByRole("heading", { name: "Family World" })).toBeVisible();
+  await expect(importDialog).toContainText("1 item ready - 2.0 KB");
+  await expect(importDialog).toContainText("1.21.8 - vanilla");
+  const request = await page.evaluate(
+    () => (window as typeof window & { __customImportPlannedRequest: unknown }).__customImportPlannedRequest,
+  );
+  expect(request).toEqual({
+    name: "Family World",
+    sourcePath: "D:/Games/PrismLauncher/instances/FamilyWorld",
+  });
+});
+
 test("friends screen starts without seeded preview requests or blocked accounts", async ({ page }) => {
   await page.goto("/");
 

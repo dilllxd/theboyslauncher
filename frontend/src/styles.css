@@ -1994,6 +1994,44 @@ h1 {
   text-align: center;
 }
 
+.import-custom-form {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.1fr) minmax(160px, 0.8fr) minmax(280px, 1.3fr) auto;
+  align-items: end;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.import-custom-form p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.import-custom-form label {
+  display: grid;
+  gap: 6px;
+}
+
+.import-custom-form label span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.import-custom-form input {
+  width: 100%;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  outline: 0;
+  background: var(--panel);
+  padding: 9px 10px;
+}
+
 .import-plan {
   margin-top: 18px;
 }
