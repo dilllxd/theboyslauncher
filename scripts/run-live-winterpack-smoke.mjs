@@ -15,6 +15,7 @@ const smokeTests = {
   fabricInstall: "live_public_fabric_packwiz_install_artifacts_pass_launch_preflight",
   fabricLaunch: "live_public_fabric_packwiz_launch_process_survives_startup_and_can_stop",
   modrinthDiscover: "live_modrinth_discover_search_resolves_installable_archive",
+  curseforgeArchivePlan: "live_curseforge_archive_plan_reads_enigmatica_export",
   modrinthArchiveInstall: "live_public_modrinth_mrpack_install_artifacts_pass_launch_preflight",
   vanillaLaunch: "live_vanilla_launch_process_survives_startup_and_can_stop",
   neoforgeInstaller: "live_neoforge_installer_extracts_launch_metadata_and_dependencies",

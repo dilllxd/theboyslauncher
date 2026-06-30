@@ -13541,6 +13541,65 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "downloads the live Enigmatica 9 Expert CurseForge export and validates archive planning without downloading every mod"]
+    async fn live_curseforge_archive_plan_reads_enigmatica_export() -> Result<()> {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let archive_path = PathBuf::from(&directories.cache_dir)
+            .join("live-smoke")
+            .join("Enigmatica9Expert-1.27.0.zip");
+        let archive_plan = DownloadPlan {
+            version_id: "live-curseforge-enigmatica-archive".to_owned(),
+            items: vec![DownloadItem {
+                id: "live-curseforge-enigmatica-archive".to_owned(),
+                kind: DownloadKind::PackFile,
+                url: public_curseforge_enigmatica_smoke_url().to_owned(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive_path),
+            }],
+        };
+        execute_download_plan(&archive_plan).await?;
+
+        let install_plan =
+            build_curseforge_modpack_archive_install_plan(&archive_path, None, &directories)
+                .expect("live CurseForge export should plan");
+        assert_eq!(install_plan.profile.id, "enigmatica9expert");
+        assert_eq!(install_plan.profile.name, "Enigmatica9Expert");
+        assert_eq!(install_plan.profile.loader, ModLoader::Forge);
+        assert_eq!(install_plan.profile.game_version, "1.19.2");
+        assert_eq!(install_plan.loader_version.as_deref(), Some("43.4.23"));
+        assert_eq!(
+            install_plan.mod_download_plan.items.len(),
+            232,
+            "Enigmatica export should expose every required mod as a planned download"
+        );
+        assert!(install_plan.mod_download_plan.items.iter().all(|item| {
+            item.kind == DownloadKind::PackFile
+                && item.url.starts_with("https://edge.forgecdn.net/")
+                && item
+                    .destination
+                    .contains("profiles/enigmatica9expert/mods/")
+        }));
+
+        extract_curseforge_modpack_archive(&archive_path, &install_plan, &directories)
+            .expect("live CurseForge overrides should extract");
+        let profile_root = PathBuf::from(&directories.data_dir).join("profiles/enigmatica9expert");
+        assert!(profile_root
+            .join(".theboys/curseforge/manifest.json")
+            .is_file());
+        assert!(profile_root
+            .join("config/AdvancedBackups.properties")
+            .is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "downloads a live public Modrinth .mrpack, Fabric loader, pack files, and vanilla artifacts before launch preflight"]
     async fn live_public_modrinth_mrpack_install_artifacts_pass_launch_preflight() {
         let _smoke_root = LiveSmokeRoot::new();
@@ -13637,6 +13696,10 @@ mod tests {
 
     fn public_modrinth_mrpack_smoke_url() -> &'static str {
         "https://cdn.modrinth.com/data/L9xxumt0/versions/iQyGNliq/%5BFabric%5DHaste-1.21.1%201.21.1.mrpack"
+    }
+
+    fn public_curseforge_enigmatica_smoke_url() -> &'static str {
+        "https://i.dylan.lol/dylan/Enigmatica9Expert-1.27.0.zip"
     }
 
     fn public_fabric_smoke_catalog_entry() -> ModpackCatalogEntry {

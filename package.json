@@ -48,6 +48,7 @@
     "smoke:live:fabric:install": "node scripts/run-live-winterpack-smoke.mjs fabricInstall --root target/live-smoke/fabric",
     "smoke:live:fabric:launch": "node scripts/run-live-winterpack-smoke.mjs fabricLaunch --root target/live-smoke/fabric",
     "smoke:live:modrinth:discover": "node scripts/run-live-winterpack-smoke.mjs modrinthDiscover",
+    "smoke:live:curseforge:plan": "node scripts/run-live-winterpack-smoke.mjs curseforgeArchivePlan --root target/live-smoke/curseforge-enigmatica",
     "smoke:live:modrinth:install": "node scripts/run-live-winterpack-smoke.mjs modrinthArchiveInstall --root target/live-smoke/modrinth-mrpack",
     "smoke:live:neoforge:installer": "node scripts/run-live-winterpack-smoke.mjs neoforgeInstaller --root target/live-smoke/neoforge",
     "smoke:live:neoforge:processors": "node scripts/run-live-winterpack-smoke.mjs neoforgeProcessors --root target/live-smoke/neoforge",
