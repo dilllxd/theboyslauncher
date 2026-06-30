@@ -249,6 +249,118 @@ test("discover shows provider plan and archive install entry point", async ({ pa
   await expect(page.getByText("Discover installs require the desktop app")).toBeVisible();
 });
 
+test("discover archive install refreshes the library profile list", async ({ page }) => {
+  await page.addInitScript(() => {
+    let installed = false;
+    let archiveRequest: unknown = null;
+    const installedProfile = {
+      id: "enigmatica-9-expert",
+      name: "Enigmatica 9 Expert",
+      loader: "forge",
+      gameVersion: "1.19.2",
+      installedPackVersion: "1.27.0",
+      memoryMb: 6144,
+      jvmArgs: [],
+    };
+    const snapshot = () => ({
+      settings: {
+        maxMemoryMb: 6144,
+        minMemoryMb: 2048,
+        offlineUsername: "Player",
+        telemetryEnabled: false,
+      },
+      directories: {
+        dataDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher",
+        configDir: "C:/Users/test/AppData/Roaming/TheBoysLauncher/config",
+        cacheDir: "C:/Users/test/AppData/Local/TheBoysLauncher/cache",
+        logDir: "C:/Users/test/AppData/Local/TheBoysLauncher/logs",
+      },
+      friends: [],
+      packs: [],
+      profiles: installed ? [installedProfile] : [],
+      imports: [],
+    });
+
+    Object.defineProperty(window, "__discoverArchiveInstallRequest", {
+      get: () => archiveRequest,
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      value: {
+        invoke: async (cmd: string, args?: { request?: unknown }) => {
+          if (cmd === "bootstrap_snapshot") return snapshot();
+          if (cmd === "list_minecraft_accounts") return [];
+          if (cmd === "list_launcher_events") {
+            return installed
+              ? [
+                  {
+                    id: "enigmatica-installed",
+                    operationId: "00000000-0000-4000-8000-000000000301",
+                    operation: "install_pack",
+                    subjectId: "enigmatica-9-expert",
+                    kind: "completed",
+                    message: "Enigmatica 9 Expert installed successfully.",
+                    progressPercent: 100,
+                    occurredAtUnixSeconds: 1_710_000_000,
+                  },
+                ]
+              : [];
+          }
+          if (cmd === "list_managed_processes") return [];
+          if (cmd === "install_modpack_archive") {
+            archiveRequest = args?.request ?? null;
+            installed = true;
+            return {
+              action: "install_modpack_archive",
+              subjectId: "enigmatica-9-expert",
+              message: "Enigmatica 9 Expert installed successfully.",
+            };
+          }
+          if (cmd === "social_backend_status") {
+            return {
+              bindAddr: "127.0.0.1:4074",
+              healthUrl: "http://127.0.0.1:4074/health",
+              running: false,
+              managed: false,
+              message: "Offline",
+            };
+          }
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return undefined;
+          throw new Error(`Unexpected invoke: ${cmd}`);
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+      },
+      configurable: true,
+    });
+    Object.defineProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+      value: {
+        unregisterListener: () => undefined,
+      },
+      configurable: true,
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("navigation").getByRole("button", { name: "Discover" }).click();
+  await page.getByLabel("Pack name").fill("Enigmatica 9 Expert");
+  await page.getByLabel("Archive URL").fill("https://i.dylan.lol/dylan/Enigmatica9Expert-1.27.0.zip");
+  await page.locator(".discover-install-form").getByRole("button", { name: "Install", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "Library" })).toBeVisible();
+  const installedProfileRow = page.locator(".profile-row").filter({ hasText: "Enigmatica 9 Expert" });
+  await expect(installedProfileRow).toContainText("1.19.2");
+  await expect(installedProfileRow).toContainText("forge");
+  const request = await page.evaluate(
+    () => (window as typeof window & { __discoverArchiveInstallRequest: unknown }).__discoverArchiveInstallRequest,
+  );
+  expect(request).toEqual({
+    name: "Enigmatica 9 Expert",
+    url: "https://i.dylan.lol/dylan/Enigmatica9Expert-1.27.0.zip",
+  });
+});
+
 test("backend pack refresh preserves native installed pack state", async ({ page }) => {
   await page.route("**/packs", async (route) => {
     await route.fulfill({
