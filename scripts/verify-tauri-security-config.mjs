@@ -102,7 +102,8 @@ for (const fragment of [
   "fn hide_backend_console_window(command: &mut Command)",
   "std::os::windows::process::CommandExt",
   "const CREATE_NO_WINDOW: u32 = 0x08000000;",
-  "command.creation_flags(CREATE_NO_WINDOW);",
+  "const DETACHED_PROCESS: u32 = 0x00000008;",
+  "command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);",
 ]) {
   if (!tauriLib.includes(fragment)) {
     throw new Error(
