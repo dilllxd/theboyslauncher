@@ -81,6 +81,12 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 concurrency:
   group: v4-foundation-${{ github.ref }}
   cancel-in-progress: true
@@ -103,6 +109,9 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -182,6 +191,9 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -227,7 +239,7 @@ jobs:
           THEBOYS_RELEASE_TAG: ${{ inputs.release_tag }}
 
       - name: Smoke packaged executable
-        run: npm run smoke:packaged-exe
+        run: npm run smoke:packaged-exe -- --wait-ms 60000
 
       - name: Verify Windows bundles
         run: npm run verify:tauri-bundles

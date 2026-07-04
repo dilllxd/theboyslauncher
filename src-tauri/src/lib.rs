@@ -4690,7 +4690,6 @@ fn write_packaged_smoke_process_lifecycle_probe_inner(
             stopped_first.state
         ));
     }
-    std::thread::sleep(Duration::from_secs(4));
     let after_first_clear = registry.clear_exited().map_err(|error| error.to_string())?;
     if after_first_clear
         .iter()
@@ -4719,7 +4718,6 @@ fn write_packaged_smoke_process_lifecycle_probe_inner(
             stopped_second.state
         ));
     }
-    std::thread::sleep(Duration::from_secs(4));
     let remaining_processes = registry.clear_exited().map_err(|error| error.to_string())?;
     if remaining_processes
         .iter()
