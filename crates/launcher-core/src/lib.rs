@@ -17858,7 +17858,7 @@ mod tests {
             id: "winterpack".to_owned(),
             name: "WinterPack".to_owned(),
             tagline: "Curated pack".to_owned(),
-            version: "1.0.3".to_owned(),
+            version: "4.0.0".to_owned(),
             status: PackStatus::UpdateAvailable,
             accent: "#67e8b9".to_owned(),
             installed_players: 4,
