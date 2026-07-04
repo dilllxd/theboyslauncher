@@ -5840,7 +5840,7 @@ impl ProcessRegistry {
                 process.stop_requested = true;
                 process.sync_lifecycle_snapshot()?;
                 stop_requested = Some(process.summary(id, process.child.id()));
-                process.child.kill()?;
+                terminate_child_process(&mut process.child)?;
                 let status = process.child.wait()?;
                 process.exit_code = status.code();
                 process.state = ManagedProcessState::Exited;
@@ -5938,6 +5938,28 @@ impl Default for ProcessRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(windows)]
+fn terminate_child_process(child: &mut Child) -> Result<()> {
+    let pid = child.id().to_string();
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.as_ref().is_ok_and(|status| status.success()) {
+        return Ok(());
+    }
+    child.kill()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn terminate_child_process(child: &mut Child) -> Result<()> {
+    child.kill()?;
+    Ok(())
 }
 
 impl ManagedProcess {

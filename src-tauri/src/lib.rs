@@ -4800,13 +4800,13 @@ fn write_packaged_smoke_long_running_java(fake_java: &Path) -> Result<(), String
     if cfg!(target_os = "windows") {
         fs::write(
             fake_java,
-            b"@echo off\r\nif \"%~1\"==\"-version\" (\r\n  echo openjdk version \"21.0.2\" 2024-01-16 1>&2\r\n  exit /B 0\r\n)\r\necho packaged smoke process started\r\nping -n 2 127.0.0.1 >NUL\r\n",
+            b"@echo off\r\nif \"%~1\"==\"-version\" (\r\n  echo openjdk version \"21.0.2\" 2024-01-16 1>&2\r\n  exit /B 0\r\n)\r\necho packaged smoke process started\r\nping -n 5 127.0.0.1 >NUL\r\n",
         )
         .map_err(|error| error.to_string())?;
     } else {
         fs::write(
             fake_java,
-            b"#!/usr/bin/env sh\nif [ \"$1\" = \"-version\" ]; then\n  echo 'openjdk version \"21.0.2\" 2024-01-16' >&2\n  exit 0\nfi\necho packaged smoke process started\nsleep 1\n",
+            b"#!/usr/bin/env sh\nif [ \"$1\" = \"-version\" ]; then\n  echo 'openjdk version \"21.0.2\" 2024-01-16' >&2\n  exit 0\nfi\necho packaged smoke process started\nsleep 10\n",
         )
         .map_err(|error| error.to_string())?;
         #[cfg(unix)]
