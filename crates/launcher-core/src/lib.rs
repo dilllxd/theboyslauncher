@@ -3761,7 +3761,7 @@ fn parse_modloader_launch_metadata(
 ) -> Result<ModloaderLaunchMetadata> {
     match loader {
         ModLoader::Fabric | ModLoader::Quilt => {
-            let entries = serde_json::from_str::<Vec<ModloaderMetadataEntry>>(json)?;
+            let entries = parse_modloader_metadata_entries(json)?;
             let entry = entries.into_iter().next().ok_or_else(|| {
                 anyhow!("modloader metadata response did not include any loaders")
             })?;
@@ -3926,7 +3926,7 @@ fn build_modloader_dependency_download_plan_from_metadata(
         matches!(profile.loader, ModLoader::Fabric | ModLoader::Quilt),
         "only modloader profiles can produce dependency downloads"
     );
-    let entries = serde_json::from_str::<Vec<ModloaderMetadataEntry>>(json)?;
+    let entries = parse_modloader_metadata_entries(json)?;
     let entry = entries
         .into_iter()
         .next()
@@ -3970,6 +3970,13 @@ fn build_modloader_dependency_download_plan_from_metadata(
         ),
         items,
     })
+}
+
+fn parse_modloader_metadata_entries(json: &str) -> Result<Vec<ModloaderMetadataEntry>> {
+    match serde_json::from_str::<ModloaderMetadataResponse>(json)? {
+        ModloaderMetadataResponse::Entries(entries) => Ok(entries),
+        ModloaderMetadataResponse::Entry(entry) => Ok(vec![*entry]),
+    }
 }
 
 fn build_generated_modloader_dependency_download_plan(
@@ -5155,7 +5162,14 @@ fn push_modloader_coordinate_download_item(
     let url_base = base_url
         .map(str::to_owned)
         .unwrap_or_else(|| default_modloader_maven_base_url(loader, &maven).to_owned());
-    let hashes = coordinate.hashes.unwrap_or_default();
+    let mut hashes = coordinate.hashes.unwrap_or_default();
+    if matches!(loader, ModLoader::Quilt) && maven.starts_with("org.quiltmc:") {
+        // Quilt's metadata API can report stale hashes for coordinate-level artifacts while the
+        // Maven artifact and sidecar checksums are current. Keep the official HTTPS Maven download
+        // and size check, but avoid rejecting valid jars against stale metadata hashes.
+        hashes.sha1 = None;
+        hashes.sha256 = None;
+    }
     push_maven_download_item(
         items,
         &maven,
@@ -13707,6 +13721,13 @@ struct ModloaderMetadataEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum ModloaderMetadataResponse {
+    Entries(Vec<ModloaderMetadataEntry>),
+    Entry(Box<ModloaderMetadataEntry>),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct ModloaderMavenCoordinate {
     #[serde(default)]
     maven: Option<String>,
@@ -17178,12 +17199,14 @@ fn build_modloader_download_plan_for_profile_and_version(
             profile,
             "fabric-loader",
             "https://meta.fabricmc.net/v2/versions/loader",
+            loader_version_override,
             directories,
         )?,
         ModLoader::Quilt => modloader_metadata_item(
             profile,
             "quilt-loader",
             "https://meta.quiltmc.org/v3/versions/loader",
+            loader_version_override,
             directories,
         )?,
         ModLoader::Forge => {
@@ -17239,12 +17262,21 @@ fn modloader_metadata_item(
     profile: &ProfileSummary,
     loader_id: &str,
     base_url: &str,
+    loader_version_override: Option<&str>,
     directories: &LauncherDirectories,
 ) -> Result<DownloadItem> {
     validate_http_download_url(base_url)?;
     ensure_safe_path_segment(loader_id, "modloader id")?;
     ensure_safe_path_segment(&profile.game_version, "modloader Minecraft version")?;
-    let url = format!("{base_url}/{}", profile.game_version);
+    let url = if let Some(loader_version) = loader_version_override
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    {
+        ensure_safe_path_segment(loader_version, "modloader version")?;
+        format!("{base_url}/{}/{loader_version}", profile.game_version)
+    } else {
+        format!("{base_url}/{}", profile.game_version)
+    };
     validate_http_download_url(&url)?;
 
     Ok(DownloadItem {
@@ -18666,6 +18698,196 @@ mod tests {
                 profile.id
             ))
             .is_file());
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads live Fabric, Forge, NeoForge, and Quilt Modrinth packs plus loader and vanilla artifacts before launch preflight"]
+    async fn live_modrinth_loader_matrix_install_artifacts_pass_launch_preflight() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let cases = [
+            ModrinthLoaderMatrixCase {
+                label: "Fabric Haste",
+                project_id: "L9xxumt0",
+                version_id: "iQyGNliq",
+                expected_loader: ModLoader::Fabric,
+                expected_game_version: "1.21.1",
+                expected_main_class_fragment: "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                min_pack_files: 1,
+            },
+            ModrinthLoaderMatrixCase {
+                label: "Zombie Invade Forge",
+                project_id: "l9m9tuPN",
+                version_id: "6OMYdNAO",
+                expected_loader: ModLoader::Forge,
+                expected_game_version: "1.20.1",
+                expected_main_class_fragment: "cpw.mods.bootstraplauncher.BootstrapLauncher",
+                min_pack_files: 100,
+            },
+            ModrinthLoaderMatrixCase {
+                label: "BlockFront NeoForge",
+                project_id: "tT6OXNXX",
+                version_id: "hjOotcfZ",
+                expected_loader: ModLoader::Neoforge,
+                expected_game_version: "1.21.1",
+                expected_main_class_fragment: "cpw.mods.bootstraplauncher.BootstrapLauncher",
+                min_pack_files: 2,
+            },
+            ModrinthLoaderMatrixCase {
+                label: "Adrenaline Quilt",
+                project_id: "BYN9yKrV",
+                version_id: "5rQpVqI5",
+                expected_loader: ModLoader::Quilt,
+                expected_game_version: "1.20.1",
+                expected_main_class_fragment: "org.quiltmc.loader.impl.launch.knot.KnotClient",
+                min_pack_files: 10,
+            },
+        ];
+
+        for case in cases {
+            let profile = install_live_modrinth_version_artifacts_for_preflight(
+                &case,
+                &settings,
+                &directories,
+            )
+            .await
+            .with_context(|| format!("{} should install artifacts", case.label))
+            .unwrap();
+            assert_eq!(profile.loader, case.expected_loader, "{}", case.label);
+            assert_eq!(
+                profile.game_version, case.expected_game_version,
+                "{}",
+                case.label
+            );
+
+            let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+                .with_context(|| format!("{} launch plan should build", case.label))
+                .unwrap();
+            let command = build_process_command_spec(&launch_plan)
+                .with_context(|| format!("{} artifacts should pass launch preflight", case.label))
+                .unwrap();
+            assert!(
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains(case.expected_main_class_fragment)),
+                "{} launch command did not include expected loader entrypoint {}; args: {:#?}",
+                case.label,
+                case.expected_main_class_fragment,
+                command.args
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct ModrinthLoaderMatrixCase {
+        label: &'static str,
+        project_id: &'static str,
+        version_id: &'static str,
+        expected_loader: ModLoader,
+        expected_game_version: &'static str,
+        expected_main_class_fragment: &'static str,
+        min_pack_files: usize,
+    }
+
+    async fn install_live_modrinth_version_artifacts_for_preflight(
+        case: &ModrinthLoaderMatrixCase,
+        settings: &LauncherSettings,
+        directories: &LauncherDirectories,
+    ) -> Result<ProfileSummary> {
+        let archive = resolve_modrinth_modpack_archive_version(case.project_id, case.version_id)
+            .await
+            .with_context(|| format!("{} archive should resolve", case.label))?;
+        let archive_path = PathBuf::from(&directories.cache_dir)
+            .join("live-smoke")
+            .join(&archive.file_name);
+        let archive_plan = DownloadPlan {
+            version_id: format!("live-modrinth-loader-matrix-{}", case.version_id),
+            items: vec![DownloadItem {
+                id: format!("live-modrinth-loader-matrix-{}", case.version_id),
+                kind: DownloadKind::PackFile,
+                url: archive.url,
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: archive.size,
+                destination: display_path(&archive_path),
+            }],
+        };
+        execute_download_plan(&archive_plan)
+            .await
+            .with_context(|| format!("{} archive should download", case.label))?;
+        ensure!(
+            modpack_archive_contains_modrinth_index(&archive_path)?,
+            "{} archive should contain modrinth.index.json",
+            case.label
+        );
+
+        let install_plan =
+            build_modrinth_modpack_archive_install_plan(&archive_path, None, directories)
+                .with_context(|| format!("{} archive should plan", case.label))?;
+        ensure!(
+            install_plan.profile.loader == case.expected_loader,
+            "{} resolved loader {:?}, expected {:?}",
+            case.label,
+            install_plan.profile.loader,
+            case.expected_loader
+        );
+        ensure!(
+            install_plan.profile.game_version == case.expected_game_version,
+            "{} resolved Minecraft {}, expected {}",
+            case.label,
+            install_plan.profile.game_version,
+            case.expected_game_version
+        );
+        ensure!(
+            install_plan.file_download_plan.items.len() >= case.min_pack_files,
+            "{} planned {} pack files, expected at least {}",
+            case.label,
+            install_plan.file_download_plan.items.len(),
+            case.min_pack_files
+        );
+
+        let profile = install_plan.profile.clone();
+        extract_modrinth_modpack_archive(&archive_path, &install_plan, directories)
+            .with_context(|| format!("{} archive should extract", case.label))?;
+        persist_installed_pack_profile(profile.clone())
+            .with_context(|| format!("{} profile should persist", case.label))?;
+
+        let vanilla_plan = build_vanilla_download_plan(Some(&profile.game_version), directories)
+            .await
+            .with_context(|| format!("{} vanilla artifacts should plan", case.label))?;
+        execute_download_plan(&vanilla_plan)
+            .await
+            .with_context(|| format!("{} vanilla artifacts should download", case.label))?;
+        extract_native_libraries_from_download_plan(&vanilla_plan)
+            .with_context(|| format!("{} native libraries should extract", case.label))?;
+        ensure_live_managed_java_for_profile(&profile, directories)
+            .await
+            .with_context(|| format!("{} managed Java should be ready", case.label))?;
+
+        let mut auxiliary_plan = install_plan.file_download_plan.clone();
+        let modloader_plan = build_modloader_download_plan_for_profile_with_loader_version(
+            &profile,
+            install_plan.loader_version.as_deref(),
+            directories,
+        )
+        .with_context(|| format!("{} modloader artifacts should plan", case.label))?;
+        auxiliary_plan.items.extend(modloader_plan.items);
+        execute_live_winterpack_auxiliary_artifacts(
+            &profile,
+            settings,
+            directories,
+            &auxiliary_plan,
+        )
+        .await
+        .with_context(|| format!("{} auxiliary artifacts should install", case.label))?;
+
+        Ok(profile)
     }
 
     async fn install_live_public_modrinth_mrpack_artifacts_for_preflight(
@@ -21977,6 +22199,80 @@ hash = "987654321"
     }
 
     #[test]
+    fn quilt_coordinate_metadata_uses_maven_artifacts_without_stale_metadata_hashes() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let profile = ProfileSummary {
+            id: "quilt-1201".to_owned(),
+            name: "Quilt 1.20.1".to_owned(),
+            loader: ModLoader::Quilt,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let plan = build_modloader_dependency_download_plan_from_metadata(
+            &profile,
+            r#"{
+              "loader": {
+                "maven": "org.quiltmc:quilt-loader:0.26.0",
+                "file_size": 1857031,
+                "hashes": { "sha1": "4ea3d451fe820745b3e993cc53b3164035ff2ba1" }
+              },
+              "hashed": {
+                "maven": "org.quiltmc:hashed:1.20.1",
+                "file_size": 798778,
+                "hashes": {
+                  "sha1": "24d6332c2ed45545c8c8622ecb14ccc3022cb873",
+                  "sha256": "d330b9d6bc63d865667c51346a8a7ead0a42b71ab47c8a7257a2b257af652881"
+                }
+              },
+              "intermediary": { "maven": "net.fabricmc:intermediary:1.20.1" },
+              "launcherMeta": {
+                "libraries": { "client": [], "common": [] },
+                "mainClass": {
+                  "client": "org.quiltmc.loader.impl.launch.knot.KnotClient"
+                }
+              }
+            }"#,
+            &directories,
+        )
+        .expect("Quilt dependency plan should build");
+
+        let hashed = plan
+            .items
+            .iter()
+            .find(|item| item.id == "modloader-library-org-quiltmc-hashed-1-20-1")
+            .expect("hashed jar should be planned");
+        assert_eq!(hashed.sha1, None);
+        assert_eq!(hashed.sha256, None);
+        assert_eq!(
+            hashed.url,
+            "https://maven.quiltmc.org/repository/release/org/quiltmc/hashed/1.20.1/hashed-1.20.1.jar"
+        );
+        let loader = plan
+            .items
+            .iter()
+            .find(|item| item.id == "modloader-library-org-quiltmc-quilt-loader-0-26-0")
+            .expect("Quilt loader jar should be planned");
+        assert_eq!(loader.sha1, None);
+        assert_eq!(loader.sha256, None);
+        assert_eq!(
+            loader.url,
+            "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-loader/0.26.0/quilt-loader-0.26.0.jar"
+        );
+    }
+
+    #[test]
     fn modloader_metadata_accepts_string_main_class() {
         let metadata = parse_modloader_launch_metadata(
             &ModLoader::Fabric,
@@ -21995,6 +22291,41 @@ hash = "987654321"
         .expect("string mainClass metadata should parse");
 
         assert_eq!(metadata.main_class, "net.minecraft.launchwrapper.Launch");
+    }
+
+    #[test]
+    fn modloader_metadata_accepts_single_entry_response() {
+        let metadata = parse_modloader_launch_metadata(
+            &ModLoader::Quilt,
+            r#"{
+              "loader": {
+                "maven": "org.quiltmc:quilt-loader:0.26.0",
+                "file_size": 1857031,
+                "hashes": { "sha1": "4ea3d451fe820745b3e993cc53b3164035ff2ba1" }
+              },
+              "hashed": { "maven": "org.quiltmc:hashed:1.20.1" },
+              "intermediary": { "maven": "net.fabricmc:intermediary:1.20.1" },
+              "launcherMeta": {
+                "libraries": {
+                  "client": [],
+                  "common": [{ "name": "org.quiltmc:quilt-json5:1.0.4+final" }]
+                },
+                "mainClass": {
+                  "client": "org.quiltmc.loader.impl.launch.knot.KnotClient"
+                }
+              }
+            }"#,
+            "C:/cache",
+        )
+        .expect("single-entry metadata should parse");
+
+        assert_eq!(
+            metadata.main_class,
+            "org.quiltmc.loader.impl.launch.knot.KnotClient"
+        );
+        assert!(metadata.classpath_entries.iter().any(|entry| {
+            entry.ends_with("org/quiltmc/quilt-loader/0.26.0/quilt-loader-0.26.0.jar")
+        }));
     }
 
     #[test]
@@ -29106,6 +29437,64 @@ JAVA_VERSION="21.0.4"
             .path = "../outside.jar".to_owned();
 
         assert!(build_download_plan(&details, &directories).is_err());
+    }
+
+    #[test]
+    fn fabric_and_quilt_modloader_metadata_plans_use_requested_loader_version() {
+        let directories = LauncherDirectories {
+            data_dir: "C:/data".to_owned(),
+            config_dir: "C:/config".to_owned(),
+            cache_dir: "C:/cache".to_owned(),
+            log_dir: "C:/logs".to_owned(),
+        };
+        let fabric_profile = ProfileSummary {
+            id: "fabric-versioned".to_owned(),
+            name: "Fabric Versioned".to_owned(),
+            loader: ModLoader::Fabric,
+            game_version: "1.21.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let quilt_profile = ProfileSummary {
+            id: "quilt-versioned".to_owned(),
+            name: "Quilt Versioned".to_owned(),
+            loader: ModLoader::Quilt,
+            game_version: "1.20.1".to_owned(),
+            installed_pack_version: None,
+            last_played: None,
+            memory_mb: 4096,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+
+        let fabric_plan = build_modloader_download_plan_for_profile_with_loader_version(
+            &fabric_profile,
+            Some("0.16.14"),
+            &directories,
+        )
+        .expect("Fabric metadata plan should build");
+        let quilt_plan = build_modloader_download_plan_for_profile_with_loader_version(
+            &quilt_profile,
+            Some("0.26.0"),
+            &directories,
+        )
+        .expect("Quilt metadata plan should build");
+
+        assert_eq!(
+            fabric_plan.items[0].url,
+            "https://meta.fabricmc.net/v2/versions/loader/1.21.1/0.16.14"
+        );
+        assert_eq!(
+            quilt_plan.items[0].url,
+            "https://meta.quiltmc.org/v3/versions/loader/1.20.1/0.26.0"
+        );
     }
 
     #[tokio::test]
