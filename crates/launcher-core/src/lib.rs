@@ -3835,8 +3835,20 @@ fn parse_generated_modloader_launch_metadata(
     );
     let processor_coordinates = modloader_processor_coordinates(&version.installer_processors)?;
     let mut classpath_entries = Vec::new();
+    let mut uses_neoforge_universal = false;
+    let mut neoforge_universal_filename = None;
     for library in &version.libraries {
         if processor_coordinates.contains(library.name.trim()) {
+            continue;
+        }
+        if is_neoforge_universal_coordinate(library.name.trim()) {
+            uses_neoforge_universal = true;
+            if let Some(artifact) = library.downloads.artifact.as_ref() {
+                neoforge_universal_filename = Path::new(&artifact.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned);
+            }
             continue;
         }
         if !library_allowed_on_current_os(library) {
@@ -3851,13 +3863,55 @@ fn parse_generated_modloader_launch_metadata(
         !classpath_entries.is_empty(),
         "generated modloader version did not include libraries"
     );
-    let arguments = version.arguments.unwrap_or_default();
+    let mut arguments = version.arguments.unwrap_or_default();
+    if uses_neoforge_universal {
+        strip_neoforge_universal_from_minecraft_arguments(&mut arguments.jvm);
+        if let Some(filename) = neoforge_universal_filename {
+            arguments.jvm.push(MinecraftArgument::String(format!(
+                "-DignoreList={filename}"
+            )));
+        }
+    }
     Ok(ModloaderLaunchMetadata {
         main_class,
         classpath_entries,
         jvm_arguments: arguments.jvm,
         game_arguments: arguments.game,
     })
+}
+
+fn is_neoforge_universal_coordinate(coordinate: &str) -> bool {
+    coordinate.starts_with("net.neoforged:neoforge:") && coordinate.ends_with(":universal")
+}
+
+fn strip_neoforge_universal_from_minecraft_arguments(arguments: &mut Vec<MinecraftArgument>) {
+    for argument in arguments {
+        match argument {
+            MinecraftArgument::String(value) => {
+                *value = strip_neoforge_universal_from_argument_value(value);
+            }
+            MinecraftArgument::Object(object) => match &mut object.value {
+                MinecraftArgumentValue::String(value) => {
+                    *value = strip_neoforge_universal_from_argument_value(value);
+                }
+                MinecraftArgumentValue::List(values) => {
+                    for value in values {
+                        *value = strip_neoforge_universal_from_argument_value(value);
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn strip_neoforge_universal_from_argument_value(value: &str) -> String {
+    value
+        .split("${classpath_separator}")
+        .filter(|entry| {
+            !entry.contains("/net/neoforged/neoforge/") || !entry.contains("-universal.jar")
+        })
+        .collect::<Vec<_>>()
+        .join("${classpath_separator}")
 }
 
 fn build_modloader_dependency_download_plan_from_metadata(
@@ -19061,8 +19115,8 @@ mod tests {
         let classpath = launch_plan_argument_value(&launch_plan.arguments, "-cp")
             .expect("NeoForge launch plan should include a classpath");
         assert!(
-            classpath.contains("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar"),
-            "NeoForge launch plan should reference the NeoForge universal jar"
+            !classpath.contains("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar"),
+            "NeoForge universal jar must stay off the classpath so the NeoForge PathBasedLocator can load it as the neoforge mod"
         );
         let module_path = launch_plan_argument_value(&launch_plan.arguments, "-p")
             .expect("NeoForge launch plan should include a module path");
@@ -21340,6 +21394,43 @@ hash = "987654321"
             .libraries
             .iter()
             .any(|library| library.name == "net.neoforged:neoforge:21.1.1:universal"));
+        let launch_metadata = load_cached_modloader_launch_metadata(&profile, &directories)
+            .expect("cached NeoForge launch metadata should read")
+            .expect("NeoForge launch metadata should exist");
+        assert_eq!(
+            launch_metadata.main_class,
+            "cpw.mods.bootstraplauncher.BootstrapLauncher"
+        );
+        assert!(
+            !launch_metadata.classpath_entries.iter().any(|entry| {
+                entry.ends_with("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar")
+            }),
+            "NeoForge universal jar must be downloaded but excluded from the runtime classpath"
+        );
+        assert!(!launch_metadata
+            .jvm_arguments
+            .iter()
+            .any(|argument| match argument {
+                MinecraftArgument::String(value) => {
+                    value.contains("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar")
+                }
+                MinecraftArgument::Object(object) => match &object.value {
+                    MinecraftArgumentValue::String(value) => value
+                        .contains("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar"),
+                    MinecraftArgumentValue::List(values) => values.iter().any(|value| {
+                        value
+                            .contains("net/neoforged/neoforge/21.1.1/neoforge-21.1.1-universal.jar")
+                    }),
+                },
+            }));
+        assert!(launch_metadata
+            .jvm_arguments
+            .iter()
+            .any(|argument| matches!(
+                argument,
+                MinecraftArgument::String(value)
+                    if value == "-DignoreList=neoforge-21.1.1-universal.jar"
+            )));
 
         let dependency_plan =
             build_modloader_dependency_download_plan_for_profile(&profile, &directories)
