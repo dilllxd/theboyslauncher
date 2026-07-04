@@ -10235,10 +10235,6 @@ fn curseforge_file_is_modpack_archive(file: &CurseForgeFileResponse) -> bool {
         .as_deref()
         .map(|name| name.to_ascii_lowercase().ends_with(".zip"))
         .unwrap_or(false)
-        && file
-            .download_url
-            .as_deref()
-            .is_some_and(|url| !url.trim().is_empty())
 }
 
 fn curseforge_file_game_versions(file: &CurseForgeFileResponse) -> Vec<String> {
@@ -21910,6 +21906,38 @@ hash = "1234"
         assert_eq!(results[0].latest_version_id.as_deref(), Some("5650506"));
         assert_eq!(results[0].game_versions, vec!["1.19.2"]);
         assert_eq!(results[0].loaders, vec!["forge"]);
+        assert!(results[0].install_available);
+    }
+
+    #[test]
+    fn curseforge_search_results_keep_pack_files_without_direct_download_url() {
+        let results = curseforge_search_results_from_json(
+            r#"{
+              "data": [
+                {
+                  "id": 890405,
+                  "name": "Enigmatica 9 Expert",
+                  "slug": "enigmatica9expert",
+                  "summary": "An expert pack.",
+                  "downloadCount": 2400000,
+                  "authors": [{ "name": "EnigmaticaModpacks" }],
+                  "latestFiles": [
+                    {
+                      "id": 5650506,
+                      "displayName": "1.27.0",
+                      "fileName": "Enigmatica9Expert-1.27.0.zip",
+                      "gameVersions": ["1.19.2", "Forge"],
+                      "hashes": [{ "value": "0123456789abcdef0123456789abcdef01234567", "algo": 1 }]
+                    }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("CurseForge search response should parse");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].latest_version_id.as_deref(), Some("5650506"));
         assert!(results[0].install_available);
     }
 

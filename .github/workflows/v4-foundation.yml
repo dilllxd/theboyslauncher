@@ -140,6 +140,14 @@ jobs:
           npm run stage:social-backend:debug
           npm run verify:package-resources:debug
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\ms-playwright
+          key: playwright-windows-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            playwright-windows-
+
       - name: Install Playwright Chromium
         run: npx playwright install chromium
 

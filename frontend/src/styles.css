@@ -8206,4 +8206,168 @@ body,
   }
 }
 
+/* Focused repair pass: notifications, account heads, Discover, Friends, Settings. */
+.notify-button {
+  cursor: pointer;
+}
+
+.notify-button:hover,
+.notify-button:focus-visible {
+  border-color: rgba(37, 211, 216, 0.45);
+  background: #18232c;
+  color: var(--accent-2);
+}
+
+.minecraft-head-avatar {
+  overflow: hidden;
+  background: #11171e;
+}
+
+.minecraft-head-avatar img,
+.player-avatar img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  object-fit: cover;
+}
+
+.discover-panel {
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.discover-layout {
+  grid-template-columns: minmax(0, 1fr) 260px;
+  min-height: 0;
+}
+
+.discover-main,
+.discover-workbench,
+.discover-search-panel {
+  min-height: 0;
+}
+
+.discover-workbench {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.discover-search-panel {
+  grid-template-columns: minmax(220px, 0.3fr) minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100%;
+}
+
+.discover-result-list {
+  max-height: none;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.discover-result-row {
+  grid-template-columns: 48px minmax(0, 1fr) minmax(104px, auto);
+  align-items: center;
+}
+
+.discover-result-icon {
+  width: 48px;
+  height: 48px;
+  background: #101821;
+}
+
+.discover-provider-card .status-pill.compatible,
+.discover-search-heading .status-pill.compatible {
+  color: #8bd4ff;
+  border-color: rgba(139, 212, 255, 0.35);
+  background: rgba(139, 212, 255, 0.1);
+}
+
+.friends-screen {
+  overflow: hidden;
+}
+
+.friends-reference-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 300px);
+  overflow: hidden;
+}
+
+.friends-main-column,
+.reference-detail-card {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.reference-friend-row {
+  grid-template-columns: 44px minmax(130px, 1fr) minmax(116px, 0.56fr) minmax(148px, auto);
+  gap: 8px;
+}
+
+.friends-screen .reference-row-actions {
+  gap: 6px;
+}
+
+.friends-screen .reference-message-button {
+  width: 40px;
+  min-width: 40px;
+  padding: 0;
+  font-size: 0;
+}
+
+.friends-screen .reference-message-button svg {
+  width: 17px;
+  height: 17px;
+}
+
+.settings-screen {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.settings-reference-grid {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.settings-save-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.settings-main-column,
+.settings-side-column {
+  align-content: start;
+}
+
+.advanced-settings {
+  margin-top: 4px;
+}
+
+@media (max-width: 1380px) {
+  .discover-layout,
+  .friends-reference-grid,
+  .settings-reference-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .discover-side,
+  .reference-detail-card,
+  .settings-side-column {
+    display: none;
+  }
+
+  .discover-search-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .discover-search-form {
+    grid-column: 1;
+    grid-row: auto;
+  }
+}
+
 

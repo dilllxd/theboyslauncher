@@ -24,7 +24,6 @@ on:
       - "frontend/**"
       - "package.json"
       - "package-lock.json"
-      - "playwright.config.ts"
       - "scripts/clean-tauri-updater-artifacts.mjs"
       - "scripts/configure-tauri-release-channel.mjs"
       - "scripts/generate-tauri-updater-manifest.mjs"
@@ -36,7 +35,6 @@ on:
       - "scripts/verify-package-resources.mjs"
       - "scripts/verify-tauri-bundles.mjs"
       - "scripts/verify-tauri-security-config.mjs"
-      - "tests/e2e/**"
 
 permissions:
   contents: write
@@ -46,11 +44,16 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' && github.ref_name == 'dev' }}
 
 jobs:
-  release:
-    name: Build and publish ${{ github.event_name == 'workflow_dispatch' && inputs.channel || github.ref_name }} channel
+  resolve:
+    name: Resolve release version
     runs-on: windows-latest
-    timeout-minutes: 75
+    timeout-minutes: 10
     if: github.event_name == 'workflow_dispatch' || github.ref_name == 'main' || github.ref_name == 'dev'
+    outputs:
+      channel: ${{ steps.version.outputs.channel }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      manifest_name: ${{ steps.version.outputs.manifest_name }}
 
     steps:
       - name: Checkout
@@ -89,6 +92,29 @@ jobs:
           node-version: "22"
           cache: npm
 
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Resolve next version
+        id: version
+        run: npm run resolve:v4-release-version -- ${{ steps.channel.outputs.channel }}
+
+  verify:
+    name: Verify release inputs
+    runs-on: windows-latest
+    timeout-minutes: 35
+    needs: resolve
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -101,15 +127,8 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Resolve next version
-        id: version
-        run: npm run resolve:v4-release-version -- ${{ steps.channel.outputs.channel }}
-
       - name: Verify release channel scripts
         run: npm run test:release-channels
-
-      - name: Configure Tauri release channel
-        run: npm run configure:tauri-release-channel -- ${{ steps.version.outputs.channel }} ${{ steps.version.outputs.version }}
 
       - name: Check Rust formatting
         run: cargo fmt --all --check
@@ -126,14 +145,48 @@ jobs:
       - name: Verify Tauri security config
         run: npm run verify:tauri-security
 
+  package:
+    name: Build signed ${{ needs.resolve.outputs.channel }} bundle
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: resolve
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Configure Tauri release channel
+        run: npm run configure:tauri-release-channel -- ${{ needs.resolve.outputs.channel }} ${{ needs.resolve.outputs.version }}
+
       - name: Build signed Tauri bundles
         run: npm run tauri:build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          THEBOYS_RELEASE_TAG: ${{ steps.version.outputs.channel == 'dev' && 'dev-latest' || steps.version.outputs.tag }}
-          THEBOYS_UPDATER_MANIFEST_NAME: ${{ steps.version.outputs.manifest_name }}
-          VITE_THEBOYS_RELEASE_CHANNEL: ${{ steps.version.outputs.channel }}
+          THEBOYS_RELEASE_TAG: ${{ needs.resolve.outputs.channel == 'dev' && 'dev-latest' || needs.resolve.outputs.tag }}
+          THEBOYS_UPDATER_MANIFEST_NAME: ${{ needs.resolve.outputs.manifest_name }}
+          VITE_THEBOYS_RELEASE_CHANNEL: ${{ needs.resolve.outputs.channel }}
 
       - name: Smoke packaged executable
         run: npm run smoke:packaged-exe
@@ -141,42 +194,76 @@ jobs:
       - name: Verify Windows bundles
         run: npm run verify:tauri-bundles
         env:
-          THEBOYS_UPDATER_MANIFEST_NAME: ${{ steps.version.outputs.manifest_name }}
+          THEBOYS_UPDATER_MANIFEST_NAME: ${{ needs.resolve.outputs.manifest_name }}
+
+      - name: Upload Windows installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TheBoysLauncher-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*setup.exe
+            target/release/bundle/**/*.sig
+            target/release/bundle/latest*.json
+
+  publish:
+    name: Publish ${{ needs.resolve.outputs.channel }} release
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs:
+      - resolve
+      - verify
+      - package
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download Windows installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: TheBoysLauncher-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version }}-${{ github.sha }}
+          path: target/release/bundle
 
       - name: Create immutable version tag
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            existing_sha="$(git rev-list -n 1 "${{ steps.version.outputs.tag }}")"
+          if git rev-parse "${{ needs.resolve.outputs.tag }}" >/dev/null 2>&1; then
+            existing_sha="$(git rev-list -n 1 "${{ needs.resolve.outputs.tag }}")"
             if [[ "${existing_sha}" != "${GITHUB_SHA}" ]]; then
-              echo "::error::Tag ${{ steps.version.outputs.tag }} already exists at ${existing_sha}, not ${GITHUB_SHA}."
+              echo "::error::Tag ${{ needs.resolve.outputs.tag }} already exists at ${existing_sha}, not ${GITHUB_SHA}."
               exit 1
             fi
-            echo "Tag ${{ steps.version.outputs.tag }} already points at ${GITHUB_SHA}; continuing publish retry."
+            echo "Tag ${{ needs.resolve.outputs.tag }} already points at ${GITHUB_SHA}; continuing publish retry."
             exit 0
           fi
-          git tag "${{ steps.version.outputs.tag }}" "${GITHUB_SHA}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          git tag "${{ needs.resolve.outputs.tag }}" "${GITHUB_SHA}"
+          git push origin "${{ needs.resolve.outputs.tag }}"
 
       - name: Publish stable release
-        if: steps.version.outputs.channel == 'stable'
+        if: needs.resolve.outputs.channel == 'stable'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: TheBoysLauncher ${{ steps.version.outputs.tag }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: TheBoysLauncher ${{ needs.resolve.outputs.tag }}
           prerelease: false
           draft: false
           generate_release_notes: true
           files: |
-            target/release/bundle/msi/*.msi
-            target/release/bundle/nsis/*setup.exe
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*setup.exe
             target/release/bundle/**/*.sig
-            target/release/bundle/latest.json
+            target/release/bundle/**/latest.json
 
       - name: Refresh dev release
-        if: steps.version.outputs.channel == 'dev'
+        if: needs.resolve.outputs.channel == 'dev'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -190,10 +277,10 @@ jobs:
           }
 
           $assetPatterns = @(
-            "target/release/bundle/msi/*.msi",
-            "target/release/bundle/nsis/*setup.exe",
+            "target/release/bundle/**/*.msi",
+            "target/release/bundle/**/*setup.exe",
             "target/release/bundle/**/*.sig",
-            "target/release/bundle/latest-dev.json"
+            "target/release/bundle/**/latest-dev.json"
           )
           $assets = @()
           foreach ($pattern in $assetPatterns) {
@@ -204,15 +291,3 @@ jobs:
             exit 1
           }
           gh release upload $releaseTag @($assets.FullName) --clobber
-
-      - name: Upload Windows installer artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: TheBoysLauncher-${{ steps.version.outputs.channel }}-${{ steps.version.outputs.version }}-${{ github.sha }}
-          if-no-files-found: error
-          retention-days: 14
-          path: |
-            target/release/bundle/msi/*.msi
-            target/release/bundle/nsis/*setup.exe
-            target/release/bundle/**/*.sig
-            target/release/bundle/latest*.json

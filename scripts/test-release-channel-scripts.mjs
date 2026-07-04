@@ -965,7 +965,7 @@ function testReleaseWorkflowKeepsEfficientRetryBehavior() {
   for (const token of [
     "group: v4-release-${{ github.event_name == 'workflow_dispatch' && inputs.channel || github.ref_name }}",
     "cancel-in-progress: ${{ github.event_name == 'push' && github.ref_name == 'dev' }}",
-    "existing_sha=\"$(git rev-list -n 1 \"${{ steps.version.outputs.tag }}\")\"",
+    "existing_sha=\"$(git rev-list -n 1 \"${{ needs.resolve.outputs.tag }}\")\"",
     "not ${GITHUB_SHA}",
     "continuing publish retry",
   ]) {
@@ -987,7 +987,7 @@ function testReleaseWorkflowAvoidsDuplicateFrontendBuild() {
   if (!workflow.includes("run: npm run tauri:build")) {
     throw new Error("v4 release-channel workflow must still build signed Tauri bundles through npm run tauri:build");
   }
-  if (!workflow.includes("VITE_THEBOYS_RELEASE_CHANNEL: ${{ steps.version.outputs.channel }}")) {
+  if (!workflow.includes("VITE_THEBOYS_RELEASE_CHANNEL: ${{ needs.resolve.outputs.channel }}")) {
     throw new Error("signed Tauri build must receive the configured release channel env for its beforeBuildCommand");
   }
 }
