@@ -6,7 +6,8 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = new Set(process.argv.slice(2));
 const profile = args.has("--profile=debug") || args.has("--debug") ? "debug" : "release";
 const executableName = process.platform === "win32" ? "social-backend.exe" : "social-backend";
-const source = join(repoRoot, "target", profile, executableName);
+const cargoTargetDir = resolve(process.env.CARGO_TARGET_DIR ?? join(repoRoot, "target"));
+const source = join(cargoTargetDir, profile, executableName);
 const destinationDir = join(repoRoot, "src-tauri", "resources");
 const destination = join(destinationDir, executableName);
 const alternateDestination = join(
@@ -24,4 +25,4 @@ if (!existsSync(source) || !statSync(source).isFile()) {
 mkdirSync(destinationDir, { recursive: true });
 copyFileSync(source, destination);
 copyFileSync(source, alternateDestination);
-console.log(`Staged ${executableName} from target/${profile} into src-tauri/resources.`);
+console.log(`Staged ${executableName} from ${source} into src-tauri/resources.`);

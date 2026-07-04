@@ -7,7 +7,8 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = new Set(process.argv.slice(2));
 const profile = args.has("--profile=debug") || args.has("--debug") ? "debug" : "release";
 const executableName = process.platform === "win32" ? "social-backend.exe" : "social-backend";
-const source = join(repoRoot, "target", profile, executableName);
+const cargoTargetDir = resolve(process.env.CARGO_TARGET_DIR ?? join(repoRoot, "target"));
+const source = join(cargoTargetDir, profile, executableName);
 const resourcesDir = join(repoRoot, "src-tauri", "resources");
 const stagedPrimary = join(resourcesDir, executableName);
 const stagedPortable = join(

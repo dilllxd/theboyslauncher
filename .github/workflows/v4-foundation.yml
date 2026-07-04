@@ -38,8 +38,14 @@ on:
       - "package.json"
       - "package-lock.json"
       - "playwright.config.ts"
+      - "scripts/clean-tauri-updater-artifacts.mjs"
+      - "scripts/configure-tauri-release-channel.mjs"
       - "scripts/generate-tauri-updater-manifest.mjs"
+      - "scripts/preflight-v4-release.mjs"
+      - "scripts/resolve-v4-release-version.mjs"
+      - "scripts/smoke-packaged-exe.mjs"
       - "scripts/stage-social-backend.mjs"
+      - "scripts/test-release-channel-scripts.mjs"
       - "scripts/verify-package-resources.mjs"
       - "scripts/verify-tauri-bundles.mjs"
       - "scripts/verify-tauri-security-config.mjs"
@@ -58,8 +64,14 @@ on:
       - "package.json"
       - "package-lock.json"
       - "playwright.config.ts"
+      - "scripts/clean-tauri-updater-artifacts.mjs"
+      - "scripts/configure-tauri-release-channel.mjs"
       - "scripts/generate-tauri-updater-manifest.mjs"
+      - "scripts/preflight-v4-release.mjs"
+      - "scripts/resolve-v4-release-version.mjs"
+      - "scripts/smoke-packaged-exe.mjs"
       - "scripts/stage-social-backend.mjs"
+      - "scripts/test-release-channel-scripts.mjs"
       - "scripts/verify-package-resources.mjs"
       - "scripts/verify-tauri-bundles.mjs"
       - "scripts/verify-tauri-security-config.mjs"
@@ -116,6 +128,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Verify release channel scripts
+        run: npm run test:release-channels
+
       - name: Verify Tauri security config
         run: npm run verify:tauri-security
 
@@ -142,6 +157,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify official release repository
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne "dilllxd/theboyslauncher") {
+            Write-Error "Release packaging is only allowed from dilllxd/theboyslauncher; current repository is $env:GITHUB_REPOSITORY."
+            exit 1
+          }
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -160,12 +183,43 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Verify manual release tag matches Tauri version
+        shell: pwsh
+        run: |
+          $releaseTag = "${{ inputs.release_tag }}"
+          $ref = "${{ github.ref }}"
+          $refName = "${{ github.ref_name }}"
+          $publishRelease = "${{ inputs.publish_release }}"
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $expectedTag = "v$($config.version)"
+          $selectedTag = $null
+          if ($releaseTag) {
+            $selectedTag = $releaseTag
+          } elseif ($ref -like "refs/tags/v*") {
+            $selectedTag = $refName
+          } elseif ($publishRelease -eq "true") {
+            Write-Error "Manual publish requires release_tag or a v* tag ref. Prefer v4-release-channels.yml for normal stable/dev publishing."
+            exit 1
+          }
+          if ($selectedTag -and $selectedTag -ne $expectedTag) {
+            Write-Error "Manual foundation package tag $selectedTag does not match Tauri config version $($config.version). Run v4-release-channels.yml or configure the channel/version before packaging."
+            exit 1
+          }
+          if ($selectedTag) {
+            "Manual package tag verified: $selectedTag"
+          } else {
+            "No manual release tag selected; package-only build will use Tauri config version $($config.version)."
+          }
+
       - name: Build signed Tauri bundles
         run: npm run tauri:build
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           THEBOYS_RELEASE_TAG: ${{ inputs.release_tag }}
+
+      - name: Smoke packaged executable
+        run: npm run smoke:packaged-exe
 
       - name: Verify Windows bundles
         run: npm run verify:tauri-bundles

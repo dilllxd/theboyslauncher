@@ -1,7 +1,19 @@
+const defaultLocalHealthEndpoint = "http://127.0.0.1:4074/health";
+const defaultPublicHealthEndpoint = "https://launcher.dylan.lol/health";
+
+function envFlagEnabled(value) {
+  return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
+}
+
 const healthEndpoints = [
-  process.env.THEBOYS_LOCAL_BACKEND_HEALTH ?? "http://127.0.0.1:4074/health",
-  process.env.THEBOYS_PUBLIC_BACKEND_HEALTH ?? "https://launcher.dylan.lol/health",
+  process.env.THEBOYS_PUBLIC_BACKEND_HEALTH ?? defaultPublicHealthEndpoint,
 ];
+const localHealthEndpoint = process.env.THEBOYS_LOCAL_BACKEND_HEALTH?.trim();
+if (localHealthEndpoint) {
+  healthEndpoints.push(localHealthEndpoint);
+} else if (envFlagEnabled(process.env.THEBOYS_CHECK_LOCAL_BACKEND)) {
+  healthEndpoints.push(defaultLocalHealthEndpoint);
+}
 
 const expectedCorsOrigins = (
   process.env.THEBOYS_BACKEND_EXPECTED_CORS_ORIGINS ??

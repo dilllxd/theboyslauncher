@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..");
-const configPath = join(repoRoot, "src-tauri", "tauri.conf.json");
+const configPath = process.env.THEBOYS_TAURI_CONFIG_PATH || join(repoRoot, "src-tauri", "tauri.conf.json");
 const channel = process.argv[2] ?? process.env.THEBOYS_RELEASE_CHANNEL ?? "stable";
 const version = process.argv[3] ?? process.env.THEBOYS_RELEASE_VERSION;
 
@@ -18,6 +18,13 @@ const config = JSON.parse(readFileSync(configPath, "utf8"));
 config.version = version;
 config.productName = channel === "dev" ? "TheBoysLauncher Dev" : "TheBoysLauncher";
 config.identifier = channel === "dev" ? "com.theboys.launcher.dev" : "com.theboys.launcher";
+if (Array.isArray(config.app?.windows)) {
+  for (const windowConfig of config.app.windows) {
+    if (windowConfig && typeof windowConfig === "object") {
+      windowConfig.title = config.productName;
+    }
+  }
+}
 config.plugins ??= {};
 config.plugins.updater ??= {};
 config.plugins.updater.endpoints = [

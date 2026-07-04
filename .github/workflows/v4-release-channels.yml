@@ -25,10 +25,14 @@ on:
       - "package.json"
       - "package-lock.json"
       - "playwright.config.ts"
+      - "scripts/clean-tauri-updater-artifacts.mjs"
       - "scripts/configure-tauri-release-channel.mjs"
       - "scripts/generate-tauri-updater-manifest.mjs"
+      - "scripts/preflight-v4-release.mjs"
       - "scripts/resolve-v4-release-version.mjs"
+      - "scripts/smoke-packaged-exe.mjs"
       - "scripts/stage-social-backend.mjs"
+      - "scripts/test-release-channel-scripts.mjs"
       - "scripts/verify-package-resources.mjs"
       - "scripts/verify-tauri-bundles.mjs"
       - "scripts/verify-tauri-security-config.mjs"
@@ -39,7 +43,7 @@ permissions:
 
 concurrency:
   group: v4-release-${{ github.event_name == 'workflow_dispatch' && inputs.channel || github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref_name == 'dev' }}
 
 jobs:
   release:
@@ -71,6 +75,14 @@ jobs:
           fi
           echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
 
+      - name: Verify official release repository
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne "dilllxd/theboyslauncher") {
+            Write-Error "Release packaging is only allowed from dilllxd/theboyslauncher; current repository is $env:GITHUB_REPOSITORY."
+            exit 1
+          }
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -93,6 +105,9 @@ jobs:
         id: version
         run: npm run resolve:v4-release-version -- ${{ steps.channel.outputs.channel }}
 
+      - name: Verify release channel scripts
+        run: npm run test:release-channels
+
       - name: Configure Tauri release channel
         run: npm run configure:tauri-release-channel -- ${{ steps.version.outputs.channel }} ${{ steps.version.outputs.version }}
 
@@ -108,11 +123,6 @@ jobs:
       - name: Run social-backend tests
         run: cargo test -p social-backend --lib -- --test-threads=1
 
-      - name: Build frontend
-        run: npm run build
-        env:
-          VITE_THEBOYS_RELEASE_CHANNEL: ${{ steps.version.outputs.channel }}
-
       - name: Verify Tauri security config
         run: npm run verify:tauri-security
 
@@ -125,6 +135,9 @@ jobs:
           THEBOYS_UPDATER_MANIFEST_NAME: ${{ steps.version.outputs.manifest_name }}
           VITE_THEBOYS_RELEASE_CHANNEL: ${{ steps.version.outputs.channel }}
 
+      - name: Smoke packaged executable
+        run: npm run smoke:packaged-exe
+
       - name: Verify Windows bundles
         run: npm run verify:tauri-bundles
         env:
@@ -136,8 +149,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists after version resolution."
-            exit 1
+            existing_sha="$(git rev-list -n 1 "${{ steps.version.outputs.tag }}")"
+            if [[ "${existing_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "::error::Tag ${{ steps.version.outputs.tag }} already exists at ${existing_sha}, not ${GITHUB_SHA}."
+              exit 1
+            fi
+            echo "Tag ${{ steps.version.outputs.tag }} already points at ${GITHUB_SHA}; continuing publish retry."
+            exit 0
           fi
           git tag "${{ steps.version.outputs.tag }}" "${GITHUB_SHA}"
           git push origin "${{ steps.version.outputs.tag }}"

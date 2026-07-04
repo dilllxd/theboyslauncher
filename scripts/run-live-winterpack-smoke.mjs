@@ -18,6 +18,7 @@ const smokeTests = {
   curseforgeArchivePlan: "live_curseforge_archive_plan_reads_enigmatica_export",
   modrinthArchiveInstall: "live_public_modrinth_mrpack_install_artifacts_pass_launch_preflight",
   vanillaLaunch: "live_vanilla_launch_process_survives_startup_and_can_stop",
+  vanillaDelete: "live_vanilla_delete_removes_profile_data_but_keeps_shared_cache",
   neoforgeInstaller: "live_neoforge_installer_extracts_launch_metadata_and_dependencies",
   neoforgeProcessors: "live_neoforge_installer_processors_resolve_command_specs_from_real_jars",
   neoforgeInstall: "live_neoforge_install_artifacts_pass_launch_preflight",

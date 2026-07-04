@@ -48,12 +48,50 @@ if (!["stable", "dev"].includes(channel)) {
   throw new Error(`Release channel must be stable or dev, received ${channel}`);
 }
 
-run("git", ["fetch", "--tags", "--force"]);
+if (process.env.THEBOYS_SKIP_GIT_FETCH !== "1") {
+  run("git", ["fetch", "--tags", "--force"]);
+}
 const tags = run("git", ["tag", "--list", "v*"])
+  .split(/\r?\n/)
+  .filter(Boolean);
+const headTags = run("git", ["tag", "--points-at", "HEAD", "--list", "v*"])
   .split(/\r?\n/)
   .filter(Boolean);
 
 const stableTags = tags.map(parseStableTag).filter(Boolean).sort(compareVersions);
+const headStableTags = headTags.map(parseStableTag).filter(Boolean).sort(compareVersions);
+const existingHeadStable = headStableTags.at(-1);
+
+function outputStable(version, tag) {
+  output({
+    channel,
+    version,
+    tag,
+    manifest_name: "latest.json",
+    prerelease: "false",
+    product_name: "TheBoysLauncher",
+  });
+}
+
+function outputDev(version, tag) {
+  output({
+    channel,
+    version,
+    tag,
+    manifest_name: "latest-dev.json",
+    prerelease: "true",
+    product_name: "TheBoysLauncher Dev",
+  });
+}
+
+if (channel === "stable" && existingHeadStable) {
+  outputStable(
+    `${existingHeadStable.major}.${existingHeadStable.minor}.${existingHeadStable.patch}`,
+    existingHeadStable.tag,
+  );
+  process.exit(0);
+}
+
 const latestStable = stableTags.at(-1) ?? { major: 4, minor: 0, patch: 0 };
 const nextStable = {
   major: latestStable.major,
@@ -63,26 +101,22 @@ const nextStable = {
 const baseVersion = `${nextStable.major}.${nextStable.minor}.${nextStable.patch}`;
 
 if (channel === "stable") {
-  output({
-    channel,
-    version: baseVersion,
-    tag: `v${baseVersion}`,
-    manifest_name: "latest.json",
-    prerelease: "false",
-    product_name: "TheBoysLauncher",
-  });
+  outputStable(baseVersion, `v${baseVersion}`);
 } else {
   const devTagPattern = new RegExp(`^v${baseVersion.replaceAll(".", "\\.")}-dev\\.(\\d+)$`);
+  const existingHeadDev = headTags
+    .map((tag) => devTagPattern.exec(tag))
+    .filter(Boolean)
+    .map((match) => ({ number: Number(match[1]), tag: match[0] }))
+    .sort((left, right) => left.number - right.number)
+    .at(-1);
+  if (existingHeadDev) {
+    outputDev(`${baseVersion}-${existingHeadDev.number}`, existingHeadDev.tag);
+    process.exit(0);
+  }
   const nextDev = Math.max(
     0,
     ...tags.map((tag) => devTagPattern.exec(tag)).filter(Boolean).map((match) => Number(match[1])),
   ) + 1;
-  output({
-    channel,
-    version: `${baseVersion}-${nextDev}`,
-    tag: `v${baseVersion}-dev.${nextDev}`,
-    manifest_name: "latest-dev.json",
-    prerelease: "true",
-    product_name: "TheBoysLauncher Dev",
-  });
+  outputDev(`${baseVersion}-${nextDev}`, `v${baseVersion}-dev.${nextDev}`);
 }

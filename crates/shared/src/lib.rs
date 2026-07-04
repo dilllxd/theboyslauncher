@@ -315,6 +315,14 @@ pub struct ArchiveProfileRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct DuplicateProfileRequest {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteProfileRequest {
     pub id: String,
 }
@@ -665,6 +673,7 @@ pub struct LauncherEvent {
 pub enum LauncherOperation {
     LaunchProfile,
     InstallPack,
+    InstallModpackArchive,
     RepairProfile,
     ImportProfile,
     DeleteProfile,
@@ -747,6 +756,42 @@ pub struct InstallModpackArchiveRequest {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallDiscoveredModpackRequest {
+    pub provider: String,
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverModpackSearchResult {
+    pub provider: String,
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub author: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+    pub downloads: u64,
+    pub follows: u64,
+    #[serde(default)]
+    pub game_versions: Vec<String>,
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version_id: Option<String>,
+    #[serde(default)]
+    pub install_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -837,6 +882,7 @@ pub enum ImportKind {
     Minecraft,
     Gdlauncher,
     Atlauncher,
+    FtbApp,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

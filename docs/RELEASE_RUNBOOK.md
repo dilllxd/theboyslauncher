@@ -34,6 +34,8 @@ npm run social:down
 npm run social:check
 ```
 
+`npm run social:check` verifies the public hosted endpoint by default. To include the local loopback service while you are on the backend host, set `$env:THEBOYS_CHECK_LOCAL_BACKEND="true"` or `$env:THEBOYS_LOCAL_BACKEND_HEALTH="http://127.0.0.1:4074/health"` before running it.
+
 The GitHub Container Registry image workflow lives at `.github/workflows/social-backend-image.yml`.
 GitHub only exposes newly added workflows after they exist on the default branch, so this workflow
 becomes manually dispatchable after the v4 branch replaces `main` or after a release tag includes it.
@@ -50,15 +52,32 @@ Production DNS/reverse proxy:
    ```
 
 3. Put an HTTPS reverse proxy in front of `http://127.0.0.1:4074`. A Caddy example is in `deploy/hosted-backend/Caddyfile.example`.
-4. Verify both local and public health:
+4. Verify public health and CORS:
 
    ```powershell
    npm run social:check
    ```
 
+   On the backend host, include the local loopback check as well:
+
+   ```powershell
+   $env:THEBOYS_CHECK_LOCAL_BACKEND="true"
+   npm run social:check
+   ```
+
 ## Release Build
 
-Normal PR and branch pushes run verification only. Windows packaging runs only for `v*` tags or manual dispatch with `package_windows=true` or `publish_release=true`.
+Normal PR and `codex/**` branch pushes run verification only through `v4-foundation.yml`.
+Normal channel publishing is handled by `v4-release-channels.yml`:
+
+- Pushing to `dev` builds `TheBoysLauncher Dev`, resolves the next MSI-safe dev version from the next stable patch line, publishes/refreshes the `dev-latest` prerelease, and uploads `latest-dev.json`.
+- Pushing to `main` builds stable `TheBoysLauncher`, resolves the next patch tag, publishes a normal GitHub release, and uploads `latest.json`.
+- Manual dispatch can build either channel. Dev push runs cancel superseded in-progress dev builds; stable/manual release runs do not auto-cancel once started.
+- If a publish retry reruns after the immutable version tag was already pushed for the same commit, the resolver and workflow reuse that tag. A same-name tag on a different commit is still a hard failure.
+
+The older `v4-foundation.yml` package/publish path remains manual-only for tagged validation or emergency packaging. Prefer `v4-release-channels.yml` for normal dev/stable publishing so versions, app identifiers, updater endpoints, manifests, and release assets are configured together.
+
+`npm run smoke:live:vanilla:compat` runs the practical vanilla sample (`--sample --shared-cache --quiet`) rather than the broad all-version campaign. Use explicit `--all --type ... --offset ... --limit ...` arguments only when resuming a deliberate compatibility sweep.
 
 The legacy Go/Fyne release workflows (`stable-release.yml`, `dev-prerelease.yml`, and
 `reset-dev-after-release.yml`) are preserved for reference but are manual-only in the

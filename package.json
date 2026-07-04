@@ -19,6 +19,8 @@
     "preflight:v4-release": "node scripts/preflight-v4-release.mjs",
     "resolve:v4-release-version": "node scripts/resolve-v4-release-version.mjs",
     "configure:tauri-release-channel": "node scripts/configure-tauri-release-channel.mjs",
+    "test:release-channels": "node scripts/test-release-channel-scripts.mjs",
+    "clean:tauri-updater-artifacts": "node scripts/clean-tauri-updater-artifacts.mjs",
     "generate:updater-manifest": "node scripts/generate-tauri-updater-manifest.mjs",
     "site:deploy": "node scripts/deploy-launcher-site.mjs",
     "postgres:up": "node scripts/manage-social-postgres.mjs up",
@@ -42,7 +44,7 @@
     "smoke:live:winterpack:auth-launch": "node scripts/run-live-winterpack-smoke.mjs authLaunch --root target/interactive-auth-smoke",
     "smoke:live:winterpack:launch": "node scripts/run-live-winterpack-smoke.mjs launch",
     "smoke:live:winterpack:delete": "node scripts/run-live-winterpack-smoke.mjs delete",
-    "smoke:live:vanilla:compat": "node scripts/run-vanilla-compat-campaign.mjs",
+    "smoke:live:vanilla:compat": "node scripts/run-vanilla-compat-campaign.mjs --sample --shared-cache --quiet",
     "smoke:live:vanilla:summary": "node scripts/summarize-vanilla-compat-results.mjs",
     "smoke:live:vanilla:coverage": "node scripts/summarize-vanilla-compat-results.mjs --coverage",
     "smoke:live:fabric:plan": "node scripts/run-live-winterpack-smoke.mjs fabricPlan",
@@ -56,8 +58,12 @@
     "smoke:live:neoforge:install": "node scripts/run-live-winterpack-smoke.mjs neoforgeInstall --root target/live-smoke/neoforge",
     "smoke:live:neoforge:launch": "node scripts/run-live-winterpack-smoke.mjs neoforgeLaunch --root target/live-smoke/neoforge",
     "smoke:live:vanilla:launch": "node scripts/run-live-winterpack-smoke.mjs vanillaLaunch --root target/live-smoke/vanilla",
+    "smoke:live:vanilla:delete": "node scripts/run-live-winterpack-smoke.mjs vanillaDelete --root target/live-smoke/vanilla",
+    "smoke:packaged-exe": "node scripts/smoke-packaged-exe.mjs",
+    "smoke:packaged-exe:local": "node scripts/smoke-packaged-exe.mjs --backend local --root target/packaged-exe-smoke/local-mode",
+    "smoke:packaged-exe:off": "node scripts/smoke-packaged-exe.mjs --backend off --root target/packaged-exe-smoke/off-mode",
     "tauri:dev": "npm run verify:tauri-security && npm run build:social-backend:debug && npm run stage:social-backend:debug && npm run verify:package-resources:debug && tauri dev",
-    "tauri:build": "npm run verify:tauri-security && npm run build:social-backend && npm run stage:social-backend && npm run verify:package-resources && tauri build && npm run generate:updater-manifest"
+    "tauri:build": "npm run verify:tauri-security && npm run build:social-backend && npm run stage:social-backend && npm run verify:package-resources && npm run clean:tauri-updater-artifacts && tauri build && npm run generate:updater-manifest"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

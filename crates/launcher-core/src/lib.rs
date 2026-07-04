@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use directories::ProjectDirs;
 use md5::Md5;
+use quick_xml::{events::Event as XmlEvent, Reader as XmlReader};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
@@ -24,9 +25,10 @@ use sha2::{Sha256, Sha512};
 use shared::{
     bundled_modpack_catalog, bundled_pack_summaries, pack_summary_from_catalog_entry,
     parse_modpack_catalog_json, ActionReceipt, ActionStatus, AppSnapshot, ArchiveProfileRequest,
-    CreateProfileRequest, DeleteProfileRequest, DownloadItem, DownloadKind, DownloadPlan,
-    ImportCandidate, ImportConflictResolution, ImportKind, ImportPlan, ImportPlanItem,
-    ImportPlanItemKind, ImportPlanRequest, JavaRuntimeDownloadRequest, JavaRuntimeManifestEntry,
+    CreateProfileRequest, DeleteProfileRequest, DiscoverModpackSearchResult, DownloadItem,
+    DownloadKind, DownloadPlan, DuplicateProfileRequest, ImportCandidate, ImportConflictResolution,
+    ImportKind, ImportPlan, ImportPlanItem, ImportPlanItemKind, ImportPlanRequest,
+    InstallDiscoveredModpackRequest, JavaRuntimeDownloadRequest, JavaRuntimeManifestEntry,
     JavaRuntimeSource, JavaRuntimeSummary, LaunchPlan, LauncherAction, LauncherDirectories,
     LauncherEvent, LauncherEventKind, LauncherOperation, LauncherSettings, ManagedProcessState,
     ManagedProcessSummary, MicrosoftAuthCallback, MicrosoftAuthStart, MicrosoftOAuthTokens,
@@ -61,6 +63,52 @@ const MINECRAFT_PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft
 const REMOTE_MODPACK_CATALOG_URL: &str = "https://modpacks.dylan.lol/modpacks.json";
 const MODRINTH_SEARCH_URL: &str = "https://api.modrinth.com/v2/search";
 const MODRINTH_PROJECT_API_URL: &str = "https://api.modrinth.com/v2/project";
+const CURSEFORGE_API_BASE_URL: &str = "https://api.curseforge.com/v1";
+const CURSEFORGE_API_KEY_ENV: &str = "THEBOYS_CURSEFORGE_API_KEY";
+const ATLAUNCHER_PUBLIC_PACKS_URL: &str = "https://api.atlauncher.com/v1/packs/full/public";
+const ATLAUNCHER_DOWNLOAD_BASE_URL: &str = "https://download.nodecdn.net/containers/atl";
+const FTB_LEGACY_CDN_BASE_URL: &str = "https://dist.creeper.host/FTB2";
+const FTB_PUBLIC_PACK_IDS_URL: &str = "https://api.modpacks.ch/public/modpack/all";
+const FTB_PUBLIC_PACK_API_URL: &str = "https://api.modpacks.ch/public/modpack";
+const FTB_PUBLIC_PACK_SEARCH_API_URL: &str = "https://api.modpacks.ch/public/modpack/search";
+const FTB_PACK_DETAIL_CONCURRENCY: usize = 6;
+const TECHNIC_API_BASE_URL: &str = "https://api.technicpack.net";
+const TECHNIC_API_BUILD: &str = "multimc";
+const TECHNIC_EXACT_METADATA_CONCURRENCY: usize = 4;
+const CURSEFORGE_KEYLESS_DISCOVER_PACKS: &[CurseForgeKeylessDiscoverPack] = &[
+    CurseForgeKeylessDiscoverPack {
+        slug: "enigmatica9expert",
+        title: "Enigmatica 9 Expert",
+        description: "Expert progression, quests, automation, and long-term server goals.",
+        author: "EnigmaticaModpacks",
+        game_versions: &["1.19.2"],
+        loaders: &["forge"],
+    },
+    CurseForgeKeylessDiscoverPack {
+        slug: "all-the-mods-10",
+        title: "All the Mods 10",
+        description: "A large kitchen-sink pack for modern modded Minecraft.",
+        author: "ATMTeam",
+        game_versions: &["1.21.1"],
+        loaders: &["neoforge"],
+    },
+    CurseForgeKeylessDiscoverPack {
+        slug: "better-mc-forge-bmc4",
+        title: "Better MC [FORGE] - BMC4",
+        description: "A polished adventure-focused Forge modpack.",
+        author: "SHXRKIE",
+        game_versions: &["1.20.1"],
+        loaders: &["forge"],
+    },
+];
+const DISCOVER_SEARCH_PROVIDERS: &[&str] = &[
+    "curseforge",
+    "modrinth",
+    "atlauncher",
+    "ftb",
+    "ftb_legacy",
+    "technic",
+];
 const THEBOYS_USER_AGENT: &str = "TheBoysLauncher/4.0.0-alpha.0";
 const JAVA_RUNTIME_MANIFEST_URL_ENV: &str = "THEBOYS_JAVA_RUNTIME_MANIFEST_URL";
 const PROCESS_OUTPUT_CAPACITY: usize = 1000;
@@ -1272,6 +1320,11 @@ pub fn archive_profile(request: ArchiveProfileRequest) -> Result<ProfileSummary>
     archive_profile_at_path(&profiles_path()?, request)
 }
 
+pub fn duplicate_profile(request: DuplicateProfileRequest) -> Result<ProfileSummary> {
+    let directories = prepare_launcher_directories()?;
+    duplicate_profile_at_path(&profiles_path()?, request, &directories)
+}
+
 pub fn delete_profile(request: DeleteProfileRequest) -> Result<ProfileSummary> {
     let directories = prepare_launcher_directories()?;
     delete_profile_at_path(&profiles_path()?, request, &directories)
@@ -1315,6 +1368,12 @@ pub fn scan_imports_in_roots(
             "ATLauncher",
             &mut candidates,
         )?;
+        scan_prism_like_instances(
+            &root.join(".ftba").join("instances"),
+            ImportKind::FtbApp,
+            "FTB App",
+            &mut candidates,
+        )?;
         scan_official_minecraft(&root.join(".minecraft"), &mut candidates)?;
     }
 
@@ -1347,8 +1406,9 @@ pub fn build_import_plan(
         .join(&profile_id);
     let mut items = Vec::new();
 
+    let source_data_path = import_data_root(&source_path);
     for (kind, relative_path) in IMPORTABLE_PROFILE_PATHS {
-        let source = source_path.join(relative_path);
+        let source = source_data_path.join(relative_path);
         let destination = destination_path.join(relative_path);
         let source_stats = collect_path_stats(&source);
         items.push(ImportPlanItem {
@@ -1387,6 +1447,84 @@ pub struct ModrinthModpackArchiveInstallPlan {
     pub profile: ProfileSummary,
     pub loader_version: Option<String>,
     pub file_download_plan: DownloadPlan,
+}
+
+#[derive(Clone, Debug)]
+pub struct FtbModpackInstallPlan {
+    pub profile: ProfileSummary,
+    pub loader_version: Option<String>,
+    pub file_download_plan: DownloadPlan,
+}
+
+#[derive(Clone, Debug)]
+pub struct AtlauncherModpackInstallPlan {
+    pub profile: ProfileSummary,
+    pub loader_version: Option<String>,
+    pub file_download_plan: DownloadPlan,
+    pub extract_archives: Vec<AtlauncherExtractArchivePlan>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AtlauncherExtractArchivePlan {
+    pub archive_path: PathBuf,
+    pub destination_dir: PathBuf,
+    pub strip_prefix: Option<String>,
+    pub label: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CurseForgeModpackDownloadPlan {
+    pub project_id: u64,
+    pub file_id: u64,
+    pub name: String,
+    pub file_name: String,
+    pub archive_download_plan: DownloadPlan,
+    pub archive_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct FtbLegacyModpackDownloadPlan {
+    pub name: String,
+    pub feed_kind: String,
+    pub directory: String,
+    pub file_name: String,
+    pub minecraft_version: String,
+    pub pack_version: String,
+    pub archive_download_plan: DownloadPlan,
+    pub archive_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct FtbLegacyModpackArchiveInstallPlan {
+    pub profile: ProfileSummary,
+    pub loader_version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TechnicModpackDownloadPlan {
+    pub slug: String,
+    pub name: String,
+    pub minecraft_version: String,
+    pub pack_version: Option<String>,
+    pub archive_download_plan: DownloadPlan,
+    pub archive_path: PathBuf,
+    pub module_archive_paths: Vec<PathBuf>,
+    pub source_kind: TechnicModpackDownloadKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct TechnicModpackArchiveInstallPlan {
+    pub profile: ProfileSummary,
+    pub loader_version: Option<String>,
+    pub archive_path: PathBuf,
+    pub module_archive_paths: Vec<PathBuf>,
+    pub source_kind: TechnicModpackDownloadKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TechnicModpackDownloadKind {
+    DirectZip,
+    SolderModules,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1508,6 +1646,12 @@ pub fn build_curseforge_modpack_archive_install_plan(
     let profile_root = profile_data_dir(directories, &profile_id)?;
     let mod_download_plan =
         build_curseforge_modpack_mod_download_plan(&manifest, &profile_id, &profile_root)?;
+    let installed_pack_version = manifest
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned);
 
     Ok(CurseForgeModpackArchiveInstallPlan {
         profile: ProfileSummary {
@@ -1515,7 +1659,7 @@ pub fn build_curseforge_modpack_archive_install_plan(
             name: profile_name.to_owned(),
             loader,
             game_version: manifest.minecraft.version.trim().to_owned(),
-            installed_pack_version: None,
+            installed_pack_version,
             last_played: None,
             memory_mb: default_settings().max_memory_mb.max(6144),
             jvm_args: Vec::new(),
@@ -1851,6 +1995,9 @@ pub fn build_modrinth_modpack_archive_install_plan(
     let profile_root = profile_data_dir(directories, &profile_id)?;
     let file_download_plan =
         build_modrinth_modpack_file_download_plan(&index, &profile_id, &profile_root)?;
+    let installed_pack_version = index.version_id.trim();
+    let installed_pack_version =
+        (!installed_pack_version.is_empty()).then(|| installed_pack_version.to_owned());
 
     Ok(ModrinthModpackArchiveInstallPlan {
         profile: ProfileSummary {
@@ -1858,7 +2005,7 @@ pub fn build_modrinth_modpack_archive_install_plan(
             name: profile_name.to_owned(),
             loader,
             game_version: minecraft_version,
-            installed_pack_version: None,
+            installed_pack_version,
             last_played: None,
             memory_mb: default_settings().max_memory_mb.max(6144),
             jvm_args: Vec::new(),
@@ -2515,7 +2662,7 @@ pub fn build_install_operation_plan(pack: &PackSummary) -> OperationPlan {
         LauncherEventKind::Planning,
         format!(
             "Resolved curated pack metadata for {action_lower} profile defaults.",
-            action_lower = action.to_lowercase()
+            action_lower = pack_install_action_phrase(pack.status.clone())
         ),
         Some(20),
     ));
@@ -2524,7 +2671,7 @@ pub fn build_install_operation_plan(pack: &PackSummary) -> OperationPlan {
         LauncherEventKind::Downloading,
         format!(
             "File downloader is ready for {action_lower} pack files and vanilla dependencies.",
-            action_lower = action.to_lowercase()
+            action_lower = pack_install_action_phrase(pack.status.clone())
         ),
         Some(50),
     ));
@@ -2552,9 +2699,18 @@ pub fn build_install_operation_plan(pack: &PackSummary) -> OperationPlan {
 fn pack_install_action_label(status: PackStatus) -> &'static str {
     match status {
         PackStatus::UpdateAvailable => "Update",
-        PackStatus::Installed => "Reinstall",
+        PackStatus::Installed => "Prepare",
         PackStatus::RepairNeeded => "Set up",
         PackStatus::NotInstalled => "Install",
+    }
+}
+
+fn pack_install_action_phrase(status: PackStatus) -> &'static str {
+    match status {
+        PackStatus::UpdateAvailable => "updating",
+        PackStatus::Installed => "preparing",
+        PackStatus::RepairNeeded => "setting up",
+        PackStatus::NotInstalled => "installing",
     }
 }
 
@@ -6076,7 +6232,7 @@ impl LauncherEventLog {
                 event.operation = Some(plan.operation.clone());
                 event.subject_id = Some(plan.subject_id.clone());
                 event.occurred_at_unix_seconds = occurred_at_unix_seconds;
-                event
+                player_facing_launcher_event(event)
             })
             .collect::<Vec<_>>();
         let snapshot = {
@@ -6096,6 +6252,7 @@ impl LauncherEventLog {
         if event.occurred_at_unix_seconds == 0 {
             event.occurred_at_unix_seconds = current_unix_seconds();
         }
+        let event = player_facing_launcher_event(event);
         let snapshot = {
             let mut events = self
                 .events
@@ -6148,6 +6305,100 @@ impl LauncherEventLog {
 impl Default for LauncherEventLog {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn player_facing_launcher_event(mut event: LauncherEvent) -> LauncherEvent {
+    if event.operation == Some(LauncherOperation::DownloadArtifacts) {
+        event.message = player_facing_download_event_message(
+            &event.message,
+            event.subject_id.as_deref().unwrap_or_default(),
+        );
+    }
+    event
+}
+
+fn player_facing_download_event_message(message: &str, subject_id: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.eq_ignore_ascii_case("Verified downloaded files.") {
+        return "Checking downloaded files.".to_owned();
+    }
+    if trimmed
+        .to_ascii_lowercase()
+        .starts_with("file download completed")
+    {
+        return "Files are ready.".to_owned();
+    }
+
+    let Some((state, label)) = download_event_state_and_label(trimmed) else {
+        return trimmed.to_owned();
+    };
+    let category = download_event_category(label, subject_id);
+    match state {
+        DownloadEventState::Pending => format!("Waiting to download {category}"),
+        DownloadEventState::Started => format!("Downloading {category}"),
+        DownloadEventState::Finished => format!("{category} ready"),
+        DownloadEventState::Failed => format!("{category} failed"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DownloadEventState {
+    Pending,
+    Started,
+    Finished,
+    Failed,
+}
+
+fn download_event_state_and_label(message: &str) -> Option<(DownloadEventState, &str)> {
+    for (prefix, state) in [
+        ("Artifact pending: ", DownloadEventState::Pending),
+        ("File pending: ", DownloadEventState::Pending),
+        ("Downloading artifact: ", DownloadEventState::Started),
+        ("Downloading file: ", DownloadEventState::Started),
+        ("Downloaded artifact: ", DownloadEventState::Finished),
+        ("Downloaded file: ", DownloadEventState::Finished),
+        ("Artifact already present: ", DownloadEventState::Finished),
+        ("File already present: ", DownloadEventState::Finished),
+        ("Failed artifact: ", DownloadEventState::Failed),
+        ("Failed file: ", DownloadEventState::Failed),
+    ] {
+        if message.len() >= prefix.len() && message[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return Some((state, message[prefix.len()..].trim()));
+        }
+    }
+    None
+}
+
+fn download_event_category(label: &str, subject_id: &str) -> &'static str {
+    let lower = label.to_ascii_lowercase();
+    let subject = subject_id.to_ascii_lowercase();
+    if lower.starts_with("asset-object-minecraft/") || lower.contains("(asset object") {
+        "Minecraft assets"
+    } else if lower.contains("(client jar") {
+        "Minecraft client"
+    } else if lower.contains("(native") {
+        "Minecraft native files"
+    } else if subject.contains("modloader")
+        || lower.contains("modloader")
+        || lower.contains("forge")
+        || lower.contains("neoforge")
+        || lower.contains("fabric")
+        || lower.contains("quilt")
+        || lower.contains("bootstrap")
+    {
+        "mod loader files"
+    } else if lower.contains("(library") {
+        "Minecraft libraries"
+    } else if lower.contains("(pack file")
+        || lower.contains("(preserved pack file")
+        || lower.contains("(mod")
+    {
+        "pack files"
+    } else if lower.contains("(java runtime archive") {
+        "Java files"
+    } else {
+        "game files"
     }
 }
 
@@ -8006,6 +8257,1632 @@ pub async fn search_modrinth_modpacks(
     modrinth_search_results_from_json(&body)
 }
 
+pub async fn search_discover_modpacks(
+    provider: impl AsRef<str>,
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let provider = provider.as_ref().trim().to_ascii_lowercase();
+    let query = query.as_ref().trim().to_owned();
+    if let Some(link_result) = discover_provider_result_from_query(&query)? {
+        if provider == "all" || provider == link_result.provider {
+            return Ok(vec![link_result]);
+        }
+    }
+    if provider == "all" {
+        return search_all_discover_modpacks(query, limit).await;
+    }
+    search_single_discover_provider(&provider, query, limit).await
+}
+
+async fn search_single_discover_provider(
+    provider: &str,
+    query: String,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    if let Some(link_result) = discover_provider_result_from_query(&query)? {
+        if link_result.provider == provider {
+            return Ok(vec![link_result]);
+        }
+    }
+    match provider {
+        "curseforge" => search_curseforge_modpacks(query, limit).await,
+        "modrinth" => search_modrinth_modpacks(query, limit)
+            .await
+            .map(modrinth_results_into_discover_results),
+        "atlauncher" => search_atlauncher_modpacks(query, limit).await,
+        "ftb" => search_ftb_modpacks(query, limit).await,
+        "ftb_legacy" => search_ftb_legacy_modpacks(query, limit).await,
+        "ftb_private" => search_ftb_private_modpacks(query, limit).await,
+        "technic" => search_technic_modpacks(query, limit).await,
+        other => Err(anyhow!("unsupported discover provider '{other}'")),
+    }
+}
+
+fn discover_provider_result_from_query(query: &str) -> Result<Option<DiscoverModpackSearchResult>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let Ok(parsed) = reqwest::Url::parse(query) else {
+        return Ok(None);
+    };
+
+    if let Some(launcher_result) = discover_launcher_install_result_from_url(&parsed)? {
+        return Ok(Some(launcher_result));
+    }
+
+    if parsed.scheme() == "curseforge" && parsed.host_str().unwrap_or_default() == "install" {
+        let project_id = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "addonId" || key == "projectId")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+        let file_id = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "fileId")
+            .map(|(_, value)| value.into_owned());
+        if !project_id.is_empty() && project_id.chars().all(|ch| ch.is_ascii_digit()) {
+            return Ok(Some(discover_provider_link_result(
+                "curseforge",
+                &project_id,
+                &project_id,
+                &format!("CurseForge project {project_id}"),
+                "CurseForge modpack install link.",
+                "CurseForge",
+                file_id.as_deref(),
+                None,
+            )?));
+        }
+        return Ok(None);
+    }
+
+    if parsed.scheme() != "https" {
+        return Ok(None);
+    }
+    let host = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let parts = parsed
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|part| !part.trim().is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+
+    if host == "modrinth.com" && parts.first().map(String::as_str) == Some("modpack") {
+        if let Some(project_id) = parts.get(1) {
+            let version = value_after_path_segment(&parts, &["version"]);
+            return Ok(Some(discover_provider_link_result(
+                "modrinth",
+                project_id,
+                project_id,
+                &provider_slug_title(project_id),
+                "Modrinth modpack link.",
+                "Modrinth",
+                version.as_deref(),
+                None,
+            )?));
+        }
+    }
+
+    if host.ends_with("curseforge.com")
+        && parts.first().map(String::as_str) == Some("minecraft")
+        && parts.get(1).map(String::as_str) == Some("modpacks")
+    {
+        if let Some(slug) = parts.get(2) {
+            let file_id = value_after_path_segment(&parts, &["files", "download"]);
+            return Ok(Some(discover_provider_link_result(
+                "curseforge",
+                slug,
+                slug,
+                &provider_slug_title(slug),
+                "CurseForge modpack link.",
+                "CurseForge",
+                file_id.as_deref(),
+                file_id.is_none().then_some(
+                    "The launcher will try CurseForge's latest pack export automatically.",
+                ),
+            )?));
+        }
+    }
+
+    if host.ends_with("curseforge.com")
+        && parts.first().map(String::as_str) == Some("projects")
+        && parts
+            .get(1)
+            .is_some_and(|part| part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        let project_id = &parts[1];
+        let file_id = value_after_path_segment(&parts, &["files", "download"]);
+        return Ok(Some(discover_provider_link_result(
+            "curseforge",
+            project_id,
+            project_id,
+            &format!("CurseForge project {project_id}"),
+            "CurseForge modpack link.",
+            "CurseForge",
+            file_id.as_deref(),
+            None,
+        )?));
+    }
+
+    if host == "atlauncher.com"
+        && matches!(parts.first().map(String::as_str), Some("pack" | "packs"))
+    {
+        if let Some(safe_name) = parts.get(1) {
+            let version = value_after_path_segment(&parts, &["version", "versions"]);
+            return Ok(Some(discover_provider_link_result(
+                "atlauncher",
+                safe_name,
+                safe_name,
+                &provider_slug_title(safe_name),
+                "ATLauncher pack link.",
+                "ATLauncher",
+                version.as_deref(),
+                None,
+            )?));
+        }
+    }
+
+    if (host == "feed-the-beast.com" || host == "ftb.team")
+        && matches!(
+            parts.first().map(String::as_str),
+            Some("modpacks" | "packs")
+        )
+    {
+        if let Some(raw_id) = parts.get(1) {
+            if let Some(id) = raw_id.split('-').next().filter(|part| {
+                !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+            }) {
+                let title_slug = raw_id.trim_start_matches(id).trim_start_matches('-');
+                let version = value_after_path_segment(&parts, &["version", "versions"]);
+                return Ok(Some(discover_provider_link_result(
+                    "ftb",
+                    id,
+                    id,
+                    &provider_slug_title(title_slug),
+                    "FTB modpack link.",
+                    "FTB Team",
+                    version.as_deref(),
+                    None,
+                )?));
+            }
+        }
+    }
+
+    if host == "api.modpacks.ch"
+        && parts.first().map(String::as_str) == Some("public")
+        && parts.get(1).map(String::as_str) == Some("modpack")
+        && parts.get(2).is_some()
+    {
+        let project_id = &parts[2];
+        let version = parts.get(3).map(String::as_str);
+        return Ok(Some(discover_provider_link_result(
+            "ftb",
+            project_id,
+            project_id,
+            &format!("FTB pack {project_id}"),
+            "FTB modpack link.",
+            "FTB Team",
+            version,
+            None,
+        )?));
+    }
+
+    if host == "dist.creeper.host"
+        && parts.first().map(String::as_str) == Some("FTB2")
+        && parts.get(1).map(String::as_str) == Some("modpacks")
+    {
+        if let (Some(directory), Some(version_path), Some(file_name)) =
+            (parts.get(2), parts.get(3), parts.get(4))
+        {
+            if file_name.to_ascii_lowercase().ends_with(".zip") {
+                return Ok(Some(discover_provider_link_result(
+                    "ftb_legacy",
+                    &format!("public:{directory}:{file_name}"),
+                    directory,
+                    &provider_slug_title(directory),
+                    "FTB Legacy pack link.",
+                    "The FTB Team",
+                    Some(&version_path.replace('_', ".")),
+                    None,
+                )?));
+            }
+        }
+    }
+
+    if (host == "technicpack.net" || host == "api.technicpack.net")
+        && parts.first().map(String::as_str) == Some("modpack")
+    {
+        if let Some(raw_slug) = parts.get(1) {
+            let slug = raw_slug.split('.').next().unwrap_or(raw_slug).trim();
+            if !slug.is_empty() {
+                let version = value_after_path_segment(&parts, &["version", "versions", "build"]);
+                return Ok(Some(discover_provider_link_result(
+                    "technic",
+                    slug,
+                    slug,
+                    &provider_slug_title(slug),
+                    "Technic modpack link.",
+                    "Technic",
+                    version.as_deref(),
+                    None,
+                )?));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn discover_launcher_install_result_from_url(
+    parsed: &reqwest::Url,
+) -> Result<Option<DiscoverModpackSearchResult>> {
+    if !matches!(
+        parsed.scheme(),
+        "prismlauncher" | "multimc" | "theboyslauncher"
+    ) || parsed.host_str().unwrap_or_default() != "install"
+    {
+        return Ok(None);
+    }
+
+    let platform = query_param_value(parsed, &["platform", "provider", "source"])
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if platform.is_empty() {
+        return Ok(None);
+    }
+
+    match platform.as_str() {
+        "curseforge" | "curse" | "flame" => {
+            let project_id = query_param_value(
+                parsed,
+                &["addonId", "modId", "projectId", "pack", "id", "slug"],
+            )
+            .unwrap_or_default();
+            let file_id = query_param_value(parsed, &["fileId", "versionId", "version"]);
+            if !project_id.chars().all(|ch| ch.is_ascii_digit())
+                || file_id
+                    .as_deref()
+                    .is_none_or(|file_id| !file_id.chars().all(|ch| ch.is_ascii_digit()))
+            {
+                return Ok(None);
+            }
+            Ok(Some(discover_provider_link_result(
+                "curseforge",
+                &project_id,
+                &project_id,
+                &format!("CurseForge project {project_id}"),
+                "CurseForge modpack install link.",
+                "CurseForge",
+                file_id.as_deref(),
+                None,
+            )?))
+        }
+        "modrinth" => {
+            let Some(project_id) = query_param_value(
+                parsed,
+                &["projectId", "modpackId", "pack", "packId", "id", "slug"],
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(discover_provider_link_result(
+                "modrinth",
+                &project_id,
+                &project_id,
+                &provider_slug_title(&project_id),
+                "Modrinth modpack install link.",
+                "Modrinth",
+                query_param_value(parsed, &["versionId", "fileId", "version"]).as_deref(),
+                None,
+            )?))
+        }
+        "atlauncher" | "atlauncherpack" => {
+            let Some(safe_name) =
+                query_param_value(parsed, &["pack", "packId", "projectId", "id", "slug"])
+            else {
+                return Ok(None);
+            };
+            Ok(Some(discover_provider_link_result(
+                "atlauncher",
+                &safe_name,
+                &safe_name,
+                &provider_slug_title(&safe_name),
+                "ATLauncher pack install link.",
+                "ATLauncher",
+                query_param_value(parsed, &["version", "versionId"]).as_deref(),
+                None,
+            )?))
+        }
+        "ftb" | "feedthebeast" => {
+            let Some(pack_id) =
+                query_param_value(parsed, &["pack", "packId", "projectId", "id", "slug"])
+            else {
+                return Ok(None);
+            };
+            if !pack_id.chars().all(|ch| ch.is_ascii_digit()) {
+                return Ok(None);
+            }
+            Ok(Some(discover_provider_link_result(
+                "ftb",
+                &pack_id,
+                &pack_id,
+                &format!("FTB pack {pack_id}"),
+                "FTB modpack install link.",
+                "FTB Team",
+                query_param_value(parsed, &["version", "versionId"]).as_deref(),
+                None,
+            )?))
+        }
+        "ftb_legacy" | "ftb-legacy" | "ftblegacy" => {
+            let Some(directory) =
+                query_param_value(parsed, &["pack", "packId", "projectId", "id", "slug"])
+            else {
+                return Ok(None);
+            };
+            let file_name = query_param_value(parsed, &["file", "fileName", "archive"]);
+            let project_id = file_name
+                .as_deref()
+                .map(|file_name| format!("public:{directory}:{file_name}"))
+                .unwrap_or_else(|| directory.clone());
+            Ok(Some(discover_provider_link_result(
+                "ftb_legacy",
+                &project_id,
+                &directory,
+                &provider_slug_title(&directory),
+                "FTB Legacy pack install link.",
+                "The FTB Team",
+                query_param_value(parsed, &["version", "versionId"]).as_deref(),
+                None,
+            )?))
+        }
+        "ftb_private" | "ftb-private" | "ftbprivate" | "private" => {
+            let Some(code) = query_param_value(
+                parsed,
+                &["code", "privateCode", "pack", "packId", "id", "slug"],
+            ) else {
+                return Ok(None);
+            };
+            ensure_safe_path_segment(&code, "FTB private pack code")?;
+            let directory = query_param_value(parsed, &["dir", "directory"]);
+            let file_name = query_param_value(parsed, &["file", "fileName", "archive"]);
+            let project_id = match (directory.as_deref(), file_name.as_deref()) {
+                (Some(directory), Some(file_name)) => {
+                    format!("private:{code}:{directory}:{file_name}")
+                }
+                _ => code.clone(),
+            };
+            Ok(Some(discover_provider_link_result(
+                "ftb_private",
+                &project_id,
+                &code,
+                &provider_slug_title(&code),
+                "Private FTB Legacy pack install link.",
+                "Private FTB Legacy",
+                query_param_value(parsed, &["version", "versionId"]).as_deref(),
+                None,
+            )?))
+        }
+        "technic" | "technicpack" => {
+            let Some(slug) =
+                query_param_value(parsed, &["slug", "pack", "packId", "projectId", "id"])
+            else {
+                return Ok(None);
+            };
+            Ok(Some(discover_provider_link_result(
+                "technic",
+                &slug,
+                &slug,
+                &provider_slug_title(&slug),
+                "Technic modpack install link.",
+                "Technic",
+                query_param_value(parsed, &["version", "versionId", "build"]).as_deref(),
+                None,
+            )?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn query_param_value(parsed: &reqwest::Url, names: &[&str]) -> Option<String> {
+    parsed
+        .query_pairs()
+        .find(|(key, value)| {
+            !value.trim().is_empty()
+                && names
+                    .iter()
+                    .any(|name| key.as_ref().eq_ignore_ascii_case(name))
+        })
+        .map(|(_, value)| value.trim().to_owned())
+}
+
+fn value_after_path_segment(parts: &[String], segment_names: &[&str]) -> Option<String> {
+    parts
+        .iter()
+        .position(|part| segment_names.iter().any(|name| part == name))
+        .and_then(|index| parts.get(index + 1))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+}
+
+fn discover_provider_link_result(
+    provider: &str,
+    project_id: &str,
+    slug: &str,
+    title: &str,
+    description: &str,
+    author: &str,
+    latest_version_id: Option<&str>,
+    install_note: Option<&str>,
+) -> Result<DiscoverModpackSearchResult> {
+    ensure_safe_path_segment(provider, "discover provider")?;
+    ensure!(
+        !project_id.trim().is_empty(),
+        "discover project id is required"
+    );
+    ensure!(!slug.trim().is_empty(), "discover slug is required");
+    Ok(DiscoverModpackSearchResult {
+        provider: provider.to_owned(),
+        project_id: project_id.to_owned(),
+        slug: slug.to_owned(),
+        title: if title.trim().is_empty() {
+            provider_slug_title(slug)
+        } else {
+            title.to_owned()
+        },
+        description: description.to_owned(),
+        author: author.to_owned(),
+        icon_url: None,
+        downloads: 0,
+        follows: 0,
+        game_versions: Vec::new(),
+        loaders: Vec::new(),
+        latest_version_id: latest_version_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        install_available: true,
+        install_note: install_note.map(str::to_owned),
+    })
+}
+
+fn provider_slug_title(slug: &str) -> String {
+    let title = slug
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        "Modpack".to_owned()
+    } else {
+        title
+    }
+}
+
+pub async fn search_all_discover_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let query = query.as_ref().trim().to_owned();
+    if let Some(private_code) = ftb_private_code_from_all_sources_query(&query) {
+        return search_ftb_private_modpacks(private_code, limit).await;
+    }
+    let result_limit = limit.clamp(1, 48);
+    let per_provider_limit = result_limit.min(24);
+    let mut handles = Vec::new();
+
+    for provider in DISCOVER_SEARCH_PROVIDERS {
+        let provider = (*provider).to_owned();
+        let query = query.clone();
+        handles.push(tokio::spawn(async move {
+            let result =
+                search_single_discover_provider(&provider, query, per_provider_limit).await;
+            (provider, result)
+        }));
+    }
+
+    let mut provider_result_sets = Vec::new();
+    let mut failures = Vec::new();
+    for handle in handles {
+        let (provider, result) = handle
+            .await
+            .map_err(|error| anyhow!("discover provider task failed: {error}"))?;
+        match result {
+            Ok(provider_results) => provider_result_sets.push(provider_results),
+            Err(error) => failures.push(format!("{provider}: {error}")),
+        }
+    }
+
+    if provider_result_sets.iter().all(Vec::is_empty) && !failures.is_empty() {
+        return Err(anyhow!(
+            "all discover sources are unavailable: {}",
+            failures.join("; ")
+        ));
+    }
+
+    Ok(interleave_discover_provider_results(
+        provider_result_sets,
+        result_limit,
+    ))
+}
+
+fn ftb_private_code_from_all_sources_query(query: &str) -> Option<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let lower = query.to_ascii_lowercase();
+    let prefix_len = ["private:", "ftb private ", "ftb-private ", "ftb_private "]
+        .iter()
+        .find_map(|prefix| lower.starts_with(prefix).then_some(prefix.len()))?;
+    let code = query[prefix_len..].trim();
+    if code.is_empty() || code.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(code.to_owned())
+}
+
+fn interleave_discover_provider_results(
+    provider_result_sets: Vec<Vec<DiscoverModpackSearchResult>>,
+    limit: usize,
+) -> Vec<DiscoverModpackSearchResult> {
+    let limit = limit.clamp(1, 48);
+    let mut results = Vec::new();
+    let mut indexes = vec![0usize; provider_result_sets.len()];
+
+    while results.len() < limit {
+        let mut added_this_round = false;
+        for (provider_index, provider_results) in provider_result_sets.iter().enumerate() {
+            let Some(result) = provider_results.get(indexes[provider_index]) else {
+                continue;
+            };
+            results.push(result.clone());
+            indexes[provider_index] += 1;
+            added_this_round = true;
+            if results.len() >= limit {
+                break;
+            }
+        }
+        if !added_this_round {
+            break;
+        }
+    }
+
+    results
+}
+
+pub async fn search_curseforge_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let query = query.as_ref().trim();
+    let api_key = match curseforge_api_key() {
+        Ok(api_key) => api_key,
+        Err(_) => return curseforge_keyless_search_results(query, limit),
+    };
+    let limit = limit.clamp(1, 24).to_string();
+    let mut url = reqwest::Url::parse(&format!("{CURSEFORGE_API_BASE_URL}/mods/search"))?;
+    url.query_pairs_mut()
+        .append_pair("gameId", "432")
+        .append_pair("classId", "4471")
+        .append_pair("pageSize", &limit)
+        .append_pair("sortField", if query.is_empty() { "2" } else { "6" })
+        .append_pair("sortOrder", "desc");
+    if !query.is_empty() {
+        url.query_pairs_mut().append_pair("searchFilter", query);
+    }
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("x-api-key", api_key)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "CurseForge search request failed with HTTP {status}"
+    );
+    curseforge_search_results_from_json(&body)
+}
+
+pub async fn search_atlauncher_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let response = metadata_http_client()
+        .get(ATLAUNCHER_PUBLIC_PACKS_URL)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "ATLauncher packs request failed with HTTP {status}"
+    );
+    atlauncher_search_results_from_json(&body, query.as_ref(), limit)
+}
+
+pub async fn search_ftb_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let limit = limit.clamp(1, 24);
+    let query = query.as_ref().trim();
+    let pack_ids_url = if query.is_empty() {
+        reqwest::Url::parse(FTB_PUBLIC_PACK_IDS_URL)?
+    } else {
+        let mut url = reqwest::Url::parse(&format!("{FTB_PUBLIC_PACK_SEARCH_API_URL}/{limit}"))?;
+        url.query_pairs_mut().append_pair("term", query);
+        url
+    };
+    let response = metadata_http_client()
+        .get(pack_ids_url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "FTB pack index request failed with HTTP {status}"
+    );
+    let index = ftb_modpack_ids_from_index_json(&body)?;
+    let mut results = Vec::new();
+    let pack_ids: Vec<u64> = index.into_iter().take(limit).collect();
+    for chunk in pack_ids.chunks(FTB_PACK_DETAIL_CONCURRENCY) {
+        if results.len() >= limit {
+            break;
+        }
+        let handles: Vec<_> = chunk
+            .iter()
+            .copied()
+            .map(|pack_id| tokio::spawn(async move { fetch_ftb_search_result(pack_id).await }))
+            .collect();
+        for handle in handles {
+            let Some(result) = handle
+                .await
+                .map_err(|error| anyhow!("FTB pack detail task failed: {error}"))??
+            else {
+                continue;
+            };
+            results.push(result);
+            if results.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn ftb_modpack_ids_from_index_json(json_text: &str) -> Result<Vec<u64>> {
+    Ok(serde_json::from_str::<FtbModpackIndexResponse>(json_text)?.packs)
+}
+
+async fn fetch_ftb_search_result(pack_id: u64) -> Result<Option<DiscoverModpackSearchResult>> {
+    let url = format!("{FTB_PUBLIC_PACK_API_URL}/{pack_id}");
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    if response.status().as_u16() != 200 {
+        return Ok(None);
+    }
+    let body = response.text().await?;
+    Ok(Some(ftb_search_result_from_pack_json(&body)?))
+}
+
+pub async fn search_ftb_legacy_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let public_url = format!("{FTB_LEGACY_CDN_BASE_URL}/static/modpacks.xml");
+    let third_party_url = format!("{FTB_LEGACY_CDN_BASE_URL}/static/thirdparty.xml");
+    let public_response = metadata_http_client()
+        .get(public_url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let public_status = public_response.status().as_u16();
+    let public_body = public_response.text().await?;
+    ensure!(
+        public_status == 200,
+        "FTB Legacy public feed request failed with HTTP {public_status}"
+    );
+    let third_party_response = metadata_http_client()
+        .get(third_party_url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let third_party_status = third_party_response.status().as_u16();
+    let third_party_body = third_party_response.text().await?;
+    ensure!(
+        third_party_status == 200,
+        "FTB Legacy third-party feed request failed with HTTP {third_party_status}"
+    );
+    let mut results = ftb_legacy_search_results_from_xml(&public_body, "public", None)?;
+    results.extend(ftb_legacy_search_results_from_xml(
+        &third_party_body,
+        "third-party",
+        None,
+    )?);
+    let query = query.as_ref().trim().to_lowercase();
+    results.retain(|result| query.is_empty() || discover_result_matches_query(result, &query));
+    results.sort_by(|a, b| {
+        b.game_versions
+            .first()
+            .cmp(&a.game_versions.first())
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+    results.truncate(limit.clamp(1, 24));
+    Ok(results)
+}
+
+pub async fn search_ftb_private_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let private_code = query.as_ref().trim();
+    if private_code.is_empty() {
+        return Ok(Vec::new());
+    }
+    ensure_safe_path_segment(private_code, "FTB private pack code")?;
+    let url = format!("{FTB_LEGACY_CDN_BASE_URL}/static/privatepacks/{private_code}.xml");
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "FTB private pack request failed with HTTP {status}"
+    );
+    let mut results = ftb_legacy_search_results_from_xml(&body, "private", Some(private_code))?;
+    results.truncate(limit.clamp(1, 24));
+    Ok(results)
+}
+
+pub async fn search_technic_modpacks(
+    query: impl AsRef<str>,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let query = query.as_ref().trim();
+    let exact_slug_query = query.strip_prefix('#').map(str::trim);
+    let base_url = if query.is_empty() {
+        format!("{TECHNIC_API_BASE_URL}/trending")
+    } else if let Some(slug) = exact_slug_query {
+        ensure_safe_path_segment(slug, "Technic modpack slug")?;
+        format!("{TECHNIC_API_BASE_URL}/modpack/{slug}")
+    } else {
+        format!("{TECHNIC_API_BASE_URL}/search")
+    };
+    let mut url = reqwest::Url::parse(&base_url)?;
+    url.query_pairs_mut()
+        .append_pair("build", TECHNIC_API_BUILD);
+    if !query.is_empty() && !query.starts_with('#') {
+        url.query_pairs_mut().append_pair("q", query);
+    }
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Technic search request failed with HTTP {status}"
+    );
+    let results = technic_search_results_from_json(&body, limit)?;
+    if exact_slug_query.is_some() {
+        Ok(results)
+    } else {
+        enrich_technic_search_results_with_exact_metadata(results).await
+    }
+}
+
+async fn enrich_technic_search_results_with_exact_metadata(
+    results: Vec<DiscoverModpackSearchResult>,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let mut enriched = Vec::with_capacity(results.len());
+    for chunk in results.chunks(TECHNIC_EXACT_METADATA_CONCURRENCY) {
+        let mut lookups = Vec::new();
+        for result in chunk {
+            if result.install_available {
+                enriched.push(result.clone());
+            } else {
+                let fallback = result.clone();
+                let fallback_for_task = result.clone();
+                let handle = tokio::spawn(async move {
+                    fetch_exact_technic_search_result(&fallback_for_task.slug)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|exact| exact.install_available)
+                        .unwrap_or(fallback_for_task)
+                });
+                lookups.push((fallback, handle));
+            }
+        }
+        for (fallback, handle) in lookups {
+            enriched.push(handle.await.unwrap_or(fallback));
+        }
+    }
+    Ok(enriched)
+}
+
+async fn fetch_exact_technic_search_result(
+    slug: &str,
+) -> Result<Option<DiscoverModpackSearchResult>> {
+    let slug = slug.trim();
+    ensure_safe_path_segment(slug, "Technic modpack slug")?;
+    let mut url = reqwest::Url::parse(&format!("{TECHNIC_API_BASE_URL}/modpack/{slug}"))?;
+    url.query_pairs_mut()
+        .append_pair("build", TECHNIC_API_BUILD);
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    if response.status().as_u16() != 200 {
+        return Ok(None);
+    }
+    let body = response.text().await?;
+    Ok(technic_search_results_from_json(&body, 1)?
+        .into_iter()
+        .next())
+}
+
+pub async fn fetch_curseforge_modpack_download_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<CurseForgeModpackDownloadPlan> {
+    ensure!(
+        request.provider.trim() == "curseforge",
+        "only CurseForge provider installs are supported by this command right now"
+    );
+    if let Some(plan) = curseforge_exact_project_file_download_plan(request, directories)? {
+        return Ok(plan);
+    }
+    if let Some(plan) = curseforge_slug_file_download_plan(request, directories)? {
+        return Ok(plan);
+    }
+    if let Some(plan) = curseforge_slug_latest_download_plan(request, directories)? {
+        return Ok(plan);
+    }
+    let api_key = curseforge_api_key()?;
+    let project_id = resolve_curseforge_project_id(&api_key, request.project_id.trim()).await?;
+    ensure!(project_id > 0, "CurseForge project id is required");
+    let file_id = request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .context("CurseForge file id must be numeric")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let file_url = if file_id > 0 {
+        format!("{CURSEFORGE_API_BASE_URL}/mods/{project_id}/files/{file_id}")
+    } else {
+        let mut url = reqwest::Url::parse(&format!(
+            "{CURSEFORGE_API_BASE_URL}/mods/{project_id}/files"
+        ))?;
+        url.query_pairs_mut().append_pair("pageSize", "50");
+        url.to_string()
+    };
+    let response = metadata_http_client()
+        .get(file_url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("x-api-key", api_key)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "CurseForge file request failed with HTTP {status}"
+    );
+    let selected = if file_id > 0 {
+        curseforge_file_from_file_json(&body)?
+    } else {
+        curseforge_latest_modpack_file_from_files_json(&body)?
+    };
+    curseforge_download_plan_from_file(project_id, request.name.as_deref(), &selected, directories)
+}
+
+fn curseforge_exact_project_file_download_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<Option<CurseForgeModpackDownloadPlan>> {
+    let project_id = match request.project_id.trim().parse::<u64>() {
+        Ok(project_id) if project_id > 0 => project_id,
+        _ => return Ok(None),
+    };
+    let Some(file_id) = request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .context("CurseForge file id must be numeric")
+        })
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    if file_id == 0 {
+        return Ok(None);
+    }
+    let file_name = format!("curseforge-{project_id}-{file_id}.zip");
+    let file = CurseForgeFileResponse {
+        id: file_id,
+        display_name: request.name.clone(),
+        file_name: Some(file_name),
+        file_length: None,
+        download_url: Some(curseforge_public_file_download_url(project_id, file_id)?),
+        game_versions: Vec::new(),
+        hashes: Vec::new(),
+    };
+    Ok(Some(curseforge_download_plan_from_file(
+        project_id,
+        request.name.as_deref(),
+        &file,
+        directories,
+    )?))
+}
+
+fn curseforge_slug_file_download_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<Option<CurseForgeModpackDownloadPlan>> {
+    let slug = request.project_id.trim();
+    if slug.is_empty() || slug.parse::<u64>().is_ok() {
+        return Ok(None);
+    }
+    ensure_safe_path_segment(slug, "CurseForge modpack slug")?;
+    let Some(file_id) = request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .context("CurseForge file id must be numeric")
+        })
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    if file_id == 0 {
+        return Ok(None);
+    }
+
+    let file_name = format!("curseforge-{slug}-{file_id}.zip");
+    ensure_safe_path_segment(&file_name, "CurseForge pack file name")?;
+    let archive_id = format!("curseforge-{slug}-{file_id}");
+    ensure_safe_path_segment(&archive_id, "CurseForge archive id")?;
+    let archive_root = PathBuf::from(&directories.cache_dir)
+        .join("modpack-archives")
+        .join(&archive_id);
+    let archive_path = archive_root.join(&file_name);
+    let download_url =
+        format!("https://www.curseforge.com/minecraft/modpacks/{slug}/download/{file_id}");
+    validate_http_download_url(&download_url)?;
+
+    Ok(Some(CurseForgeModpackDownloadPlan {
+        project_id: 0,
+        file_id,
+        name: request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| provider_slug_to_search_name(slug)),
+        file_name,
+        archive_download_plan: DownloadPlan {
+            version_id: format!("{archive_id}-archive"),
+            items: vec![DownloadItem {
+                id: "curseforge-modpack-archive".to_owned(),
+                kind: DownloadKind::PackFile,
+                url: download_url,
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive_path),
+            }],
+        },
+        archive_path,
+    }))
+}
+
+fn curseforge_slug_latest_download_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<Option<CurseForgeModpackDownloadPlan>> {
+    let slug = request.project_id.trim();
+    if slug.is_empty() || slug.parse::<u64>().is_ok() {
+        return Ok(None);
+    }
+    ensure_safe_path_segment(slug, "CurseForge modpack slug")?;
+    if request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(None);
+    }
+
+    let file_name = format!("curseforge-{slug}-latest.zip");
+    ensure_safe_path_segment(&file_name, "CurseForge pack file name")?;
+    let archive_id = format!("curseforge-{slug}-latest");
+    ensure_safe_path_segment(&archive_id, "CurseForge archive id")?;
+    let archive_root = PathBuf::from(&directories.cache_dir)
+        .join("modpack-archives")
+        .join(&archive_id);
+    let archive_path = archive_root.join(&file_name);
+    let download_url = format!("https://www.curseforge.com/minecraft/modpacks/{slug}/download");
+    validate_http_download_url(&download_url)?;
+
+    Ok(Some(CurseForgeModpackDownloadPlan {
+        project_id: 0,
+        file_id: 0,
+        name: request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| provider_slug_to_search_name(slug)),
+        file_name,
+        archive_download_plan: DownloadPlan {
+            version_id: format!("{archive_id}-archive"),
+            items: vec![DownloadItem {
+                id: "curseforge-modpack-archive".to_owned(),
+                kind: DownloadKind::PackFile,
+                url: download_url,
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive_path),
+            }],
+        },
+        archive_path,
+    }))
+}
+
+async fn resolve_curseforge_project_id(api_key: &str, project_id_or_slug: &str) -> Result<u64> {
+    let project_id_or_slug = project_id_or_slug.trim();
+    ensure!(
+        !project_id_or_slug.is_empty(),
+        "CurseForge project id or slug is required"
+    );
+    if let Ok(project_id) = project_id_or_slug.parse::<u64>() {
+        ensure!(project_id > 0, "CurseForge project id is required");
+        return Ok(project_id);
+    }
+    ensure_safe_path_segment(project_id_or_slug, "CurseForge modpack slug")?;
+    let mut url = reqwest::Url::parse(&format!("{CURSEFORGE_API_BASE_URL}/mods/search"))?;
+    url.query_pairs_mut()
+        .append_pair("gameId", "432")
+        .append_pair("classId", "4471")
+        .append_pair("pageSize", "20")
+        .append_pair("sortField", "6")
+        .append_pair("sortOrder", "desc")
+        .append_pair("searchFilter", project_id_or_slug);
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("x-api-key", api_key)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "CurseForge project lookup failed with HTTP {status}"
+    );
+    curseforge_project_id_from_search_json(&body, project_id_or_slug)
+}
+
+pub async fn fetch_ftb_modpack_install_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<FtbModpackInstallPlan> {
+    ensure!(
+        request.provider.trim() == "ftb",
+        "only FTB provider installs are supported by this command right now"
+    );
+    let project_id = request.project_id.trim();
+    ensure!(!project_id.is_empty(), "FTB pack id is required");
+    ensure!(
+        project_id
+            .chars()
+            .all(|character| character.is_ascii_digit()),
+        "FTB pack id must be numeric"
+    );
+    let mut version_id = request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if version_id.is_none() {
+        let pack_url = format!("{FTB_PUBLIC_PACK_API_URL}/{project_id}");
+        let response = metadata_http_client()
+            .get(pack_url)
+            .header("User-Agent", THEBOYS_USER_AGENT)
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        ensure!(
+            status == 200,
+            "FTB pack detail request failed with HTTP {status}"
+        );
+        version_id = Some(latest_ftb_version_id_from_pack_json(&body)?);
+    }
+    let version_id = version_id.ok_or_else(|| anyhow!("FTB version id is required"))?;
+    ensure!(
+        version_id
+            .chars()
+            .all(|character| character.is_ascii_digit()),
+        "FTB version id must be numeric"
+    );
+    let url = format!("{FTB_PUBLIC_PACK_API_URL}/{project_id}/{version_id}");
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "FTB pack version request failed with HTTP {status}"
+    );
+    ftb_install_plan_from_version_json(
+        project_id,
+        &version_id,
+        request.name.as_deref(),
+        directories,
+        &body,
+    )
+}
+
+pub async fn fetch_atlauncher_modpack_install_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<AtlauncherModpackInstallPlan> {
+    ensure!(
+        request.provider.trim() == "atlauncher",
+        "only ATLauncher provider installs are supported by this command right now"
+    );
+    let safe_name = request.project_id.trim();
+    ensure_safe_path_segment(safe_name, "ATLauncher pack id")?;
+    let mut version_id = request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if version_id.is_none() {
+        let response = metadata_http_client()
+            .get(ATLAUNCHER_PUBLIC_PACKS_URL)
+            .header("User-Agent", THEBOYS_USER_AGENT)
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        ensure!(
+            status == 200,
+            "ATLauncher packs request failed with HTTP {status}"
+        );
+        version_id = Some(latest_atlauncher_version_id_from_packs_json(
+            &body, safe_name,
+        )?);
+    }
+    let version_id = version_id.ok_or_else(|| anyhow!("ATLauncher version id is required"))?;
+    ensure_safe_path_segment(&version_id, "ATLauncher version id")?;
+    let url = format!(
+        "{ATLAUNCHER_DOWNLOAD_BASE_URL}/packs/{safe_name}/versions/{version_id}/Configs.json"
+    );
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "ATLauncher pack manifest request failed with HTTP {status}"
+    );
+    atlauncher_install_plan_from_config_json(
+        safe_name,
+        &version_id,
+        request.name.as_deref(),
+        directories,
+        &body,
+    )
+}
+
+pub async fn fetch_ftb_legacy_modpack_download_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<FtbLegacyModpackDownloadPlan> {
+    ensure!(
+        matches!(request.provider.trim(), "ftb_legacy" | "ftb_private"),
+        "only FTB Legacy provider installs are supported by this command right now"
+    );
+    let metadata = fetch_ftb_legacy_modpack_metadata(request).await?;
+    let version_path = metadata.pack_version.replace('.', "_");
+    ensure_safe_path_segment(&version_path, "FTB Legacy download version")?;
+    let base_path = if metadata.feed_kind == "private" {
+        "privatepacks"
+    } else {
+        "modpacks"
+    };
+    let url = format!(
+        "{FTB_LEGACY_CDN_BASE_URL}/{base_path}/{}/{}/{}",
+        metadata.directory, version_path, metadata.file_name
+    );
+    validate_http_download_url(&url)?;
+    let archive_id = Uuid::new_v4().to_string();
+    let archive_path = PathBuf::from(&directories.cache_dir)
+        .join("modpack-archives")
+        .join(&archive_id)
+        .join(&metadata.file_name);
+    Ok(FtbLegacyModpackDownloadPlan {
+        name: metadata.name,
+        feed_kind: metadata.feed_kind,
+        directory: metadata.directory,
+        file_name: metadata.file_name,
+        minecraft_version: metadata.minecraft_version,
+        pack_version: metadata.pack_version,
+        archive_download_plan: DownloadPlan {
+            version_id: format!("ftb-legacy-archive-{archive_id}"),
+            items: vec![DownloadItem {
+                id: "ftb-legacy-archive".to_owned(),
+                kind: DownloadKind::PackFile,
+                url,
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5: None,
+                murmur2: None,
+                size: None,
+                destination: display_path(&archive_path),
+            }],
+        },
+        archive_path,
+    })
+}
+
+pub fn build_ftb_legacy_modpack_archive_install_plan(
+    archive_path: &Path,
+    download_plan: &FtbLegacyModpackDownloadPlan,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+) -> Result<FtbLegacyModpackArchiveInstallPlan> {
+    let profile_name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| download_plan.name.trim());
+    ensure!(
+        !profile_name.is_empty(),
+        "FTB Legacy modpack name is required"
+    );
+    let (loader, loader_version) = ftb_legacy_modloader_from_archive(archive_path)?;
+    let profile = ProfileSummary {
+        id: format!("ftb-legacy-{}", profile_id_from_name(profile_name)),
+        name: profile_name.to_owned(),
+        loader,
+        game_version: download_plan.minecraft_version.clone(),
+        installed_pack_version: Some(download_plan.pack_version.clone()),
+        last_played: None,
+        memory_mb: default_settings().max_memory_mb.max(6144),
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    };
+    validate_profiles(std::slice::from_ref(&profile))?;
+    let profile_root = profile_data_dir(directories, &profile.id)?;
+    ensure!(
+        path_starts_with(&profile_root, &PathBuf::from(&directories.data_dir)),
+        "FTB Legacy profile destination is outside launcher data"
+    );
+    Ok(FtbLegacyModpackArchiveInstallPlan {
+        profile,
+        loader_version,
+    })
+}
+
+pub fn extract_ftb_legacy_modpack_archive(
+    archive_path: &Path,
+    plan: &FtbLegacyModpackArchiveInstallPlan,
+    directories: &LauncherDirectories,
+) -> Result<OperationPlan> {
+    validate_profiles(std::slice::from_ref(&plan.profile))?;
+    let profile_root = profile_data_dir(directories, &plan.profile.id)?;
+    fs::create_dir_all(&profile_root)?;
+    extract_ftb_legacy_minecraft_dir_from_archive(archive_path, &profile_root)?;
+
+    let operation_id = Uuid::new_v4();
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::ImportProfile,
+        subject_id: plan.profile.id.clone(),
+        events: vec![
+            operation_event(
+                operation_id,
+                LauncherEventKind::Planning,
+                format!("Prepared FTB Legacy modpack {}", plan.profile.name),
+                Some(20),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Completed,
+                "Copied legacy FTB Minecraft files from the modpack archive.",
+                Some(100),
+            ),
+        ],
+    })
+}
+
+pub async fn fetch_technic_modpack_download_plan(
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<TechnicModpackDownloadPlan> {
+    ensure!(
+        request.provider.trim() == "technic",
+        "only Technic provider installs are supported by this command right now"
+    );
+    let slug = request.project_id.trim();
+    ensure_safe_path_segment(slug, "Technic modpack slug")?;
+    let url = format!("{TECHNIC_API_BASE_URL}/modpack/{slug}");
+    let mut url = reqwest::Url::parse(&url)?;
+    url.query_pairs_mut()
+        .append_pair("build", TECHNIC_API_BUILD);
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Technic modpack metadata request failed with HTTP {status}"
+    );
+    let metadata = technic_metadata_from_json(&body)?;
+    ensure!(
+        metadata.slug == slug,
+        "Technic metadata slug did not match requested pack"
+    );
+    ensure!(
+        looks_like_minecraft_version(&metadata.minecraft_version),
+        "Technic pack has unsupported Minecraft version '{}'",
+        metadata.minecraft_version
+    );
+    let archive_id = Uuid::new_v4().to_string();
+    let archive_root = PathBuf::from(&directories.cache_dir)
+        .join("modpack-archives")
+        .join(&archive_id);
+    if let Some(archive_url) = metadata.archive_url {
+        ensure!(
+            archive_url.starts_with("https://"),
+            "Technic archive URL must use HTTPS"
+        );
+        validate_http_download_url(&archive_url)?;
+        let archive_file_name = filename_from_download_url(&archive_url)
+            .unwrap_or_else(|_| format!("{}.zip", metadata.slug));
+        ensure_safe_path_segment(&archive_file_name, "Technic archive file name")?;
+        let archive_path = archive_root.join(&archive_file_name);
+        return Ok(TechnicModpackDownloadPlan {
+            slug: metadata.slug,
+            name: metadata.name,
+            minecraft_version: metadata.minecraft_version,
+            pack_version: metadata.pack_version,
+            archive_download_plan: DownloadPlan {
+                version_id: format!("technic-archive-{archive_id}"),
+                items: vec![DownloadItem {
+                    id: "technic-archive".to_owned(),
+                    kind: DownloadKind::PackFile,
+                    url: archive_url,
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: None,
+                    destination: display_path(&archive_path),
+                }],
+            },
+            archive_path,
+            module_archive_paths: Vec::new(),
+            source_kind: TechnicModpackDownloadKind::DirectZip,
+        });
+    }
+    let solder_url = metadata
+        .solder_url
+        .clone()
+        .ok_or_else(|| anyhow!("Technic pack does not expose a direct zip or Solder API URL"))?;
+    let solder_plan = fetch_technic_solder_download_plan(
+        &metadata,
+        &solder_url,
+        &archive_root,
+        &archive_id,
+        request,
+    )
+    .await?;
+    Ok(TechnicModpackDownloadPlan {
+        slug: metadata.slug,
+        name: solder_plan.name,
+        minecraft_version: solder_plan.minecraft_version,
+        pack_version: Some(solder_plan.pack_version),
+        archive_download_plan: solder_plan.download_plan,
+        archive_path: archive_root,
+        module_archive_paths: solder_plan.module_archive_paths,
+        source_kind: TechnicModpackDownloadKind::SolderModules,
+    })
+}
+
+pub fn build_technic_modpack_archive_install_plan(
+    archive_path: &Path,
+    download_plan: &TechnicModpackDownloadPlan,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+) -> Result<TechnicModpackArchiveInstallPlan> {
+    let profile_name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| download_plan.name.trim());
+    ensure!(!profile_name.is_empty(), "Technic modpack name is required");
+    let (archive_minecraft_version, loader, loader_version) =
+        technic_modloader_from_download_plan(archive_path, download_plan)?;
+    let game_version =
+        archive_minecraft_version.unwrap_or_else(|| download_plan.minecraft_version.clone());
+    ensure!(
+        looks_like_minecraft_version(&game_version),
+        "Technic pack has unsupported Minecraft version '{}'",
+        game_version
+    );
+    let profile = ProfileSummary {
+        id: format!("technic-{}", profile_id_from_name(&download_plan.slug)),
+        name: profile_name.to_owned(),
+        loader,
+        game_version,
+        installed_pack_version: download_plan.pack_version.clone(),
+        last_played: None,
+        memory_mb: default_settings().max_memory_mb.max(6144),
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    };
+    validate_profiles(std::slice::from_ref(&profile))?;
+    let profile_root = profile_data_dir(directories, &profile.id)?;
+    ensure!(
+        path_starts_with(&profile_root, &PathBuf::from(&directories.data_dir)),
+        "Technic profile destination is outside launcher data"
+    );
+    Ok(TechnicModpackArchiveInstallPlan {
+        profile,
+        loader_version,
+        archive_path: archive_path.to_path_buf(),
+        module_archive_paths: download_plan.module_archive_paths.clone(),
+        source_kind: download_plan.source_kind.clone(),
+    })
+}
+
+pub fn extract_technic_modpack_archive(
+    _archive_path: &Path,
+    plan: &TechnicModpackArchiveInstallPlan,
+    directories: &LauncherDirectories,
+) -> Result<OperationPlan> {
+    validate_profiles(std::slice::from_ref(&plan.profile))?;
+    let profile_root = profile_data_dir(directories, &plan.profile.id)?;
+    fs::create_dir_all(&profile_root)?;
+    match plan.source_kind {
+        TechnicModpackDownloadKind::DirectZip => {
+            extract_technic_zip_root_to_profile(&plan.archive_path, &profile_root)?
+        }
+        TechnicModpackDownloadKind::SolderModules => {
+            for path in &plan.module_archive_paths {
+                extract_technic_zip_root_to_profile(path, &profile_root)?;
+            }
+        }
+    }
+    let operation_id = Uuid::new_v4();
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::ImportProfile,
+        subject_id: plan.profile.id.clone(),
+        events: vec![
+            operation_event(
+                operation_id,
+                LauncherEventKind::Planning,
+                format!("Prepared Technic modpack {}", plan.profile.name),
+                Some(20),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Completed,
+                "Copied Technic modpack files from the archive.",
+                Some(100),
+            ),
+        ],
+    })
+}
+
 pub async fn resolve_modrinth_modpack_archive(
     project_id: impl AsRef<str>,
 ) -> Result<ModrinthModpackArchiveResolution> {
@@ -8026,6 +9903,30 @@ pub async fn resolve_modrinth_modpack_archive(
         "Modrinth project '{project_id}' versions request failed with HTTP {status}"
     );
     modrinth_archive_resolution_from_versions_json(project_id, &body)
+}
+
+pub async fn resolve_modrinth_modpack_archive_version(
+    project_id: impl AsRef<str>,
+    version_id: impl AsRef<str>,
+) -> Result<ModrinthModpackArchiveResolution> {
+    let project_id = project_id.as_ref().trim();
+    ensure_modrinth_identifier(project_id, "Modrinth project id")?;
+    let version_id = version_id.as_ref().trim();
+    let url = modrinth_version_api_url(version_id)?;
+    let response = metadata_http_client()
+        .get(url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Modrinth version '{version_id}' request failed with HTTP {status}"
+    );
+    modrinth_archive_resolution_from_version_json(project_id, &body)
 }
 
 fn modrinth_search_results_from_json(json_text: &str) -> Result<Vec<ModrinthModpackSearchResult>> {
@@ -8059,6 +9960,2202 @@ fn modrinth_search_results_from_json(json_text: &str) -> Result<Vec<ModrinthModp
             }
         })
         .collect())
+}
+
+fn curseforge_api_key() -> Result<String> {
+    std::env::var(CURSEFORGE_API_KEY_ENV)
+        .ok()
+        .or_else(|| option_env!("THEBOYS_CURSEFORGE_API_KEY").map(str::to_owned))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "CurseForge search needs {} configured in the launcher build or environment",
+                CURSEFORGE_API_KEY_ENV
+            )
+        })
+}
+
+fn curseforge_keyless_search_results(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let limit = limit.clamp(1, 24);
+    let query = query.trim();
+    let normalized_query = query.to_ascii_lowercase();
+    let explicit_slug = curseforge_slug_from_query(query)?;
+    let mut results = CURSEFORGE_KEYLESS_DISCOVER_PACKS
+        .iter()
+        .filter(|pack| {
+            if let Some(slug) = explicit_slug.as_deref() {
+                pack.slug.eq_ignore_ascii_case(slug)
+            } else {
+                normalized_query.is_empty()
+                    || pack.slug.contains(&normalized_query)
+                    || pack.title.to_ascii_lowercase().contains(&normalized_query)
+                    || pack
+                        .description
+                        .to_ascii_lowercase()
+                        .contains(&normalized_query)
+            }
+        })
+        .map(curseforge_keyless_pack_to_result)
+        .collect::<Vec<_>>();
+
+    if results.is_empty() {
+        if let Some(slug) = explicit_slug.as_deref() {
+            results.push(curseforge_keyless_slug_result(slug));
+        } else if !query.is_empty() {
+            let slug = provider_slug_from_search_query(query);
+            if !slug.is_empty() {
+                results.push(curseforge_keyless_slug_result(&slug));
+            }
+        }
+    }
+
+    results.truncate(limit);
+    Ok(results)
+}
+
+fn curseforge_slug_from_query(query: &str) -> Result<Option<String>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(None);
+    }
+    if let Some(exact) = query.strip_prefix('#').map(str::trim) {
+        if exact.parse::<u64>().is_ok() {
+            return Ok(None);
+        }
+        ensure_safe_path_segment(exact, "CurseForge modpack slug")?;
+        return Ok(Some(exact.to_ascii_lowercase()));
+    }
+    if let Ok(url) = reqwest::Url::parse(query) {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        if host.ends_with("curseforge.com") {
+            let parts = url
+                .path_segments()
+                .map(|segments| {
+                    segments
+                        .filter(|part| !part.trim().is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if parts.first() == Some(&"minecraft") && parts.get(1) == Some(&"modpacks") {
+                if let Some(slug) = parts.get(2) {
+                    ensure_safe_path_segment(slug, "CurseForge modpack slug")?;
+                    return Ok(Some(slug.to_ascii_lowercase()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn provider_slug_from_search_query(query: &str) -> String {
+    query
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn curseforge_keyless_pack_to_result(
+    pack: &CurseForgeKeylessDiscoverPack,
+) -> DiscoverModpackSearchResult {
+    DiscoverModpackSearchResult {
+        provider: "curseforge".to_owned(),
+        project_id: pack.slug.to_owned(),
+        slug: pack.slug.to_owned(),
+        title: pack.title.to_owned(),
+        description: pack.description.to_owned(),
+        author: pack.author.to_owned(),
+        icon_url: None,
+        downloads: 0,
+        follows: 0,
+        game_versions: pack
+            .game_versions
+            .iter()
+            .map(|version| (*version).to_owned())
+            .collect(),
+        loaders: pack
+            .loaders
+            .iter()
+            .map(|loader| (*loader).to_owned())
+            .collect(),
+        latest_version_id: None,
+        install_available: true,
+        install_note: Some(
+            "Installs from the public CurseForge pack page; exact file details are detected during install."
+                .to_owned(),
+        ),
+    }
+}
+
+fn curseforge_keyless_slug_result(slug: &str) -> DiscoverModpackSearchResult {
+    let title = provider_slug_to_search_name(slug);
+    DiscoverModpackSearchResult {
+        provider: "curseforge".to_owned(),
+        project_id: slug.to_owned(),
+        slug: slug.to_owned(),
+        title: title
+            .split_whitespace()
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        description: "CurseForge modpack page.".to_owned(),
+        author: "CurseForge".to_owned(),
+        icon_url: None,
+        downloads: 0,
+        follows: 0,
+        game_versions: Vec::new(),
+        loaders: Vec::new(),
+        latest_version_id: None,
+        install_available: true,
+        install_note: Some(
+            "Installs from the public CurseForge pack page; exact file details are detected during install."
+                .to_owned(),
+        ),
+    }
+}
+
+fn curseforge_search_results_from_json(
+    json_text: &str,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let response = serde_json::from_str::<CurseForgeSearchResponse>(json_text)?;
+    let mut results = Vec::new();
+    for pack in response.data {
+        let latest_file = curseforge_select_latest_modpack_file(pack.latest_files.as_slice());
+        let latest_version_id = latest_file.map(|file| file.id.to_string());
+        let game_versions = latest_file
+            .map(|file| curseforge_file_game_versions(file))
+            .unwrap_or_else(|| curseforge_latest_indexes_game_versions(&pack.latest_files_indexes));
+        let loaders = latest_file
+            .map(|file| curseforge_file_loaders(file))
+            .unwrap_or_default();
+        results.push(DiscoverModpackSearchResult {
+            provider: "curseforge".to_owned(),
+            project_id: pack.id.to_string(),
+            slug: pack.slug,
+            title: pack.name,
+            description: pack
+                .summary
+                .filter(|summary| !summary.trim().is_empty())
+                .unwrap_or_else(|| "CurseForge modpack.".to_owned()),
+            author: pack
+                .authors
+                .first()
+                .map(|author| author.name.clone())
+                .unwrap_or_else(|| "CurseForge".to_owned()),
+            icon_url: pack
+                .logo
+                .as_ref()
+                .and_then(|logo| logo.thumbnail_url.clone().or_else(|| logo.url.clone())),
+            downloads: pack.download_count.unwrap_or_default(),
+            follows: 0,
+            game_versions,
+            loaders,
+            latest_version_id,
+            install_available: latest_file.is_some(),
+            install_note: Some(
+                "Installs CurseForge pack exports through the automatic zip importer.".to_owned(),
+            ),
+        });
+    }
+    Ok(results)
+}
+
+fn curseforge_project_id_from_search_json(json_text: &str, slug: &str) -> Result<u64> {
+    let response = serde_json::from_str::<CurseForgeSearchResponse>(json_text)?;
+    let normalized_slug = slug.trim().to_ascii_lowercase();
+    let normalized_name = provider_slug_to_search_name(&normalized_slug);
+    let selected = response
+        .data
+        .iter()
+        .find(|pack| pack.slug.eq_ignore_ascii_case(&normalized_slug))
+        .or_else(|| {
+            response.data.iter().find(|pack| {
+                provider_slug_to_search_name(&pack.slug).eq_ignore_ascii_case(&normalized_name)
+                    || pack.name.eq_ignore_ascii_case(&normalized_name)
+            })
+        })
+        .ok_or_else(|| anyhow!("CurseForge modpack '{slug}' was not found"))?;
+    ensure!(selected.id > 0, "CurseForge project id is required");
+    Ok(selected.id)
+}
+
+fn provider_slug_to_search_name(slug: &str) -> String {
+    slug.replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn curseforge_file_from_file_json(json_text: &str) -> Result<CurseForgeFileResponse> {
+    let response = serde_json::from_str::<CurseForgeFileEnvelope>(json_text)?;
+    Ok(response.data)
+}
+
+fn curseforge_latest_modpack_file_from_files_json(
+    json_text: &str,
+) -> Result<CurseForgeFileResponse> {
+    let response = serde_json::from_str::<CurseForgeFilesEnvelope>(json_text)?;
+    curseforge_select_latest_modpack_file(response.data.as_slice())
+        .cloned()
+        .ok_or_else(|| anyhow!("CurseForge modpack has no downloadable client pack files"))
+}
+
+fn curseforge_select_latest_modpack_file(
+    files: &[CurseForgeFileResponse],
+) -> Option<&CurseForgeFileResponse> {
+    files
+        .iter()
+        .filter(|file| curseforge_file_is_modpack_archive(file))
+        .max_by_key(|file| file.id)
+}
+
+fn curseforge_file_is_modpack_archive(file: &CurseForgeFileResponse) -> bool {
+    file.file_name
+        .as_deref()
+        .map(|name| name.to_ascii_lowercase().ends_with(".zip"))
+        .unwrap_or(false)
+        && file
+            .download_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
+}
+
+fn curseforge_file_game_versions(file: &CurseForgeFileResponse) -> Vec<String> {
+    file.game_versions
+        .iter()
+        .filter(|version| looks_like_minecraft_version(version))
+        .cloned()
+        .collect()
+}
+
+fn curseforge_file_loaders(file: &CurseForgeFileResponse) -> Vec<String> {
+    let mut loaders = file
+        .game_versions
+        .iter()
+        .filter_map(|version| {
+            let lower = version.to_ascii_lowercase();
+            match lower.as_str() {
+                "forge" | "neoforge" | "fabric" | "quilt" => Some(lower),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    loaders.sort();
+    loaders.dedup();
+    loaders
+}
+
+fn curseforge_latest_indexes_game_versions(indexes: &[CurseForgeLatestFileIndex]) -> Vec<String> {
+    let mut versions = indexes
+        .iter()
+        .filter_map(|index| index.game_version.clone())
+        .filter(|version| looks_like_minecraft_version(version))
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+    versions
+}
+
+fn curseforge_download_plan_from_file(
+    project_id: u64,
+    requested_name: Option<&str>,
+    file: &CurseForgeFileResponse,
+    directories: &LauncherDirectories,
+) -> Result<CurseForgeModpackDownloadPlan> {
+    ensure!(file.id > 0, "CurseForge file id is required");
+    let file_name = file
+        .file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("CurseForge pack file is missing a file name"))?;
+    ensure!(
+        file_name.to_ascii_lowercase().ends_with(".zip"),
+        "CurseForge pack file must be a zip export"
+    );
+    ensure_safe_path_segment(file_name, "CurseForge pack file name")?;
+    let url = file
+        .download_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| anyhow!("CurseForge pack file is not downloadable automatically"))?;
+    validate_http_download_url(url)?;
+    ensure!(
+        url.starts_with("https://"),
+        "CurseForge pack file URL must use HTTPS"
+    );
+    let archive_id = format!("curseforge-{project_id}-{}", file.id);
+    ensure_safe_path_segment(&archive_id, "CurseForge archive id")?;
+    let archive_root = PathBuf::from(&directories.cache_dir)
+        .join("modpack-archives")
+        .join(&archive_id);
+    let archive_path = archive_root.join(file_name);
+    let name = requested_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .or_else(|| file.display_name.clone())
+        .unwrap_or_else(|| file_name.trim_end_matches(".zip").to_owned());
+    Ok(CurseForgeModpackDownloadPlan {
+        project_id,
+        file_id: file.id,
+        name,
+        file_name: file_name.to_owned(),
+        archive_path: archive_path.clone(),
+        archive_download_plan: DownloadPlan {
+            version_id: format!("{archive_id}-archive"),
+            items: vec![DownloadItem {
+                id: "curseforge-modpack-archive".to_owned(),
+                kind: DownloadKind::PackFile,
+                url: url.to_owned(),
+                sha1: curseforge_file_hash(file, 1),
+                sha256: None,
+                sha512: None,
+                md5: curseforge_file_hash(file, 2),
+                murmur2: None,
+                size: file.file_length,
+                destination: display_path(&archive_path),
+            }],
+        },
+    })
+}
+
+fn curseforge_file_hash(file: &CurseForgeFileResponse, algorithm: u32) -> Option<String> {
+    file.hashes
+        .iter()
+        .find(|hash| hash.algo == algorithm)
+        .map(|hash| hash.value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn modrinth_results_into_discover_results(
+    results: Vec<ModrinthModpackSearchResult>,
+) -> Vec<DiscoverModpackSearchResult> {
+    results
+        .into_iter()
+        .map(|result| DiscoverModpackSearchResult {
+            provider: "modrinth".to_owned(),
+            project_id: result.project_id,
+            slug: result.slug,
+            title: result.title,
+            description: result.description,
+            author: result.author,
+            icon_url: result.icon_url,
+            downloads: result.downloads,
+            follows: result.follows,
+            game_versions: result.game_versions,
+            loaders: result.loaders,
+            latest_version_id: result.latest_version_id,
+            install_available: true,
+            install_note: None,
+        })
+        .collect()
+}
+
+fn atlauncher_search_results_from_json(
+    json_text: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let response = serde_json::from_str::<AtlauncherPacksResponse>(json_text)?;
+    let query = query.trim().to_lowercase();
+    let limit = limit.clamp(1, 24);
+    let mut results = response
+        .data
+        .into_iter()
+        .filter(|pack| pack.pack_type.as_deref() == Some("public"))
+        .map(|pack| {
+            let latest = pack
+                .versions
+                .iter()
+                .max_by_key(|version| version.published.unwrap_or_default());
+            let game_versions = latest
+                .and_then(|version| version.minecraft.clone())
+                .into_iter()
+                .collect::<Vec<_>>();
+            DiscoverModpackSearchResult {
+                provider: "atlauncher".to_owned(),
+                project_id: pack.safe_name.clone(),
+                slug: pack.safe_name,
+                title: pack.name,
+                description: "ATLauncher public modpack.".to_owned(),
+                author: "ATLauncher".to_owned(),
+                icon_url: None,
+                downloads: 0,
+                follows: 0,
+                game_versions,
+                loaders: Vec::new(),
+                latest_version_id: latest.map(|version| version.version.clone()),
+                install_available: latest.is_some(),
+                install_note: None,
+            }
+        })
+        .filter(|result| query.is_empty() || discover_result_matches_query(result, &query))
+        .collect::<Vec<_>>();
+    results.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    results.truncate(limit);
+    Ok(results)
+}
+
+fn latest_atlauncher_version_id_from_packs_json(
+    json_text: &str,
+    safe_name: &str,
+) -> Result<String> {
+    let response = serde_json::from_str::<AtlauncherPacksResponse>(json_text)?;
+    let pack = response
+        .data
+        .into_iter()
+        .find(|pack| pack.safe_name.eq_ignore_ascii_case(safe_name))
+        .ok_or_else(|| anyhow!("ATLauncher pack '{safe_name}' was not found"))?;
+    pack.versions
+        .into_iter()
+        .max_by_key(|version| version.published.unwrap_or_default())
+        .map(|version| version.version)
+        .filter(|version| !version.trim().is_empty())
+        .ok_or_else(|| anyhow!("ATLauncher pack '{safe_name}' has no installable versions"))
+}
+
+pub fn build_atlauncher_modpack_install_plan_from_config_json(
+    safe_name: &str,
+    version_id: &str,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+    json_text: &str,
+) -> Result<AtlauncherModpackInstallPlan> {
+    atlauncher_install_plan_from_config_json(
+        safe_name,
+        version_id,
+        requested_name,
+        directories,
+        json_text,
+    )
+}
+
+fn atlauncher_install_plan_from_config_json(
+    safe_name: &str,
+    version_id: &str,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+    json_text: &str,
+) -> Result<AtlauncherModpackInstallPlan> {
+    let manifest = serde_json::from_str::<AtlauncherConfigManifest>(json_text)?;
+    let minecraft_version = manifest.minecraft.trim();
+    ensure!(
+        looks_like_minecraft_version(minecraft_version),
+        "ATLauncher pack has unsupported Minecraft version '{}'",
+        minecraft_version
+    );
+    let (loader, loader_version) = atlauncher_modloader_from_manifest(manifest.loader.as_ref())?;
+    let name = requested_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| safe_name.to_owned());
+    let profile = ProfileSummary {
+        id: format!("atlauncher-{}", profile_id_from_name(safe_name)),
+        name,
+        loader,
+        game_version: minecraft_version.to_owned(),
+        installed_pack_version: Some(version_id.to_owned()),
+        last_played: None,
+        memory_mb: default_settings().max_memory_mb,
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    };
+    validate_profiles(std::slice::from_ref(&profile))?;
+    let profile_root = profile_data_dir(directories, &profile.id)?;
+    let (file_download_plan, extract_archives) = build_atlauncher_modpack_file_download_plan(
+        safe_name,
+        version_id,
+        manifest.configs.as_ref(),
+        &manifest.mods,
+        &profile.id,
+        &profile_root,
+    )?;
+    Ok(AtlauncherModpackInstallPlan {
+        profile,
+        loader_version,
+        file_download_plan,
+        extract_archives,
+    })
+}
+
+fn atlauncher_modloader_from_manifest(
+    loader: Option<&AtlauncherLoaderConfig>,
+) -> Result<(ModLoader, Option<String>)> {
+    let Some(loader) = loader else {
+        return Ok((ModLoader::Vanilla, None));
+    };
+    let loader_type = loader.loader_type.trim().to_ascii_lowercase();
+    if loader_type.is_empty() || loader_type == "vanilla" {
+        return Ok((ModLoader::Vanilla, None));
+    }
+    let mapped_loader = match loader_type.as_str() {
+        "fabric" => ModLoader::Fabric,
+        "forge" => ModLoader::Forge,
+        "neoforge" => ModLoader::Neoforge,
+        "quilt" => ModLoader::Quilt,
+        other => return Err(anyhow!("unsupported ATLauncher modloader '{other}'")),
+    };
+    let loader_version = loader
+        .metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .version
+                .as_deref()
+                .or(metadata.raw_version.as_deref())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(version) = loader_version.as_deref() {
+        ensure_safe_path_segment(version, "ATLauncher modloader version")?;
+    }
+    Ok((mapped_loader, loader_version))
+}
+
+fn build_atlauncher_modpack_file_download_plan(
+    safe_name: &str,
+    version_id: &str,
+    configs: Option<&AtlauncherConfigsConfig>,
+    files: &[AtlauncherModFileConfig],
+    profile_id: &str,
+    profile_root: &Path,
+) -> Result<(DownloadPlan, Vec<AtlauncherExtractArchivePlan>)> {
+    let mut items = Vec::new();
+    let mut extract_archives = Vec::new();
+    if let Some(configs) = configs {
+        let archive_id = Uuid::new_v4().to_string();
+        let archive_path = profile_root
+            .join(".theboys")
+            .join("atlauncher")
+            .join(format!("configs-{archive_id}.zip"));
+        let sha1 = configs
+            .sha1
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+        if let Some(sha1) = sha1.as_deref() {
+            ensure!(
+                sha1.len() == 40 && sha1.chars().all(|character| character.is_ascii_hexdigit()),
+                "ATLauncher configs SHA-1 hash must be a 40-character hex value"
+            );
+        }
+        items.push(DownloadItem {
+            id: format!("atlauncher-configs-{profile_id}"),
+            kind: DownloadKind::PackFile,
+            url: format!(
+                "{ATLAUNCHER_DOWNLOAD_BASE_URL}/packs/{safe_name}/versions/{version_id}/Configs.zip"
+            ),
+            sha1,
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: configs.filesize,
+            destination: display_path(&archive_path),
+        });
+        extract_archives.push(AtlauncherExtractArchivePlan {
+            archive_path,
+            destination_dir: PathBuf::new(),
+            strip_prefix: None,
+            label: "config files".to_owned(),
+        });
+    }
+    for file in files {
+        if !file.client || file.optional {
+            continue;
+        }
+        let mod_type = file.mod_type.as_deref().unwrap_or("mods").trim();
+        let download_mode = file.download.as_deref().unwrap_or("server").trim();
+        ensure!(
+            !download_mode.eq_ignore_ascii_case("browser"),
+            "ATLauncher file '{}' requires a browser download and cannot be installed automatically",
+            file.name
+        );
+        let file_name = file
+            .file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("ATLauncher file '{}' is missing a file name", file.name))?;
+        ensure_safe_path_segment(file_name, "ATLauncher file name")?;
+        let md5 = atlauncher_file_md5(file)?;
+        let url = atlauncher_download_url(download_mode, file.url.as_deref(), &file.name)?;
+        if mod_type.eq_ignore_ascii_case("extract") {
+            let archive_id = Uuid::new_v4().to_string();
+            let archive_path = profile_root
+                .join(".theboys")
+                .join("atlauncher")
+                .join("extracts")
+                .join(format!("{archive_id}-{file_name}"));
+            let destination_dir = atlauncher_extract_destination_dir(file.extract_to.as_deref())?;
+            let strip_prefix = atlauncher_extract_strip_prefix(file.extract_folder.as_deref())?;
+            items.push(DownloadItem {
+                id: format!("atlauncher-extract-{profile_id}-{}", items.len() + 1),
+                kind: DownloadKind::PackFile,
+                url,
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                md5,
+                murmur2: None,
+                size: file.filesize,
+                destination: display_path(&archive_path),
+            });
+            extract_archives.push(AtlauncherExtractArchivePlan {
+                archive_path,
+                destination_dir,
+                strip_prefix,
+                label: file.name.trim().to_owned(),
+            });
+            continue;
+        }
+        let destination_dir = match atlauncher_mod_type_relative_dir(file.mod_type.as_deref())? {
+            Some(path) => path,
+            None => continue,
+        };
+        let destination = if destination_dir.as_os_str().is_empty() {
+            profile_root.join(file_name)
+        } else {
+            profile_root.join(&destination_dir).join(file_name)
+        };
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "ATLauncher file destination is outside the profile directory"
+        );
+        items.push(DownloadItem {
+            id: format!("atlauncher-file-{profile_id}-{}", items.len() + 1),
+            kind: DownloadKind::PackFile,
+            url,
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5,
+            murmur2: None,
+            size: file.filesize,
+            destination: display_path(&destination),
+        });
+    }
+    ensure!(
+        !items.is_empty(),
+        "ATLauncher manifest did not contain any required client files this launcher can install automatically"
+    );
+    Ok((
+        DownloadPlan {
+            version_id: format!("{profile_id}-atlauncher-files"),
+            items,
+        },
+        extract_archives,
+    ))
+}
+
+pub fn extract_atlauncher_archives(
+    extract_archives: &[AtlauncherExtractArchivePlan],
+    profile: &ProfileSummary,
+    directories: &LauncherDirectories,
+) -> Result<OperationPlan> {
+    validate_profiles(std::slice::from_ref(profile))?;
+    let profile_root = profile_data_dir(directories, &profile.id)?;
+    ensure!(
+        path_starts_with(&profile_root, &PathBuf::from(&directories.data_dir)),
+        "ATLauncher profile destination is outside launcher data"
+    );
+    let mut copied = 0usize;
+    for extract_archive in extract_archives {
+        copied += extract_atlauncher_archive_to_profile(extract_archive, &profile_root)?;
+    }
+    ensure!(
+        copied > 0,
+        "ATLauncher extract archives did not contain any files"
+    );
+    let operation_id = Uuid::new_v4();
+    Ok(OperationPlan {
+        operation_id,
+        operation: LauncherOperation::ImportProfile,
+        subject_id: profile.id.clone(),
+        events: vec![
+            operation_event(
+                operation_id,
+                LauncherEventKind::Planning,
+                format!("Prepared ATLauncher files for {}", profile.name),
+                Some(80),
+            ),
+            operation_event(
+                operation_id,
+                LauncherEventKind::Completed,
+                "Copied ATLauncher bundled files into the profile.",
+                Some(100),
+            ),
+        ],
+    })
+}
+
+fn extract_atlauncher_archive_to_profile(
+    extract_archive: &AtlauncherExtractArchivePlan,
+    profile_root: &Path,
+) -> Result<usize> {
+    if !extract_archive.destination_dir.as_os_str().is_empty() {
+        ensure_safe_relative_path(
+            extract_archive.destination_dir.to_string_lossy().as_ref(),
+            "ATLauncher extract destination",
+        )?;
+    }
+    let destination_root = profile_root.join(&extract_archive.destination_dir);
+    ensure!(
+        path_starts_with(&destination_root, profile_root),
+        "ATLauncher extract destination is outside the profile directory"
+    );
+    let file = fs::File::open(&extract_archive.archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut copied = 0usize;
+    let strip_prefix = extract_archive
+        .strip_prefix
+        .as_deref()
+        .map(|prefix| format!("{}/", prefix.trim_end_matches('/')));
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let raw_name = entry.name().replace('\\', "/");
+        if raw_name.is_empty() {
+            continue;
+        }
+        let relative = if let Some(strip_prefix) = strip_prefix.as_deref() {
+            if raw_name == strip_prefix.trim_end_matches('/') {
+                continue;
+            }
+            match raw_name.strip_prefix(strip_prefix) {
+                Some(relative) => relative,
+                None => continue,
+            }
+        } else {
+            raw_name.as_str()
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        ensure_safe_relative_path(relative.trim_end_matches('/'), "ATLauncher extract path")?;
+        let destination = destination_root.join(relative);
+        ensure!(
+            path_starts_with(&destination, &destination_root),
+            "ATLauncher extract entry is outside the profile directory"
+        );
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut output = fs::File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+fn atlauncher_file_md5(file: &AtlauncherModFileConfig) -> Result<Option<String>> {
+    let md5 = file
+        .md5
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    if let Some(md5) = md5.as_deref() {
+        ensure!(
+            md5.len() == 32 && md5.chars().all(|character| character.is_ascii_hexdigit()),
+            "ATLauncher file '{}' MD5 hash must be a 32-character hex value",
+            file.name
+        );
+    }
+    Ok(md5)
+}
+
+fn atlauncher_extract_destination_dir(extract_to: Option<&str>) -> Result<PathBuf> {
+    let extract_to = extract_to
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("root");
+    if matches!(extract_to, "/" | "." | "root" | "minecraft") {
+        return Ok(PathBuf::new());
+    }
+    atlauncher_mod_type_relative_dir(Some(extract_to))?
+        .ok_or_else(|| anyhow!("ATLauncher extract target '{extract_to}' is server-only"))
+}
+
+fn atlauncher_extract_strip_prefix(extract_folder: Option<&str>) -> Result<Option<String>> {
+    let Some(extract_folder) = extract_folder
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "/" && *value != ".")
+    else {
+        return Ok(None);
+    };
+    let relative = extract_folder.trim_matches('/');
+    ensure_safe_relative_path(relative, "ATLauncher extract folder")?;
+    Ok(Some(relative.to_owned()))
+}
+
+fn atlauncher_download_url(
+    download_mode: &str,
+    raw_url: Option<&str>,
+    file_name: &str,
+) -> Result<String> {
+    let raw_url = raw_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("ATLauncher file '{file_name}' is missing a download URL"))?;
+    let url = if raw_url.starts_with("https://") {
+        raw_url.to_owned()
+    } else if raw_url.starts_with("http://") {
+        return Err(anyhow!("ATLauncher file '{file_name}' URL must use HTTPS"));
+    } else if download_mode.eq_ignore_ascii_case("server") {
+        let relative = raw_url.trim_start_matches('/');
+        ensure_safe_relative_path(relative, "ATLauncher server file URL")?;
+        format!("{ATLAUNCHER_DOWNLOAD_BASE_URL}/{relative}")
+    } else if download_mode.eq_ignore_ascii_case("direct") {
+        return Err(anyhow!(
+            "ATLauncher direct file '{file_name}' must provide a full HTTPS URL"
+        ));
+    } else {
+        return Err(anyhow!(
+            "ATLauncher file '{file_name}' uses unsupported download mode '{download_mode}'"
+        ));
+    };
+    validate_http_download_url(&url)?;
+    ensure!(
+        url.starts_with("https://"),
+        "ATLauncher file '{file_name}' URL must use HTTPS"
+    );
+    Ok(url)
+}
+
+fn atlauncher_mod_type_relative_dir(mod_type: Option<&str>) -> Result<Option<PathBuf>> {
+    let mod_type = mod_type.unwrap_or("mods").trim().to_ascii_lowercase();
+    let relative = match mod_type.as_str() {
+        "mods" => Some(PathBuf::from("mods")),
+        "coremods" => Some(PathBuf::from("coremods")),
+        "root" | "minecraft" => Some(PathBuf::new()),
+        "config" | "configs" => Some(PathBuf::from("config")),
+        "resourcepack" | "resourcepacks" => Some(PathBuf::from("resourcepacks")),
+        "texturepack" | "texturepacks" => Some(PathBuf::from("texturepacks")),
+        "shaderpack" | "shaderpacks" => Some(PathBuf::from("shaderpacks")),
+        "maps" | "saves" => Some(PathBuf::from("saves")),
+        "server" | "servermods" => None,
+        "extract" | "jar" | "forge" | "mcpc" => {
+            return Err(anyhow!(
+                "ATLauncher required file type '{mod_type}' cannot be installed automatically"
+            ))
+        }
+        other => {
+            return Err(anyhow!(
+                "ATLauncher required file type '{other}' is not supported"
+            ))
+        }
+    };
+    Ok(relative)
+}
+
+fn ftb_search_result_from_pack_json(json_text: &str) -> Result<DiscoverModpackSearchResult> {
+    let pack = serde_json::from_str::<FtbModpackResponse>(json_text)?;
+    let latest = pack.versions.iter().max_by_key(|version| {
+        (
+            version.updated.unwrap_or_default(),
+            version.id.unwrap_or_default(),
+        )
+    });
+    let game_versions = latest
+        .into_iter()
+        .flat_map(|version| version.targets.iter())
+        .filter(|target| target.target_type.as_deref() == Some("game"))
+        .filter_map(|target| target.version.clone())
+        .collect::<Vec<_>>();
+    let mut loaders = latest
+        .into_iter()
+        .flat_map(|version| version.targets.iter())
+        .filter(|target| target.target_type.as_deref() == Some("modloader"))
+        .filter_map(|target| target.name.clone())
+        .collect::<Vec<_>>();
+    loaders.sort();
+    loaders.dedup();
+    let icon_url = pack
+        .art
+        .iter()
+        .find(|art| art.art_type.as_deref() == Some("square"))
+        .or_else(|| pack.art.first())
+        .and_then(|art| art.url.clone());
+    Ok(DiscoverModpackSearchResult {
+        provider: "ftb".to_owned(),
+        project_id: pack.id.to_string(),
+        slug: pack.id.to_string(),
+        title: pack.name,
+        description: pack.synopsis.unwrap_or_else(|| "FTB modpack.".to_owned()),
+        author: pack
+            .authors
+            .first()
+            .map(|author| author.name.clone())
+            .unwrap_or_else(|| "FTB".to_owned()),
+        icon_url,
+        downloads: pack.installs.unwrap_or_default(),
+        follows: pack.plays.unwrap_or_default(),
+        game_versions,
+        loaders,
+        latest_version_id: latest
+            .and_then(|version| version.id)
+            .map(|id| id.to_string()),
+        install_available: latest.and_then(|version| version.id).is_some(),
+        install_note: None,
+    })
+}
+
+fn latest_ftb_version_id_from_pack_json(json_text: &str) -> Result<String> {
+    let pack = serde_json::from_str::<FtbModpackResponse>(json_text)?;
+    pack.versions
+        .into_iter()
+        .max_by_key(|version| {
+            (
+                version.updated.unwrap_or_default(),
+                version.id.unwrap_or_default(),
+            )
+        })
+        .and_then(|version| version.id)
+        .map(|id| id.to_string())
+        .ok_or_else(|| anyhow!("FTB pack has no installable versions"))
+}
+
+fn ftb_legacy_search_results_from_xml(
+    xml_text: &str,
+    feed_kind: &str,
+    private_code: Option<&str>,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    if feed_kind == "private" {
+        ensure!(
+            private_code
+                .map(|code| !code.trim().is_empty())
+                .unwrap_or(false),
+            "FTB private pack code is required"
+        );
+    }
+    let mut reader = XmlReader::from_str(xml_text);
+    reader.config_mut().trim_text(true);
+    let mut results = Vec::new();
+    loop {
+        match reader.read_event()? {
+            XmlEvent::Start(event) | XmlEvent::Empty(event)
+                if event.name().as_ref() == b"modpack" =>
+            {
+                let mut name = String::new();
+                let mut current_version = String::new();
+                let mut minecraft_version = String::new();
+                let mut description = String::new();
+                let mut author = String::new();
+                let mut dir = String::new();
+                let mut file = String::new();
+                let mut old_versions = String::new();
+                for attribute in event.attributes() {
+                    let attribute = attribute?;
+                    let key = attribute.key.as_ref();
+                    let value = attribute
+                        .decode_and_unescape_value(reader.decoder())?
+                        .into_owned();
+                    match key {
+                        b"name" => name = value,
+                        b"version" => current_version = value,
+                        b"mcVersion" => minecraft_version = value,
+                        b"description" => description = value,
+                        b"author" => author = value,
+                        b"dir" => dir = value,
+                        b"url" => file = value,
+                        b"oldVersions" => old_versions = value,
+                        _ => {}
+                    }
+                }
+                if name.trim().is_empty()
+                    || current_version.trim().is_empty()
+                    || minecraft_version.trim().is_empty()
+                    || dir.trim().is_empty()
+                    || file.trim().is_empty()
+                {
+                    continue;
+                }
+                if !looks_like_minecraft_version(&minecraft_version) {
+                    continue;
+                }
+                ensure_safe_path_segment(&dir, "FTB Legacy pack directory")?;
+                ensure_safe_path_segment(&file, "FTB Legacy pack file")?;
+                let latest_version = ftb_legacy_latest_version(&current_version, &old_versions);
+                ensure_safe_path_segment(&latest_version, "FTB Legacy pack version")?;
+                let feed_label = match feed_kind {
+                    "private" => "Private FTB Legacy",
+                    "third-party" => "Third-party FTB Legacy",
+                    _ => "FTB Legacy",
+                };
+                let provider = if feed_kind == "private" {
+                    "ftb_private"
+                } else {
+                    "ftb_legacy"
+                };
+                let project_id = if feed_kind == "private" {
+                    format!(
+                        "private:{}:{dir}:{file}",
+                        private_code
+                            .map(str::trim)
+                            .filter(|code| !code.is_empty())
+                            .unwrap_or_default()
+                    )
+                } else {
+                    format!("{feed_kind}:{dir}:{file}")
+                };
+                results.push(DiscoverModpackSearchResult {
+                    provider: provider.to_owned(),
+                    project_id,
+                    slug: dir,
+                    title: name,
+                    description: ftb_legacy_description(&description, feed_label),
+                    author: if author.trim().is_empty() {
+                        feed_label.to_owned()
+                    } else {
+                        author
+                    },
+                    icon_url: None,
+                    downloads: 0,
+                    follows: 0,
+                    game_versions: vec![minecraft_version],
+                    loaders: Vec::new(),
+                    latest_version_id: Some(latest_version),
+                    install_available: true,
+                    install_note: Some(
+                        "Installs common FTB Legacy zips automatically. Older jar-mod-only packs may still need a later compatibility pass.".to_owned(),
+                    ),
+                });
+            }
+            XmlEvent::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(results)
+}
+
+fn ftb_legacy_latest_version(current_version: &str, old_versions: &str) -> String {
+    old_versions
+        .split(';')
+        .map(str::trim)
+        .find(|version| !version.is_empty())
+        .unwrap_or_else(|| current_version.trim())
+        .to_owned()
+}
+
+fn ftb_legacy_description(description: &str, feed_label: &str) -> String {
+    let cleaned = description
+        .replace("<br>", " ")
+        .replace("<br/>", " ")
+        .replace("<br />", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        format!("{feed_label} modpack.")
+    } else {
+        cleaned
+    }
+}
+
+fn technic_search_results_from_json(
+    json_text: &str,
+    limit: usize,
+) -> Result<Vec<DiscoverModpackSearchResult>> {
+    let value = serde_json::from_str::<Value>(json_text)?;
+    let mut results = Vec::new();
+    if let Some(items) = value.get("modpacks").and_then(Value::as_array) {
+        for item in items {
+            if let Some(result) = technic_search_result_from_value(item)? {
+                results.push(result);
+            }
+        }
+    } else if value.get("error").is_none() {
+        if let Some(result) = technic_single_pack_result_from_value(&value)? {
+            results.push(result);
+        }
+    }
+    results.truncate(limit.clamp(1, 24));
+    Ok(results)
+}
+
+fn technic_search_result_from_value(value: &Value) -> Result<Option<DiscoverModpackSearchResult>> {
+    let Some(slug) = value
+        .get("slug")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty() && *slug != "vanilla")
+    else {
+        return Ok(None);
+    };
+    ensure_safe_path_segment(slug, "Technic modpack slug")?;
+    let title = value
+        .get("name")
+        .or_else(|| value.get("displayName"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(slug)
+        .to_owned();
+    Ok(Some(DiscoverModpackSearchResult {
+        provider: "technic".to_owned(),
+        project_id: slug.to_owned(),
+        slug: slug.to_owned(),
+        title,
+        description: "Technic modpack.".to_owned(),
+        author: "Technic".to_owned(),
+        icon_url: value
+            .get("iconUrl")
+            .or_else(|| value.get("icon").and_then(|icon| icon.get("url")))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| url.starts_with("https://"))
+            .map(str::to_owned),
+        downloads: 0,
+        follows: 0,
+        game_versions: Vec::new(),
+        loaders: Vec::new(),
+        latest_version_id: None,
+        install_available: false,
+        install_note: Some(
+            "Technic browsing is live. Installation needs reliable Technic metadata/download resolution first.".to_owned(),
+        ),
+    }))
+}
+
+fn technic_single_pack_result_from_value(
+    value: &Value,
+) -> Result<Option<DiscoverModpackSearchResult>> {
+    let Some(slug) = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty() && *slug != "vanilla")
+    else {
+        return Ok(None);
+    };
+    ensure_safe_path_segment(slug, "Technic modpack slug")?;
+    let title = value
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(slug)
+        .to_owned();
+    let game_versions = value
+        .get("minecraft")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(|version| vec![version.to_owned()])
+        .unwrap_or_default();
+    let archive_url = value
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| url.starts_with("https://"));
+    let has_solder = value
+        .get("solder")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .is_some();
+    let install_available = archive_url.is_some() || has_solder;
+    Ok(Some(DiscoverModpackSearchResult {
+        provider: "technic".to_owned(),
+        project_id: slug.to_owned(),
+        slug: slug.to_owned(),
+        title,
+        description: value
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .unwrap_or("Technic modpack.")
+            .to_owned(),
+        author: value
+            .get("user")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|author| !author.is_empty())
+            .unwrap_or("Technic")
+            .to_owned(),
+        icon_url: value
+            .get("icon")
+            .and_then(|icon| icon.get("url"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| url.starts_with("https://"))
+            .map(str::to_owned),
+        downloads: value
+            .get("installs")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        follows: value
+            .get("runs")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        game_versions,
+        loaders: Vec::new(),
+        latest_version_id: value
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .map(str::to_owned),
+        install_available,
+        install_note: if install_available {
+            if has_solder {
+                Some(
+                    "Installs Technic Solder packs automatically from the selected build."
+                        .to_owned(),
+                )
+            } else {
+                Some("Installs direct Technic zip packs automatically.".to_owned())
+            }
+        } else {
+            Some(
+                "Technic browsing is live. This pack does not expose a direct zip download URL."
+                    .to_owned(),
+            )
+        },
+    }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TechnicModpackMetadata {
+    slug: String,
+    name: String,
+    minecraft_version: String,
+    pack_version: Option<String>,
+    archive_url: Option<String>,
+    solder_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TechnicSolderDownloadPlan {
+    name: String,
+    minecraft_version: String,
+    pack_version: String,
+    download_plan: DownloadPlan,
+    module_archive_paths: Vec<PathBuf>,
+}
+
+fn technic_metadata_from_json(json_text: &str) -> Result<TechnicModpackMetadata> {
+    let value = serde_json::from_str::<Value>(json_text)?;
+    ensure!(
+        value.get("error").is_none(),
+        "Technic metadata response reported an error"
+    );
+    let slug = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .ok_or_else(|| anyhow!("Technic metadata is missing a slug"))?;
+    ensure_safe_path_segment(slug, "Technic modpack slug")?;
+    let name = value
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(slug)
+        .to_owned();
+    let minecraft_version = value
+        .get("minecraft")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| anyhow!("Technic metadata is missing a Minecraft version"))?
+        .to_owned();
+    let archive_url = value
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned);
+    let solder_url = value
+        .get("solder")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned);
+    Ok(TechnicModpackMetadata {
+        slug: slug.to_owned(),
+        name,
+        minecraft_version,
+        pack_version: value
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .map(str::to_owned),
+        archive_url,
+        solder_url,
+    })
+}
+
+async fn fetch_technic_solder_download_plan(
+    metadata: &TechnicModpackMetadata,
+    solder_url: &str,
+    archive_root: &Path,
+    archive_id: &str,
+    request: &InstallDiscoveredModpackRequest,
+) -> Result<TechnicSolderDownloadPlan> {
+    ensure!(
+        solder_url.starts_with("https://"),
+        "Technic Solder API URL must use HTTPS"
+    );
+    let base = reqwest::Url::parse(solder_url)?;
+    ensure!(
+        base.scheme() == "https",
+        "Technic Solder API URL must use HTTPS"
+    );
+    let pack_url = base.join(&format!("modpack/{}", metadata.slug))?;
+    let response = metadata_http_client()
+        .get(pack_url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Technic Solder pack request failed with HTTP {status}"
+    );
+    let pack = serde_json::from_str::<Value>(&body)?;
+    let pack_version = request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .or_else(|| {
+            pack.get("recommended")
+                .and_then(Value::as_str)
+                .map(str::trim)
+        })
+        .or_else(|| pack.get("latest").and_then(Value::as_str).map(str::trim))
+        .or(metadata.pack_version.as_deref())
+        .ok_or_else(|| anyhow!("Technic Solder pack is missing a recommended build"))?;
+    ensure_safe_path_segment(pack_version, "Technic Solder build")?;
+    let build_url = base.join(&format!("modpack/{}/{}", metadata.slug, pack_version))?;
+    let response = metadata_http_client()
+        .get(build_url)
+        .header("User-Agent", THEBOYS_USER_AGENT)
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await?;
+    ensure!(
+        status == 200,
+        "Technic Solder build request failed with HTTP {status}"
+    );
+    technic_solder_download_plan_from_build_json(
+        metadata,
+        pack.get("display_name")
+            .and_then(Value::as_str)
+            .unwrap_or(metadata.name.as_str()),
+        pack_version,
+        archive_root,
+        archive_id,
+        &body,
+    )
+}
+
+fn technic_solder_download_plan_from_build_json(
+    metadata: &TechnicModpackMetadata,
+    display_name: &str,
+    pack_version: &str,
+    archive_root: &Path,
+    archive_id: &str,
+    json_text: &str,
+) -> Result<TechnicSolderDownloadPlan> {
+    let value = serde_json::from_str::<Value>(json_text)?;
+    let minecraft_version = value
+        .get("minecraft")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .unwrap_or(metadata.minecraft_version.as_str())
+        .to_owned();
+    ensure!(
+        looks_like_minecraft_version(&minecraft_version),
+        "Technic Solder pack has unsupported Minecraft version '{}'",
+        minecraft_version
+    );
+    let modules = value
+        .get("mods")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Technic Solder build is missing module downloads"))?;
+    ensure!(!modules.is_empty(), "Technic Solder build has no modules");
+    let mut items = Vec::new();
+    let mut module_archive_paths = Vec::new();
+    for module in modules {
+        let module_name = module
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow!("Technic Solder module is missing a name"))?;
+        ensure_safe_path_segment(module_name, "Technic Solder module name")?;
+        let module_version = module
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| anyhow!("Technic Solder module '{module_name}' is missing a version"))?;
+        ensure_safe_path_segment(module_version, "Technic Solder module version")?;
+        let url = module
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| anyhow!("Technic Solder module '{module_name}' is missing a URL"))?;
+        validate_http_download_url(url)?;
+        ensure!(
+            url.starts_with("https://"),
+            "Technic Solder module '{module_name}' URL must use HTTPS"
+        );
+        let md5 = module
+            .get("md5")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
+            .map(|hash| hash.to_ascii_lowercase())
+            .ok_or_else(|| {
+                anyhow!("Technic Solder module '{module_name}' is missing an MD5 hash")
+            })?;
+        ensure!(
+            md5.len() == 32 && md5.chars().all(|character| character.is_ascii_hexdigit()),
+            "Technic Solder module '{module_name}' MD5 hash must be a 32-character hex value"
+        );
+        let file_name = filename_from_download_url(url)
+            .unwrap_or_else(|_| format!("{module_name}-{module_version}.zip"));
+        ensure_safe_path_segment(&file_name, "Technic Solder module file name")?;
+        let destination = archive_root.join("modules").join(&file_name);
+        module_archive_paths.push(destination.clone());
+        items.push(DownloadItem {
+            id: format!("technic-solder-{module_name}-{module_version}"),
+            kind: DownloadKind::PackFile,
+            url: url.to_owned(),
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            md5: Some(md5),
+            murmur2: None,
+            size: module.get("filesize").and_then(Value::as_u64),
+            destination: display_path(&destination),
+        });
+    }
+    Ok(TechnicSolderDownloadPlan {
+        name: display_name.trim().to_owned(),
+        minecraft_version,
+        pack_version: pack_version.to_owned(),
+        download_plan: DownloadPlan {
+            version_id: format!("technic-solder-{archive_id}"),
+            items,
+        },
+        module_archive_paths,
+    })
+}
+
+fn technic_modloader_from_download_plan(
+    archive_path: &Path,
+    download_plan: &TechnicModpackDownloadPlan,
+) -> Result<(Option<String>, ModLoader, Option<String>)> {
+    match download_plan.source_kind {
+        TechnicModpackDownloadKind::DirectZip => technic_modloader_from_archive(archive_path),
+        TechnicModpackDownloadKind::SolderModules => {
+            for module_path in &download_plan.module_archive_paths {
+                if let Ok(loader) = technic_modloader_from_archive(module_path) {
+                    return Ok(loader);
+                }
+            }
+            Err(anyhow!(
+                "Technic Solder modules did not include supported launch metadata"
+            ))
+        }
+    }
+}
+
+fn technic_modloader_from_archive(
+    archive_path: &Path,
+) -> Result<(Option<String>, ModLoader, Option<String>)> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    if let Ok(mut version_entry) = archive.by_name("bin/version.json") {
+        let mut body = String::new();
+        version_entry.read_to_string(&mut body)?;
+        return technic_modloader_from_version_json(&body);
+    }
+    if let Ok(mut modpack_jar_entry) = archive.by_name("bin/modpack.jar") {
+        let mut bytes = Vec::new();
+        modpack_jar_entry.read_to_end(&mut bytes)?;
+        let mut jar = zip::ZipArchive::new(Cursor::new(bytes))?;
+        if let Ok(mut version_entry) = jar.by_name("version.json") {
+            let mut body = String::new();
+            version_entry.read_to_string(&mut body)?;
+            return technic_modloader_from_version_json(&body);
+        }
+        return technic_modloader_from_legacy_modpack_jar(&mut jar);
+    }
+    Err(anyhow!(
+        "Technic archive is missing bin/version.json; only direct zip packs with standard launch metadata are supported right now"
+    ))
+}
+
+fn technic_modloader_from_version_json(
+    json_text: &str,
+) -> Result<(Option<String>, ModLoader, Option<String>)> {
+    let value = serde_json::from_str::<Value>(json_text)?;
+    let minecraft_version = value
+        .get("inheritsFrom")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned);
+    let libraries = value
+        .get("libraries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Technic version.json is missing libraries"))?;
+    for library in libraries {
+        let Some(name) = library.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(version) = forge_loader_version_from_maven_coordinate(name) {
+            ensure_safe_path_segment(&version, "Technic Forge version")?;
+            return Ok((minecraft_version, ModLoader::Forge, Some(version)));
+        }
+        if let Some(version) = name.strip_prefix("net.fabricmc:fabric-loader:") {
+            ensure_safe_path_segment(version, "Technic Fabric version")?;
+            return Ok((
+                minecraft_version,
+                ModLoader::Fabric,
+                Some(version.to_owned()),
+            ));
+        }
+        if let Some(version) = name.strip_prefix("org.quiltmc:quilt-loader:") {
+            ensure_safe_path_segment(version, "Technic Quilt version")?;
+            return Ok((
+                minecraft_version,
+                ModLoader::Quilt,
+                Some(version.to_owned()),
+            ));
+        }
+    }
+    Err(anyhow!(
+        "Technic version.json did not declare a supported modloader"
+    ))
+}
+
+fn technic_modloader_from_legacy_modpack_jar<R: Read + std::io::Seek>(
+    jar: &mut zip::ZipArchive<R>,
+) -> Result<(Option<String>, ModLoader, Option<String>)> {
+    let mut forge_version_properties = match jar.by_name("forgeversion.properties") {
+        Ok(entry) => entry,
+        Err(_) => {
+            return Err(anyhow!(
+                "Technic legacy jar-mod pack is missing forgeversion.properties; this launcher cannot safely install that older jar patch format"
+            ))
+        }
+    };
+    let mut body = String::new();
+    forge_version_properties.read_to_string(&mut body)?;
+    let major = property_value(&body, "forge.major.number").ok_or_else(|| {
+        anyhow!("Technic legacy forgeversion.properties is missing forge.major.number")
+    })?;
+    let minor = property_value(&body, "forge.minor.number").ok_or_else(|| {
+        anyhow!("Technic legacy forgeversion.properties is missing forge.minor.number")
+    })?;
+    let revision = property_value(&body, "forge.revision.number").ok_or_else(|| {
+        anyhow!("Technic legacy forgeversion.properties is missing forge.revision.number")
+    })?;
+    let build = property_value(&body, "forge.build.number").ok_or_else(|| {
+        anyhow!("Technic legacy forgeversion.properties is missing forge.build.number")
+    })?;
+    let loader_version = format!("{major}.{minor}.{revision}.{build}");
+    ensure_safe_path_segment(&loader_version, "Technic legacy Forge version")?;
+    Ok((None, ModLoader::Forge, Some(loader_version)))
+}
+
+fn property_value(properties: &str, key: &str) -> Option<String> {
+    properties.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            return None;
+        }
+        let (candidate, value) = line.split_once('=').or_else(|| line.split_once(':'))?;
+        if candidate.trim() == key {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+        None
+    })
+}
+
+fn extract_technic_zip_root_to_profile(archive_path: &Path, profile_root: &Path) -> Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut copied = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let raw_name = entry.name().replace('\\', "/");
+        if raw_name.is_empty() {
+            continue;
+        }
+        ensure_safe_relative_path(raw_name.trim_end_matches('/'), "Technic archive path")?;
+        let destination = profile_root.join(&raw_name);
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "Technic archive destination is outside the profile directory"
+        );
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut output = fs::File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+            copied += 1;
+        }
+    }
+    ensure!(copied > 0, "Technic archive did not contain any files");
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FtbLegacyModpackMetadata {
+    name: String,
+    feed_kind: String,
+    directory: String,
+    file_name: String,
+    minecraft_version: String,
+    pack_version: String,
+}
+
+async fn fetch_ftb_legacy_modpack_metadata(
+    request: &InstallDiscoveredModpackRequest,
+) -> Result<FtbLegacyModpackMetadata> {
+    let parsed_project_id = parse_ftb_legacy_project_id(&request.project_id);
+    let mut metadata = match parsed_project_id {
+        Ok((feed_kind, private_code, directory, file_name)) => {
+            let feed_url = match feed_kind.as_str() {
+                "public" => format!("{FTB_LEGACY_CDN_BASE_URL}/static/modpacks.xml"),
+                "third-party" => format!("{FTB_LEGACY_CDN_BASE_URL}/static/thirdparty.xml"),
+                "private" => {
+                    let private_code = private_code
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("FTB private pack code is required"))?;
+                    format!("{FTB_LEGACY_CDN_BASE_URL}/static/privatepacks/{private_code}.xml")
+                }
+                other => return Err(anyhow!("unsupported FTB Legacy feed '{other}'")),
+            };
+            let response = metadata_http_client()
+                .get(feed_url)
+                .header("User-Agent", THEBOYS_USER_AGENT)
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache")
+                .send()
+                .await?;
+            let status = response.status().as_u16();
+            let body = response.text().await?;
+            ensure!(
+                status == 200,
+                "FTB Legacy feed request failed with HTTP {status}"
+            );
+            ftb_legacy_metadata_from_xml(&body, &feed_kind, &directory, &file_name)?.ok_or_else(
+                || {
+                    anyhow!(
+                        "FTB Legacy pack '{}' was not found in the live feed",
+                        directory
+                    )
+                },
+            )?
+        }
+        Err(_parse_error)
+            if request.provider.trim() == "ftb_private" && !request.project_id.contains(':') =>
+        {
+            let private_code = request.project_id.trim();
+            ensure_safe_path_segment(private_code, "FTB private pack code")?;
+            let feed_url =
+                format!("{FTB_LEGACY_CDN_BASE_URL}/static/privatepacks/{private_code}.xml");
+            let response = metadata_http_client()
+                .get(feed_url)
+                .header("User-Agent", THEBOYS_USER_AGENT)
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache")
+                .send()
+                .await?;
+            let status = response.status().as_u16();
+            let body = response.text().await?;
+            ensure!(
+                status == 200,
+                "FTB private pack request failed with HTTP {status}"
+            );
+            let mut results =
+                ftb_legacy_search_results_from_xml(&body, "private", Some(private_code))?;
+            if let Some(name) = request
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                results.sort_by_key(|result| result.title != name);
+            }
+            let result = results.into_iter().next().ok_or_else(|| {
+                anyhow!("FTB private pack code did not return any compatible packs")
+            })?;
+            let (_, _, directory, file_name) = parse_ftb_legacy_project_id(&result.project_id)?;
+            FtbLegacyModpackMetadata {
+                name: result.title,
+                feed_kind: "private".to_owned(),
+                directory,
+                file_name,
+                minecraft_version: result.game_versions.first().cloned().ok_or_else(|| {
+                    anyhow!("FTB private pack did not include a Minecraft version")
+                })?,
+                pack_version: result
+                    .latest_version_id
+                    .ok_or_else(|| anyhow!("FTB private pack did not include a pack version"))?,
+            }
+        }
+        Err(parse_error) => return Err(parse_error),
+    };
+    if let Some(version) = request
+        .version_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    {
+        ensure_safe_path_segment(version, "FTB Legacy pack version")?;
+        metadata.pack_version = version.to_owned();
+    }
+    Ok(metadata)
+}
+
+fn parse_ftb_legacy_project_id(
+    project_id: &str,
+) -> Result<(String, Option<String>, String, String)> {
+    let parts = project_id.split(':').collect::<Vec<_>>();
+    ensure!(
+        parts.len() == 3 || parts.len() == 4,
+        "FTB Legacy project id must include feed, directory, and file"
+    );
+    let feed_kind = parts[0].trim();
+    ensure!(
+        matches!(feed_kind, "public" | "third-party" | "private"),
+        "unsupported FTB Legacy feed '{feed_kind}'"
+    );
+    ensure!(
+        (feed_kind == "private" && parts.len() == 4)
+            || (feed_kind != "private" && parts.len() == 3),
+        "FTB private packs must include feed, code, directory, and file"
+    );
+    let (private_code, directory, file_name) = if feed_kind == "private" {
+        let code = parts[1].trim();
+        ensure_safe_path_segment(code, "FTB private pack code")?;
+        (Some(code.to_owned()), parts[2].trim(), parts[3].trim())
+    } else {
+        (None, parts[1].trim(), parts[2].trim())
+    };
+    ensure_safe_path_segment(directory, "FTB Legacy pack directory")?;
+    ensure_safe_path_segment(file_name, "FTB Legacy pack file")?;
+    Ok((
+        feed_kind.to_owned(),
+        private_code,
+        directory.to_owned(),
+        file_name.to_owned(),
+    ))
+}
+
+fn ftb_legacy_metadata_from_xml(
+    xml_text: &str,
+    feed_kind: &str,
+    expected_directory: &str,
+    expected_file_name: &str,
+) -> Result<Option<FtbLegacyModpackMetadata>> {
+    let mut reader = XmlReader::from_str(xml_text);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event()? {
+            XmlEvent::Start(event) | XmlEvent::Empty(event)
+                if event.name().as_ref() == b"modpack" =>
+            {
+                let mut name = String::new();
+                let mut current_version = String::new();
+                let mut minecraft_version = String::new();
+                let mut directory = String::new();
+                let mut file_name = String::new();
+                let mut old_versions = String::new();
+                for attribute in event.attributes() {
+                    let attribute = attribute?;
+                    let value = attribute
+                        .decode_and_unescape_value(reader.decoder())?
+                        .into_owned();
+                    match attribute.key.as_ref() {
+                        b"name" => name = value,
+                        b"version" => current_version = value,
+                        b"mcVersion" => minecraft_version = value,
+                        b"dir" => directory = value,
+                        b"url" => file_name = value,
+                        b"oldVersions" => old_versions = value,
+                        _ => {}
+                    }
+                }
+                if directory == expected_directory && file_name == expected_file_name {
+                    ensure!(
+                        !name.trim().is_empty(),
+                        "FTB Legacy modpack name is required"
+                    );
+                    ensure!(
+                        looks_like_minecraft_version(&minecraft_version),
+                        "FTB Legacy pack has unsupported Minecraft version '{}'",
+                        minecraft_version
+                    );
+                    ensure_safe_path_segment(&directory, "FTB Legacy pack directory")?;
+                    ensure_safe_path_segment(&file_name, "FTB Legacy pack file")?;
+                    let pack_version = ftb_legacy_latest_version(&current_version, &old_versions);
+                    ensure_safe_path_segment(&pack_version, "FTB Legacy pack version")?;
+                    return Ok(Some(FtbLegacyModpackMetadata {
+                        name,
+                        feed_kind: feed_kind.to_owned(),
+                        directory,
+                        file_name,
+                        minecraft_version,
+                        pack_version,
+                    }));
+                }
+            }
+            XmlEvent::Eof => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+fn ftb_legacy_modloader_from_archive(archive_path: &Path) -> Result<(ModLoader, Option<String>)> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    if archive.by_name("instMods/").is_ok() {
+        return Err(anyhow!(
+            "FTB Legacy archives with jar mods cannot be installed automatically"
+        ));
+    }
+    let mut pack_json = match archive.by_name("minecraft/pack.json") {
+        Ok(entry) => entry,
+        Err(_) => {
+            return Err(anyhow!(
+                "FTB Legacy archive is missing minecraft/pack.json; older jar-mod-only packs cannot be installed automatically"
+            ))
+        }
+    };
+    let mut body = String::new();
+    pack_json.read_to_string(&mut body)?;
+    let value = serde_json::from_str::<Value>(&body)?;
+    let libraries = value
+        .get("libraries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("FTB Legacy pack.json is missing libraries"))?;
+    for library in libraries {
+        let Some(name) = library.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(version) = forge_loader_version_from_maven_coordinate(name) {
+            return Ok((ModLoader::Forge, Some(version)));
+        }
+    }
+    Err(anyhow!(
+        "FTB Legacy pack.json did not declare a Forge library this launcher can install automatically"
+    ))
+}
+
+fn forge_loader_version_from_maven_coordinate(coordinate: &str) -> Option<String> {
+    let mut parts = coordinate.split(':');
+    let group = parts.next()?.trim();
+    let artifact = parts.next()?.trim();
+    let version = parts.next()?.trim();
+    if group != "net.minecraftforge" {
+        return None;
+    }
+    let loader_version = match artifact {
+        "forge" => version
+            .rsplit_once('-')
+            .map(|(_, loader)| loader)
+            .unwrap_or(version),
+        "minecraftforge" => version,
+        _ => return None,
+    };
+    if loader_version.is_empty() {
+        return None;
+    }
+    Some(loader_version.to_owned())
+}
+
+fn extract_ftb_legacy_minecraft_dir_from_archive(
+    archive_path: &Path,
+    profile_root: &Path,
+) -> Result<()> {
+    let file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut copied = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let raw_name = entry.name().replace('\\', "/");
+        let Some(relative) = raw_name.strip_prefix("minecraft/") else {
+            continue;
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        ensure_safe_relative_path(
+            relative.trim_end_matches('/'),
+            "FTB Legacy archive Minecraft path",
+        )?;
+        let destination = profile_root.join(relative);
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "FTB Legacy archive destination is outside the profile directory"
+        );
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut output = fs::File::create(&destination)?;
+            std::io::copy(&mut entry, &mut output)?;
+            copied += 1;
+        }
+    }
+    ensure!(
+        copied > 0,
+        "FTB Legacy archive did not contain a minecraft/ directory"
+    );
+    Ok(())
+}
+
+fn ftb_install_plan_from_version_json(
+    project_id: &str,
+    version_id: &str,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+    json_text: &str,
+) -> Result<FtbModpackInstallPlan> {
+    let version = serde_json::from_str::<FtbVersionManifestResponse>(json_text)?;
+    ensure!(
+        version.status.as_deref().unwrap_or("success") == "success",
+        "FTB version manifest did not report success"
+    );
+    let minecraft_version = ftb_target_version(&version.targets, "game", "minecraft")
+        .ok_or_else(|| anyhow!("FTB version is missing a Minecraft target"))?;
+    ensure!(
+        looks_like_minecraft_version(&minecraft_version),
+        "FTB pack has unsupported Minecraft version '{}'",
+        minecraft_version
+    );
+    let (loader, loader_version) = ftb_modloader_from_targets(&version.targets)?;
+    let name = requested_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("FTB Pack {project_id}"));
+    let profile = ProfileSummary {
+        id: format!("ftb-{project_id}"),
+        name,
+        loader,
+        game_version: minecraft_version,
+        installed_pack_version: Some(version_id.to_owned()),
+        last_played: None,
+        memory_mb: version
+            .specs
+            .as_ref()
+            .and_then(|specs| specs.recommended)
+            .or_else(|| version.specs.as_ref().and_then(|specs| specs.minimum))
+            .unwrap_or(default_settings().max_memory_mb),
+        jvm_args: Vec::new(),
+        resolution: None,
+        default_server: None,
+        java_runtime_override_path: None,
+    };
+    validate_profiles(std::slice::from_ref(&profile))?;
+    let profile_root = profile_data_dir(directories, &profile.id)?;
+    let file_download_plan =
+        build_ftb_modpack_file_download_plan(&version.files, &profile.id, &profile_root)?;
+    Ok(FtbModpackInstallPlan {
+        profile,
+        loader_version,
+        file_download_plan,
+    })
+}
+
+pub fn build_ftb_modpack_install_plan_from_version_json(
+    project_id: &str,
+    version_id: &str,
+    requested_name: Option<&str>,
+    directories: &LauncherDirectories,
+    json_text: &str,
+) -> Result<FtbModpackInstallPlan> {
+    ftb_install_plan_from_version_json(
+        project_id,
+        version_id,
+        requested_name,
+        directories,
+        json_text,
+    )
+}
+
+fn ftb_target_version(
+    targets: &[FtbTargetResponse],
+    target_type: &str,
+    name: &str,
+) -> Option<String> {
+    targets
+        .iter()
+        .find(|target| {
+            target.target_type.as_deref() == Some(target_type)
+                && target
+                    .name
+                    .as_deref()
+                    .map(|value| value.eq_ignore_ascii_case(name))
+                    .unwrap_or(false)
+        })
+        .and_then(|target| target.version.clone())
+}
+
+fn ftb_modloader_from_targets(
+    targets: &[FtbTargetResponse],
+) -> Result<(ModLoader, Option<String>)> {
+    let Some(target) = targets
+        .iter()
+        .find(|target| target.target_type.as_deref() == Some("modloader"))
+    else {
+        return Ok((ModLoader::Vanilla, None));
+    };
+    let loader_name = target
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let loader = match loader_name.as_str() {
+        "fabric" => ModLoader::Fabric,
+        "forge" => ModLoader::Forge,
+        "neoforge" => ModLoader::Neoforge,
+        "quilt" => ModLoader::Quilt,
+        other => return Err(anyhow!("unsupported FTB modloader '{other}'")),
+    };
+    if let Some(version) = target
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        ensure_safe_path_segment(version, "FTB modloader version")?;
+        Ok((loader, Some(version.to_owned())))
+    } else {
+        Ok((loader, None))
+    }
+}
+
+fn build_ftb_modpack_file_download_plan(
+    files: &[FtbVersionFileResponse],
+    profile_id: &str,
+    profile_root: &Path,
+) -> Result<DownloadPlan> {
+    let mut items = Vec::new();
+    for file in files {
+        if file.server_only || file.optional {
+            continue;
+        }
+        ensure!(
+            file.url.starts_with("https://"),
+            "FTB file '{}' URL must use HTTPS",
+            file.name
+        );
+        ensure_safe_path_segment(&file.name, "FTB file name")?;
+        let relative_dir = ftb_file_relative_dir(file.path.as_deref().unwrap_or("./"))?;
+        let relative_path = if relative_dir.is_empty() {
+            PathBuf::from(&file.name)
+        } else {
+            PathBuf::from(&relative_dir).join(&file.name)
+        };
+        let destination = profile_root.join(&relative_path);
+        ensure!(
+            path_starts_with(&destination, profile_root),
+            "FTB file destination is outside the profile directory"
+        );
+        items.push(DownloadItem {
+            id: format!("ftb-file-{}", file.id.unwrap_or(items.len() as u64)),
+            kind: DownloadKind::PackFile,
+            url: file.url.clone(),
+            sha1: file.sha1.clone(),
+            sha256: None,
+            sha512: None,
+            md5: None,
+            murmur2: None,
+            size: file.size,
+            destination: display_path(&destination),
+        });
+    }
+    Ok(DownloadPlan {
+        version_id: format!("{profile_id}-ftb-files"),
+        items,
+    })
+}
+
+fn ftb_file_relative_dir(raw_path: &str) -> Result<String> {
+    let normalized = raw_path
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    if normalized.is_empty() {
+        return Ok(String::new());
+    }
+    ensure_safe_relative_path(normalized, "FTB file path")?;
+    Ok(normalized.to_owned())
+}
+
+fn discover_result_matches_query(result: &DiscoverModpackSearchResult, query: &str) -> bool {
+    let haystack = format!(
+        "{} {} {} {}",
+        result.title, result.slug, result.description, result.author
+    )
+    .to_lowercase();
+    haystack.contains(query)
 }
 
 fn modrinth_archive_resolution_from_versions_json(
@@ -8096,6 +12193,42 @@ fn modrinth_archive_resolution_from_versions_json(
     Err(anyhow!(
         "Modrinth project '{project_id}' has no downloadable .mrpack versions"
     ))
+}
+
+fn modrinth_archive_resolution_from_version_json(
+    project_id: &str,
+    json_text: &str,
+) -> Result<ModrinthModpackArchiveResolution> {
+    let version = serde_json::from_str::<ModrinthVersionResponse>(json_text)?;
+    let selected = version
+        .files
+        .iter()
+        .find(|file| file.primary && file.filename.ends_with(".mrpack"))
+        .or_else(|| {
+            version
+                .files
+                .iter()
+                .find(|file| file.filename.ends_with(".mrpack"))
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Modrinth version '{}' has no downloadable .mrpack file",
+                version.id
+            )
+        })?;
+    ensure!(
+        selected.url.starts_with("https://"),
+        "Modrinth archive URL must use HTTPS"
+    );
+    ensure_safe_path_segment(&selected.filename, "Modrinth archive filename")?;
+    Ok(ModrinthModpackArchiveResolution {
+        project_id: project_id.to_owned(),
+        version_id: version.id.clone(),
+        version_name: version.name.unwrap_or_else(|| version.id.clone()),
+        file_name: selected.filename.clone(),
+        url: selected.url.clone(),
+        size: selected.size,
+    })
 }
 
 async fn fetch_modrinth_packwiz_metafile_download_item(
@@ -9675,6 +13808,12 @@ fn list_minecraft_accounts_from_paths(
     let active_account_id = document
         .active_account_id
         .as_deref()
+        .filter(|active_id| {
+            document
+                .accounts
+                .iter()
+                .any(|session| stored_session_account_id(session) == *active_id)
+        })
         .map(str::to_owned)
         .or_else(|| document.accounts.first().map(stored_session_account_id));
     Ok(document
@@ -10181,6 +14320,56 @@ fn archive_profile_at_path(path: &Path, request: ArchiveProfileRequest) -> Resul
     Ok(archived)
 }
 
+fn duplicate_profile_at_path(
+    path: &Path,
+    request: DuplicateProfileRequest,
+    directories: &LauncherDirectories,
+) -> Result<ProfileSummary> {
+    validate_duplicate_profile_request(&request)?;
+    let mut profiles = load_profiles_from_path(path)?;
+    let source = profiles
+        .iter()
+        .find(|profile| profile.id == request.id)
+        .cloned()
+        .ok_or_else(|| anyhow!("profile '{}' was not found", request.id))?;
+    let existing_names = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect::<Vec<_>>();
+    let requested_name = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let name = unique_profile_name(
+        requested_name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{} Copy", source.name)),
+        &existing_names,
+    );
+    let existing_ids = profiles
+        .iter()
+        .map(|profile| profile.id.as_str())
+        .collect::<Vec<_>>();
+    let id = unique_profile_id_from_name(&name, &existing_ids);
+    let mut duplicate = source.clone();
+    duplicate.id = id;
+    duplicate.name = name;
+    duplicate.installed_pack_version = None;
+    duplicate.last_played = None;
+
+    let copied_data_dir = copy_profile_data_dir(directories, &source.id, &duplicate.id)?;
+    profiles.push(duplicate.clone());
+    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    if let Err(error) = save_profiles_to_path(path, &profiles) {
+        if copied_data_dir {
+            let _ = remove_profile_data_dir(directories, &duplicate.id);
+        }
+        return Err(error);
+    }
+    Ok(duplicate)
+}
+
 fn delete_profile_at_path(
     path: &Path,
     request: DeleteProfileRequest,
@@ -10198,6 +14387,74 @@ fn delete_profile_at_path(
     validate_profiles(&profiles)?;
     save_profiles_to_path(path, &profiles)?;
     Ok(deleted)
+}
+
+fn copy_profile_data_dir(
+    directories: &LauncherDirectories,
+    source_profile_id: &str,
+    destination_profile_id: &str,
+) -> Result<bool> {
+    let source_dir = profile_data_dir(directories, source_profile_id)?;
+    let destination_dir = profile_data_dir(directories, destination_profile_id)?;
+    if !source_dir.exists() {
+        return Ok(false);
+    }
+    ensure!(
+        source_dir.is_dir(),
+        "profile data path is not a directory: {}",
+        display_path(&source_dir)
+    );
+    ensure!(
+        !destination_dir.exists(),
+        "duplicate profile data directory already exists: {}",
+        display_path(&destination_dir)
+    );
+    let profile_root = profile_data_root(directories);
+    fs::create_dir_all(&profile_root)?;
+    let canonical_profile_root = profile_root.canonicalize().with_context(|| {
+        format!(
+            "profile data root is missing: {}",
+            display_path(&profile_root)
+        )
+    })?;
+    let canonical_source_dir = source_dir.canonicalize().with_context(|| {
+        format!(
+            "profile data directory could not be resolved safely: {}",
+            display_path(&source_dir)
+        )
+    })?;
+    ensure!(
+        canonical_source_dir != canonical_profile_root
+            && path_starts_with(&canonical_source_dir, &canonical_profile_root),
+        "profile data directory is outside the managed profiles root"
+    );
+    copy_dir_recursive(&canonical_source_dir, &destination_dir)?;
+    Ok(true)
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        ensure!(
+            !file_type.is_symlink(),
+            "profile data copy does not support symbolic links: {}",
+            display_path(&entry.path())
+        );
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else {
+            bail!(
+                "profile data copy does not support special file: {}",
+                display_path(&entry.path())
+            );
+        }
+    }
+    Ok(())
 }
 
 fn remove_profile_data_dir(directories: &LauncherDirectories, profile_id: &str) -> Result<bool> {
@@ -10450,6 +14707,15 @@ fn validate_update_profile_request(request: &UpdateProfileRequest) -> Result<()>
 fn validate_archive_profile_request(request: &ArchiveProfileRequest) -> Result<()> {
     ensure!(!request.id.trim().is_empty(), "profile id is required");
     ensure_safe_path_segment(&request.id, "profile id")?;
+    Ok(())
+}
+
+fn validate_duplicate_profile_request(request: &DuplicateProfileRequest) -> Result<()> {
+    ensure!(!request.id.trim().is_empty(), "profile id is required");
+    ensure_safe_path_segment(&request.id, "profile id")?;
+    if let Some(name) = request.name.as_ref() {
+        ensure!(!name.trim().is_empty(), "profile name is required");
+    }
     Ok(())
 }
 
@@ -10708,9 +14974,24 @@ fn has_import_marker(path: &Path) -> bool {
         "mmc-pack.json",
         "manifest.json",
         "minecraftinstance.json",
+        "instance.json",
     ]
     .iter()
     .any(|marker| path.join(marker).is_file())
+}
+
+fn import_data_root(source_path: &Path) -> PathBuf {
+    let minecraft_dir = source_path.join(".minecraft");
+    if minecraft_dir.is_dir() && importable_profile_path_exists(&minecraft_dir) {
+        return minecraft_dir;
+    }
+    source_path.to_path_buf()
+}
+
+fn importable_profile_path_exists(source_path: &Path) -> bool {
+    IMPORTABLE_PROFILE_PATHS
+        .iter()
+        .any(|(_, relative_path)| source_path.join(relative_path).exists())
 }
 
 fn scan_official_minecraft(
@@ -10752,6 +15033,7 @@ fn import_id(kind: &ImportKind, path: &Path) -> String {
         ImportKind::Minecraft => "minecraft",
         ImportKind::Gdlauncher => "gdlauncher",
         ImportKind::Atlauncher => "atlauncher",
+        ImportKind::FtbApp => "ftb-app",
     };
     let path = display_path(path).to_ascii_lowercase();
     let slug = path
@@ -10818,7 +15100,13 @@ fn detect_import_game_version_from_mmc_pack(source_path: &Path) -> Option<String
 
 fn detect_import_loader_from_json_metadata(source_path: &Path) -> Option<ModLoader> {
     for metadata in read_import_json_metadata(source_path) {
-        for key in ["loader", "modLoader", "modloader", "loaderType"] {
+        for key in [
+            "loader",
+            "modLoader",
+            "modloader",
+            "loaderType",
+            "modLoaderType",
+        ] {
             if let Some(loader) = metadata.get(key).and_then(Value::as_str) {
                 if let Some(loader) = parse_mod_loader(loader) {
                     return Some(loader);
@@ -10834,7 +15122,7 @@ fn detect_import_loader_from_json_metadata(source_path: &Path) -> Option<ModLoad
 
 fn detect_import_game_version_from_json_metadata(source_path: &Path) -> Option<String> {
     for metadata in read_import_json_metadata(source_path) {
-        for key in ["gameVersion", "minecraftVersion", "version"] {
+        for key in ["gameVersion", "minecraftVersion", "mcVersion", "version"] {
             if let Some(version) = metadata.get(key).and_then(Value::as_str) {
                 if looks_like_minecraft_version(version) {
                     return Some(version.to_owned());
@@ -10895,7 +15183,7 @@ fn parse_mod_loader(loader: &str) -> Option<ModLoader> {
 }
 
 fn read_import_json_metadata(source_path: &Path) -> Vec<Value> {
-    ["manifest.json", "minecraftinstance.json"]
+    ["manifest.json", "minecraftinstance.json", "instance.json"]
         .into_iter()
         .filter_map(|relative_path| {
             serde_json::from_slice(&fs::read(source_path.join(relative_path)).ok()?).ok()
@@ -10976,6 +15264,7 @@ fn detect_import_identity(source_path: &Path) -> ImportIdentityMetadata {
     apply_instance_cfg_identity(source_path, &mut identity);
     apply_json_identity(source_path, "manifest.json", &mut identity);
     apply_json_identity(source_path, "minecraftinstance.json", &mut identity);
+    apply_json_identity(source_path, "instance.json", &mut identity);
     if identity.icon_path.is_none() {
         identity.icon_path = find_import_icon_path(source_path);
     }
@@ -11020,12 +15309,18 @@ fn apply_json_identity(
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
         return;
     };
-    for key in ["name", "displayName", "title"] {
+    for key in [
+        "name",
+        "displayName",
+        "title",
+        "instanceName",
+        "modpackName",
+    ] {
         if let Some(name) = value.get(key).and_then(Value::as_str) {
             set_if_empty(&mut identity.name, name);
         }
     }
-    for key in ["summary", "description", "notes"] {
+    for key in ["summary", "description", "synopsis", "notes"] {
         if let Some(summary) = value.get(key).and_then(Value::as_str) {
             set_if_empty(&mut identity.summary, summary);
         }
@@ -11091,10 +15386,11 @@ fn inspect_import_candidate_metadata(source_path: &Path) -> ImportCandidateMetad
     let mut file_count = 0;
     let mut total_bytes = 0;
     let mut newest = None;
+    let source_data_path = import_data_root(source_path);
 
     for (_, relative_path) in IMPORTABLE_PROFILE_PATHS {
         collect_import_path_metadata(
-            &source_path.join(relative_path),
+            &source_data_path.join(relative_path),
             &mut file_count,
             &mut total_bytes,
             &mut newest,
@@ -11298,17 +15594,29 @@ fn looks_like_minecraft_version(version: &str) -> bool {
     if looks_like_minecraft_snapshot_version(version) {
         return true;
     }
-    let mut parts = version.split('.');
+    let (base, suffix) = version
+        .split_once('-')
+        .map(|(base, suffix)| (base, Some(suffix)))
+        .unwrap_or((version, None));
+    let mut parts = base.split('.');
     if !matches!(parts.next(), Some("1")) {
         return false;
     }
     let Some(minor) = parts.next() else {
         return false;
     };
-    let (minor, suffix) = minor
-        .split_once('-')
-        .map(|(minor, suffix)| (minor, Some(suffix)))
-        .unwrap_or((minor, None));
+    if minor.parse::<u32>().is_err() {
+        return false;
+    }
+    let patch = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    if let Some(patch) = patch {
+        if patch.parse::<u32>().is_err() {
+            return false;
+        }
+    }
     let valid_release_suffix = match suffix {
         None => true,
         Some(suffix) => {
@@ -11321,7 +15629,7 @@ fn looks_like_minecraft_version(version: &str) -> bool {
                 && digits.chars().all(|ch| ch.is_ascii_digit())
         }
     };
-    minor.parse::<u32>().ok().is_some_and(|minor| minor >= 6) && valid_release_suffix
+    valid_release_suffix
 }
 
 fn looks_like_minecraft_snapshot_version(version: &str) -> bool {
@@ -11358,6 +15666,44 @@ fn profile_id_from_name(name: &str) -> String {
     } else {
         slug
     }
+}
+
+fn unique_profile_name(base_name: String, existing_names: &[&str]) -> String {
+    let base_name = base_name.trim();
+    let base_name = if base_name.is_empty() {
+        "Profile Copy"
+    } else {
+        base_name
+    };
+    let existing = existing_names
+        .iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if !existing.contains(&base_name.to_ascii_lowercase()) {
+        return base_name.to_owned();
+    }
+    for index in 2..10_000 {
+        let candidate = format!("{base_name} {index}");
+        if !existing.contains(&candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+    }
+    format!("{base_name} {}", current_unix_seconds())
+}
+
+fn unique_profile_id_from_name(name: &str, existing_ids: &[&str]) -> String {
+    let base_id = profile_id_from_name(name);
+    let existing = existing_ids.iter().copied().collect::<BTreeSet<_>>();
+    if !existing.contains(base_id.as_str()) {
+        return base_id;
+    }
+    for index in 2..10_000 {
+        let candidate = format!("{base_id}-{index}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!("{base_id}-{}", current_unix_seconds())
 }
 
 fn receipt(
@@ -11629,6 +15975,284 @@ struct ModrinthSearchHit {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct CurseForgeSearchResponse {
+    #[serde(default)]
+    data: Vec<CurseForgeModResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeModResponse {
+    id: u64,
+    name: String,
+    slug: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    authors: Vec<CurseForgeAuthorResponse>,
+    #[serde(default)]
+    logo: Option<CurseForgeLogoResponse>,
+    #[serde(default)]
+    download_count: Option<u64>,
+    #[serde(default)]
+    latest_files: Vec<CurseForgeFileResponse>,
+    #[serde(default)]
+    latest_files_indexes: Vec<CurseForgeLatestFileIndex>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct CurseForgeAuthorResponse {
+    name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeLogoResponse {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    thumbnail_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct CurseForgeFileEnvelope {
+    data: CurseForgeFileResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct CurseForgeFilesEnvelope {
+    #[serde(default)]
+    data: Vec<CurseForgeFileResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeFileResponse {
+    id: u64,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    file_length: Option<u64>,
+    #[serde(default)]
+    download_url: Option<String>,
+    #[serde(default)]
+    game_versions: Vec<String>,
+    #[serde(default)]
+    hashes: Vec<CurseForgeFileHashResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct CurseForgeFileHashResponse {
+    value: String,
+    #[serde(default)]
+    algo: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeLatestFileIndex {
+    #[serde(default)]
+    game_version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurseForgeKeylessDiscoverPack {
+    slug: &'static str,
+    title: &'static str,
+    description: &'static str,
+    author: &'static str,
+    game_versions: &'static [&'static str],
+    loaders: &'static [&'static str],
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AtlauncherPacksResponse {
+    #[serde(default)]
+    data: Vec<AtlauncherPackResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AtlauncherPackResponse {
+    name: String,
+    safe_name: String,
+    #[serde(default, rename = "type")]
+    pack_type: Option<String>,
+    #[serde(default)]
+    versions: Vec<AtlauncherPackVersionResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AtlauncherPackVersionResponse {
+    version: String,
+    #[serde(default)]
+    minecraft: Option<String>,
+    #[serde(default)]
+    published: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AtlauncherConfigManifest {
+    version: String,
+    minecraft: String,
+    #[serde(default)]
+    loader: Option<AtlauncherLoaderConfig>,
+    #[serde(default)]
+    mods: Vec<AtlauncherModFileConfig>,
+    #[serde(default)]
+    configs: Option<AtlauncherConfigsConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AtlauncherLoaderConfig {
+    #[serde(default, rename = "type")]
+    loader_type: String,
+    #[serde(default)]
+    metadata: Option<AtlauncherLoaderMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AtlauncherLoaderMetadata {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    raw_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AtlauncherModFileConfig {
+    name: String,
+    #[serde(default, rename = "type")]
+    mod_type: Option<String>,
+    #[serde(default)]
+    download: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    md5: Option<String>,
+    #[serde(default)]
+    filesize: Option<u64>,
+    #[serde(default, rename = "extractTo")]
+    extract_to: Option<String>,
+    #[serde(default, rename = "extractFolder")]
+    extract_folder: Option<String>,
+    #[serde(default = "default_true")]
+    client: bool,
+    #[serde(default)]
+    optional: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct AtlauncherConfigsConfig {
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    filesize: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbModpackIndexResponse {
+    #[serde(default)]
+    packs: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbModpackResponse {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    synopsis: Option<String>,
+    #[serde(default)]
+    installs: Option<u64>,
+    #[serde(default)]
+    plays: Option<u64>,
+    #[serde(default)]
+    authors: Vec<FtbAuthorResponse>,
+    #[serde(default)]
+    versions: Vec<FtbVersionResponse>,
+    #[serde(default)]
+    art: Vec<FtbArtResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbAuthorResponse {
+    name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbVersionResponse {
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    updated: Option<u64>,
+    #[serde(default)]
+    specs: Option<FtbSpecsResponse>,
+    #[serde(default)]
+    targets: Vec<FtbTargetResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbVersionManifestResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    specs: Option<FtbSpecsResponse>,
+    #[serde(default)]
+    targets: Vec<FtbTargetResponse>,
+    #[serde(default)]
+    files: Vec<FtbVersionFileResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbSpecsResponse {
+    #[serde(default)]
+    minimum: Option<u32>,
+    #[serde(default)]
+    recommended: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbTargetResponse {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default, rename = "type")]
+    target_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbArtResponse {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, rename = "type")]
+    art_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct FtbVersionFileResponse {
+    #[serde(default)]
+    id: Option<u64>,
+    name: String,
+    #[serde(default)]
+    path: Option<String>,
+    url: String,
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    optional: bool,
+    #[serde(default, rename = "serveronly")]
+    server_only: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct ModrinthProjectVersionResponse {
     id: String,
     name: String,
@@ -11639,6 +16263,8 @@ struct ModrinthProjectVersionResponse {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct ModrinthVersionResponse {
     id: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     files: Vec<ModrinthVersionFile>,
 }
@@ -12338,6 +16964,7 @@ mod tests {
     };
 
     static ENV_LOCK: TestMutex<()> = TestMutex::new(());
+    static JAVA_RUNTIME_OVERRIDE_LOCK: TestMutex<()> = TestMutex::new(());
     const LAUNCHER_DIR_ENV_KEYS: [&str; 5] = [
         "THEBOYS_LAUNCHER_ROOT_DIR",
         "THEBOYS_LAUNCHER_DATA_DIR",
@@ -12433,6 +17060,7 @@ mod tests {
     }
 
     struct JavaRuntimeDiscoveryGuard {
+        _lock: TestMutexGuard<'static, ()>,
         previous: Option<Vec<JavaRuntimeSummary>>,
     }
 
@@ -12446,6 +17074,9 @@ mod tests {
         }
 
         fn with_runtime(major_version: u32, version: &str) -> Self {
+            let lock = JAVA_RUNTIME_OVERRIDE_LOCK
+                .lock()
+                .expect("Java runtime test override lock should be available");
             let mut override_slot = JAVA_RUNTIME_DISCOVERY_OVERRIDE
                 .lock()
                 .expect("Java runtime override lock should be available");
@@ -12457,7 +17088,10 @@ mod tests {
                 major_version,
                 source: JavaRuntimeSource::Bundled,
             }]);
-            Self { previous }
+            Self {
+                _lock: lock,
+                previous,
+            }
         }
     }
 
@@ -12952,7 +17586,7 @@ mod tests {
     }
 
     #[test]
-    fn install_pack_plan_reports_reinstall_for_current_installed_profile() {
+    fn install_pack_plan_reports_prepare_for_current_installed_profile() {
         let catalog = vec![ModpackCatalogEntry {
             id: "remote-pack".to_owned(),
             display_name: Some("Remote Pack".to_owned()),
@@ -12991,7 +17625,7 @@ mod tests {
             .first()
             .expect("plan has first event")
             .message
-            .contains("Reinstall queued for Remote Pack"));
+            .contains("Prepare queued for Remote Pack"));
     }
 
     #[test]
@@ -14226,6 +18860,61 @@ mod tests {
             .stop(startup.id)
             .expect("vanilla process should stop cleanly after smoke");
         assert_eq!(stopped.state, ManagedProcessState::Exited);
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads live vanilla Minecraft artifacts, deletes the managed profile instance, and verifies shared cache is retained"]
+    async fn live_vanilla_delete_removes_profile_data_but_keeps_shared_cache() {
+        let _smoke_root = LiveSmokeRoot::new();
+
+        let directories = prepare_launcher_directories().expect("isolated directories prepare");
+        let settings = load_settings().expect("isolated settings load");
+        let profile = install_live_vanilla_artifacts_for_preflight(&directories, "1.21.8")
+            .await
+            .expect("live vanilla artifacts should install");
+
+        let launch_plan = build_offline_launch_plan(&profile.id, &settings, &directories)
+            .expect("installed vanilla launch plan should build");
+        build_process_command_spec(&launch_plan)
+            .expect("installed vanilla artifacts should preflight");
+
+        let profile_dir = PathBuf::from(&directories.data_dir)
+            .join("profiles")
+            .join(&profile.id);
+        fs::create_dir_all(&profile_dir).expect("profile directory should create");
+        let profile_options = profile_dir.join("options.txt");
+        fs::write(&profile_options, b"live vanilla profile data")
+            .expect("profile-owned file should write");
+        assert!(profile_dir.is_dir());
+        assert!(profile_options.is_file());
+
+        let assets_dir = launch_plan_argument_value(&launch_plan.arguments, "--assetsDir")
+            .expect("launch plan should include assets directory");
+        let asset_index = launch_plan_argument_value(&launch_plan.arguments, "--assetIndex")
+            .expect("launch plan should include asset index");
+        let shared_asset_index = PathBuf::from(assets_dir)
+            .join("indexes")
+            .join(format!("{asset_index}.json"));
+        assert!(shared_asset_index.is_file());
+        let cache_dir = PathBuf::from(&directories.cache_dir);
+        let client_jar = cache_dir
+            .join("versions")
+            .join(&profile.game_version)
+            .join("client.jar");
+        assert!(client_jar.is_file());
+
+        let deleted = delete_profile(DeleteProfileRequest {
+            id: profile.id.clone(),
+        })
+        .expect("live vanilla profile should delete");
+        let profiles = load_profiles().expect("profiles should reload after delete");
+
+        assert_eq!(deleted.id, profile.id);
+        assert!(!profiles.iter().any(|saved| saved.id == profile.id));
+        assert!(!profile_dir.exists());
+        assert!(!profile_options.exists());
+        assert!(shared_asset_index.is_file());
+        assert!(client_jar.is_file());
     }
 
     #[tokio::test]
@@ -17185,6 +21874,1518 @@ hash = "1234"
     }
 
     #[test]
+    fn curseforge_search_results_select_downloadable_modpack_file() {
+        let results = curseforge_search_results_from_json(
+            r#"{
+              "data": [
+                {
+                  "id": 890405,
+                  "name": "Enigmatica 9 Expert",
+                  "slug": "enigmatica9expert",
+                  "summary": "An expert pack.",
+                  "downloadCount": 2400000,
+                  "authors": [{ "name": "EnigmaticaModpacks" }],
+                  "logo": {
+                    "thumbnailUrl": "https://media.forgecdn.net/avatars/890/icon.png"
+                  },
+                  "latestFiles": [
+                    {
+                      "id": 5650506,
+                      "displayName": "1.27.0",
+                      "fileName": "Enigmatica9Expert-1.27.0.zip",
+                      "downloadUrl": "https://edge.forgecdn.net/files/5650/506/Enigmatica9Expert-1.27.0.zip",
+                      "gameVersions": ["1.19.2", "Forge"],
+                      "hashes": [{ "value": "0123456789abcdef0123456789abcdef01234567", "algo": 1 }]
+                    }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("CurseForge search response should parse");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider, "curseforge");
+        assert_eq!(results[0].project_id, "890405");
+        assert_eq!(results[0].latest_version_id.as_deref(), Some("5650506"));
+        assert_eq!(results[0].game_versions, vec!["1.19.2"]);
+        assert_eq!(results[0].loaders, vec!["forge"]);
+        assert!(results[0].install_available);
+    }
+
+    #[test]
+    fn curseforge_project_id_resolves_from_slug_search_results() {
+        let project_id = curseforge_project_id_from_search_json(
+            r#"{
+              "data": [
+                {
+                  "id": 890405,
+                  "name": "Enigmatica 9 Expert",
+                  "slug": "enigmatica9expert",
+                  "summary": "An expert pack."
+                },
+                {
+                  "id": 123,
+                  "name": "Different Pack",
+                  "slug": "different-pack",
+                  "summary": "Not the requested pack."
+                }
+              ]
+            }"#,
+            "enigmatica9expert",
+        )
+        .expect("CurseForge slug should resolve");
+
+        assert_eq!(project_id, 890405);
+    }
+
+    #[test]
+    fn curseforge_keyless_search_browses_seed_packs_without_api_key() {
+        let results = curseforge_keyless_search_results("", 2)
+            .expect("keyless CurseForge browse should return seed packs");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].provider, "curseforge");
+        assert_eq!(results[0].project_id, "enigmatica9expert");
+        assert_eq!(results[0].title, "Enigmatica 9 Expert");
+        assert!(results[0].install_available);
+        assert!(results[0].latest_version_id.is_none());
+        assert_eq!(results[0].loaders, vec!["forge"]);
+    }
+
+    #[test]
+    fn curseforge_keyless_search_matches_known_pack_query() {
+        let results = curseforge_keyless_search_results("enigmatica", 12)
+            .expect("keyless CurseForge search should match known packs");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_id, "enigmatica9expert");
+        assert_eq!(results[0].game_versions, vec!["1.19.2"]);
+    }
+
+    #[test]
+    fn curseforge_keyless_search_accepts_public_pack_page_url() {
+        let results = curseforge_keyless_search_results(
+            "https://www.curseforge.com/minecraft/modpacks/enigmatica9expert",
+            12,
+        )
+        .expect("keyless CurseForge search should parse pack page links");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_id, "enigmatica9expert");
+        assert_eq!(results[0].title, "Enigmatica 9 Expert");
+    }
+
+    #[test]
+    fn curseforge_keyless_search_builds_installable_slug_guess() {
+        let results = curseforge_keyless_search_results("Some New Pack", 12)
+            .expect("keyless CurseForge search should build a slug suggestion");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_id, "some-new-pack");
+        assert_eq!(results[0].title, "Some New Pack");
+        assert!(results[0].install_available);
+    }
+
+    #[test]
+    fn curseforge_file_response_builds_archive_download_plan() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let file = curseforge_file_from_file_json(
+            r#"{
+              "data": {
+                "id": 5650506,
+                "displayName": "1.27.0",
+                "fileName": "Enigmatica9Expert-1.27.0.zip",
+                "fileLength": 123456,
+                "downloadUrl": "https://edge.forgecdn.net/files/5650/506/Enigmatica9Expert-1.27.0.zip",
+                "gameVersions": ["1.19.2", "Forge"],
+                "hashes": [
+                  { "value": "0123456789abcdef0123456789abcdef01234567", "algo": 1 },
+                  { "value": "0123456789abcdef0123456789abcdef", "algo": 2 }
+                ]
+              }
+            }"#,
+        )
+        .expect("CurseForge file should parse");
+
+        let plan = curseforge_download_plan_from_file(
+            890405,
+            Some("Enigmatica 9 Expert"),
+            &file,
+            &directories,
+        )
+        .expect("download plan should build");
+
+        assert_eq!(plan.project_id, 890405);
+        assert_eq!(plan.file_id, 5650506);
+        assert_eq!(plan.name, "Enigmatica 9 Expert");
+        assert_eq!(plan.archive_download_plan.items.len(), 1);
+        let item = &plan.archive_download_plan.items[0];
+        assert_eq!(
+            item.url,
+            "https://edge.forgecdn.net/files/5650/506/Enigmatica9Expert-1.27.0.zip"
+        );
+        assert_eq!(
+            item.sha1.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            item.md5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(item.destination.ends_with(
+            "cache/modpack-archives/curseforge-890405-5650506/Enigmatica9Expert-1.27.0.zip"
+        ));
+    }
+
+    #[test]
+    fn curseforge_exact_project_file_links_build_keyless_download_plan() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let request = InstallDiscoveredModpackRequest {
+            provider: "curseforge".to_owned(),
+            project_id: "890405".to_owned(),
+            version_id: Some("5650506".to_owned()),
+            name: Some("Enigmatica 9 Expert".to_owned()),
+        };
+
+        let plan = curseforge_exact_project_file_download_plan(&request, &directories)
+            .expect("exact project file request should plan")
+            .expect("numeric project/file request should use keyless direct plan");
+
+        assert_eq!(plan.project_id, 890405);
+        assert_eq!(plan.file_id, 5650506);
+        assert_eq!(plan.name, "Enigmatica 9 Expert");
+        assert_eq!(plan.file_name, "curseforge-890405-5650506.zip");
+        let item = &plan.archive_download_plan.items[0];
+        assert_eq!(
+            item.url,
+            "https://www.curseforge.com/api/v1/mods/890405/files/5650506/download"
+        );
+        assert!(item.sha1.is_none());
+        assert!(item.md5.is_none());
+        assert!(item.destination.ends_with(
+            "cache/modpack-archives/curseforge-890405-5650506/curseforge-890405-5650506.zip"
+        ));
+    }
+
+    #[test]
+    fn curseforge_slug_file_links_build_keyless_download_plan() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let request = InstallDiscoveredModpackRequest {
+            provider: "curseforge".to_owned(),
+            project_id: "enigmatica9expert".to_owned(),
+            version_id: Some("5650506".to_owned()),
+            name: Some("Enigmatica 9 Expert".to_owned()),
+        };
+
+        let plan = curseforge_slug_file_download_plan(&request, &directories)
+            .expect("slug file request should plan")
+            .expect("slug/file request should use keyless web download plan");
+
+        assert_eq!(plan.project_id, 0);
+        assert_eq!(plan.file_id, 5650506);
+        assert_eq!(plan.name, "Enigmatica 9 Expert");
+        assert_eq!(plan.file_name, "curseforge-enigmatica9expert-5650506.zip");
+        let item = &plan.archive_download_plan.items[0];
+        assert_eq!(
+            item.url,
+            "https://www.curseforge.com/minecraft/modpacks/enigmatica9expert/download/5650506"
+        );
+        assert!(item.sha1.is_none());
+        assert!(item.md5.is_none());
+        assert!(item.destination.ends_with(
+            "cache/modpack-archives/curseforge-enigmatica9expert-5650506/curseforge-enigmatica9expert-5650506.zip"
+        ));
+    }
+
+    #[test]
+    fn curseforge_plain_slug_links_build_keyless_latest_download_plan() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let request = InstallDiscoveredModpackRequest {
+            provider: "curseforge".to_owned(),
+            project_id: "enigmatica9expert".to_owned(),
+            version_id: None,
+            name: Some("Enigmatica 9 Expert".to_owned()),
+        };
+
+        let plan = curseforge_slug_latest_download_plan(&request, &directories)
+            .expect("plain slug request should plan")
+            .expect("plain slug request should use keyless latest download plan");
+
+        assert_eq!(plan.project_id, 0);
+        assert_eq!(plan.file_id, 0);
+        assert_eq!(plan.name, "Enigmatica 9 Expert");
+        assert_eq!(plan.file_name, "curseforge-enigmatica9expert-latest.zip");
+        let item = &plan.archive_download_plan.items[0];
+        assert_eq!(
+            item.url,
+            "https://www.curseforge.com/minecraft/modpacks/enigmatica9expert/download"
+        );
+        assert!(item.sha1.is_none());
+        assert!(item.md5.is_none());
+        assert!(item.destination.ends_with(
+            "cache/modpack-archives/curseforge-enigmatica9expert-latest/curseforge-enigmatica9expert-latest.zip"
+        ));
+    }
+
+    #[test]
+    fn all_discover_search_uses_public_catalog_providers() {
+        assert_eq!(
+            DISCOVER_SEARCH_PROVIDERS,
+            &[
+                "curseforge",
+                "modrinth",
+                "atlauncher",
+                "ftb",
+                "ftb_legacy",
+                "technic"
+            ]
+        );
+        assert!(
+            !DISCOVER_SEARCH_PROVIDERS.contains(&"ftb_private"),
+            "private FTB packs require a code and should not be queried by All sources"
+        );
+    }
+
+    #[test]
+    fn all_discover_search_extracts_private_ftb_shortcut_codes() {
+        assert_eq!(
+            ftb_private_code_from_all_sources_query("private:FamilyCode"),
+            Some("FamilyCode".to_owned())
+        );
+        assert_eq!(
+            ftb_private_code_from_all_sources_query("ftb private FamilyCode"),
+            Some("FamilyCode".to_owned())
+        );
+        assert_eq!(
+            ftb_private_code_from_all_sources_query("ftb-private FamilyCode"),
+            Some("FamilyCode".to_owned())
+        );
+        assert_eq!(
+            ftb_private_code_from_all_sources_query("ftb_private FamilyCode"),
+            Some("FamilyCode".to_owned())
+        );
+        assert_eq!(ftb_private_code_from_all_sources_query("private:"), None);
+        assert_eq!(
+            ftb_private_code_from_all_sources_query("private:family code"),
+            None
+        );
+        assert_eq!(ftb_private_code_from_all_sources_query("family code"), None);
+    }
+
+    #[test]
+    fn all_discover_search_interleaves_provider_results_before_truncating() {
+        let results = interleave_discover_provider_results(
+            vec![
+                vec![
+                    discover_test_result("curseforge", "curseforge-one"),
+                    discover_test_result("curseforge", "curseforge-two"),
+                    discover_test_result("curseforge", "curseforge-three"),
+                ],
+                vec![
+                    discover_test_result("modrinth", "modrinth-one"),
+                    discover_test_result("modrinth", "modrinth-two"),
+                ],
+                vec![discover_test_result("technic", "technic-one")],
+            ],
+            5,
+        );
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| format!("{}:{}", result.provider, result.slug))
+                .collect::<Vec<_>>(),
+            vec![
+                "curseforge:curseforge-one",
+                "modrinth:modrinth-one",
+                "technic:technic-one",
+                "curseforge:curseforge-two",
+                "modrinth:modrinth-two",
+            ]
+        );
+    }
+
+    #[test]
+    fn discover_provider_query_recognizes_provider_page_links() {
+        let cases = [
+            (
+                "https://modrinth.com/modpack/fabulously-optimized/version/abc123",
+                "modrinth",
+                "fabulously-optimized",
+                Some("abc123"),
+            ),
+            (
+                "https://www.curseforge.com/minecraft/modpacks/enigmatica9expert/files/5650506",
+                "curseforge",
+                "enigmatica9expert",
+                Some("5650506"),
+            ),
+            (
+                "https://atlauncher.com/pack/SevTechAges/versions/3.2.3",
+                "atlauncher",
+                "SevTechAges",
+                Some("3.2.3"),
+            ),
+            (
+                "https://feed-the-beast.com/modpacks/126-ftb-presents-direwolf20-1-21/versions/12482",
+                "ftb",
+                "126",
+                Some("12482"),
+            ),
+            (
+                "https://dist.creeper.host/FTB2/modpacks/FTBAcademy/1_1_0/FTBAcademy.zip",
+                "ftb_legacy",
+                "public:FTBAcademy:FTBAcademy.zip",
+                Some("1.1.0"),
+            ),
+            (
+                "https://www.technicpack.net/modpack/tekxit-3-official-1122.123456",
+                "technic",
+                "tekxit-3-official-1122",
+                None,
+            ),
+            (
+                "prismlauncher://install?platform=modrinth&projectId=fabulously-optimized&versionId=preview",
+                "modrinth",
+                "fabulously-optimized",
+                Some("preview"),
+            ),
+            (
+                "multimc://install?platform=flame&addonId=890405&fileId=5650506",
+                "curseforge",
+                "890405",
+                Some("5650506"),
+            ),
+            (
+                "prismlauncher://install?platform=atlauncher&pack=SevTechAges&version=3.2.3",
+                "atlauncher",
+                "SevTechAges",
+                Some("3.2.3"),
+            ),
+            (
+                "prismlauncher://install?platform=ftb&packId=126&versionId=12482",
+                "ftb",
+                "126",
+                Some("12482"),
+            ),
+            (
+                "prismlauncher://install?platform=ftb-legacy&pack=FTBAcademy&file=FTBAcademy.zip&version=1.1.0",
+                "ftb_legacy",
+                "public:FTBAcademy:FTBAcademy.zip",
+                Some("1.1.0"),
+            ),
+            (
+                "prismlauncher://install?platform=ftb-private&code=familycode",
+                "ftb_private",
+                "familycode",
+                None,
+            ),
+            (
+                "prismlauncher://install?platform=technic&slug=hexxit&build=1.0.10",
+                "technic",
+                "hexxit",
+                Some("1.0.10"),
+            ),
+        ];
+
+        for (url, provider, project_id, version_id) in cases {
+            let result = discover_provider_result_from_query(url)
+                .expect("provider link should parse")
+                .expect("provider link should return a result");
+            assert_eq!(result.provider, provider);
+            assert_eq!(result.project_id, project_id);
+            assert_eq!(result.latest_version_id.as_deref(), version_id);
+            assert!(result.install_available);
+        }
+    }
+
+    #[test]
+    fn discover_provider_query_recognizes_curseforge_install_scheme() {
+        let result = discover_provider_result_from_query(
+            "curseforge://install?addonId=890405&fileId=5650506",
+        )
+        .expect("curseforge install link should parse")
+        .expect("curseforge install link should return a result");
+
+        assert_eq!(result.provider, "curseforge");
+        assert_eq!(result.project_id, "890405");
+        assert_eq!(result.latest_version_id.as_deref(), Some("5650506"));
+        assert!(result.install_available);
+    }
+
+    fn discover_test_result(provider: &str, slug: &str) -> DiscoverModpackSearchResult {
+        DiscoverModpackSearchResult {
+            provider: provider.to_owned(),
+            project_id: slug.to_owned(),
+            slug: slug.to_owned(),
+            title: slug.to_owned(),
+            description: "Test modpack.".to_owned(),
+            author: "Test".to_owned(),
+            icon_url: None,
+            downloads: 0,
+            follows: 0,
+            game_versions: Vec::new(),
+            loaders: Vec::new(),
+            latest_version_id: None,
+            install_available: true,
+            install_note: None,
+        }
+    }
+
+    #[test]
+    fn atlauncher_search_results_filter_public_packs() {
+        let results = atlauncher_search_results_from_json(
+            r#"{
+              "error": false,
+              "code": 200,
+              "data": [
+                {
+                  "id": 468,
+                  "name": "SevTech: Ages",
+                  "safeName": "SevTechAges",
+                  "type": "public",
+                  "versions": [
+                    { "version": "3.2.2", "minecraft": "1.12.2", "published": 1639190275 },
+                    { "version": "3.2.3", "minecraft": "1.12.2", "published": 1639772583 }
+                  ]
+                },
+                {
+                  "id": 11,
+                  "name": "Private Server",
+                  "safeName": "PrivateServer",
+                  "type": "private",
+                  "versions": []
+                }
+              ]
+            }"#,
+            "sevtech",
+            12,
+        )
+        .expect("ATLauncher response should parse");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider, "atlauncher");
+        assert_eq!(results[0].project_id, "SevTechAges");
+        assert_eq!(results[0].title, "SevTech: Ages");
+        assert_eq!(results[0].game_versions, vec!["1.12.2"]);
+        assert_eq!(results[0].latest_version_id.as_deref(), Some("3.2.3"));
+        assert!(results[0].install_available);
+        assert!(results[0].install_note.is_none());
+    }
+
+    #[test]
+    fn atlauncher_latest_version_resolves_from_pack_index() {
+        let version = latest_atlauncher_version_id_from_packs_json(
+            r#"{
+              "data": [
+                {
+                  "name": "SevTech: Ages",
+                  "safeName": "SevTechAges",
+                  "type": "public",
+                  "versions": [
+                    { "version": "3.2.2", "minecraft": "1.12.2", "published": 1639190275 },
+                    { "version": "3.2.3", "minecraft": "1.12.2", "published": 1639772583 }
+                  ]
+                }
+              ]
+            }"#,
+            "sevtechages",
+        )
+        .expect("ATLauncher latest version should resolve");
+
+        assert_eq!(version, "3.2.3");
+    }
+
+    #[test]
+    fn atlauncher_install_plan_builds_profile_and_downloads() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = atlauncher_install_plan_from_config_json(
+            "SevTechAges",
+            "3.2.3",
+            Some("SevTech: Ages"),
+            &directories,
+            r#"{
+              "version": "3.2.3",
+              "minecraft": "1.12.2",
+              "loader": {
+                "type": "forge",
+                "metadata": {
+                  "minecraft": "1.12.2",
+                  "version": "14.23.5.2860",
+                  "rawVersion": "1.12.2-14.23.5.2860"
+                }
+              },
+              "mods": [
+                {
+                  "name": "No World Gen 5 You",
+                  "type": "mods",
+                  "download": "server",
+                  "url": "packs/SevTechAges/files/3.2.3/NoWorldgen5You-1.12.2-1.0.6.jar",
+                  "file": "NoWorldgen5You-1.12.2-1.0.6.jar",
+                  "md5": "232105adbce120e493bb7f53ccdb232b",
+                  "filesize": 16882,
+                  "client": true,
+                  "server": true,
+                  "optional": false
+                },
+                {
+                  "name": "Server Script",
+                  "type": "mods",
+                  "download": "server",
+                  "url": "packs/SevTechAges/files/3.2.3/server-only.jar",
+                  "file": "server-only.jar",
+                  "client": false,
+                  "server": true,
+                  "optional": false
+                },
+                {
+                  "name": "Optional Client Mod",
+                  "type": "mods",
+                  "download": "server",
+                  "url": "packs/SevTechAges/files/3.2.3/optional.jar",
+                  "file": "optional.jar",
+                  "client": true,
+                  "optional": true
+                }
+              ]
+            }"#,
+        )
+        .expect("ATLauncher install plan should parse");
+
+        assert_eq!(plan.profile.id, "atlauncher-sevtechages");
+        assert_eq!(plan.profile.name, "SevTech: Ages");
+        assert_eq!(plan.profile.loader, ModLoader::Forge);
+        assert_eq!(plan.profile.game_version, "1.12.2");
+        assert_eq!(plan.loader_version.as_deref(), Some("14.23.5.2860"));
+        assert_eq!(plan.file_download_plan.items.len(), 1);
+        let item = &plan.file_download_plan.items[0];
+        assert_eq!(item.kind, DownloadKind::PackFile);
+        assert_eq!(
+            item.url,
+            "https://download.nodecdn.net/containers/atl/packs/SevTechAges/files/3.2.3/NoWorldgen5You-1.12.2-1.0.6.jar"
+        );
+        assert_eq!(
+            item.md5.as_deref(),
+            Some("232105adbce120e493bb7f53ccdb232b")
+        );
+        assert!(item.destination.replace('\\', "/").ends_with(
+            "data/profiles/atlauncher-sevtechages/mods/NoWorldgen5You-1.12.2-1.0.6.jar"
+        ));
+    }
+
+    #[test]
+    fn atlauncher_install_plan_downloads_and_extracts_configs_bundle() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = atlauncher_install_plan_from_config_json(
+            "SevTechAges",
+            "3.2.3",
+            Some("SevTech: Ages"),
+            &directories,
+            r#"{
+              "version": "3.2.3",
+              "minecraft": "1.12.2",
+              "loader": {
+                "type": "forge",
+                "metadata": {
+                  "minecraft": "1.12.2",
+                  "version": "14.23.5.2860",
+                  "rawVersion": "1.12.2-14.23.5.2860"
+                }
+              },
+              "mods": [
+                {
+                  "name": "No World Gen 5 You",
+                  "type": "mods",
+                  "download": "server",
+                  "url": "packs/SevTechAges/files/3.2.3/NoWorldgen5You-1.12.2-1.0.6.jar",
+                  "file": "NoWorldgen5You-1.12.2-1.0.6.jar",
+                  "client": true,
+                  "optional": false
+                }
+              ],
+              "configs": {
+                "sha1": "d7ab58e918e97e30e751df6c2a58383c432d4185",
+                "filesize": 20926719
+              }
+            }"#,
+        )
+        .expect("ATLauncher install plan should parse configs");
+
+        let config_archive = plan
+            .extract_archives
+            .iter()
+            .find(|archive| archive.label == "config files")
+            .expect("config archive path should be planned");
+        let config_item = plan
+            .file_download_plan
+            .items
+            .iter()
+            .find(|item| item.id == "atlauncher-configs-atlauncher-sevtechages")
+            .expect("configs download should be included");
+        assert_eq!(
+            config_item.url,
+            "https://download.nodecdn.net/containers/atl/packs/SevTechAges/versions/3.2.3/Configs.zip"
+        );
+        assert_eq!(
+            config_item.sha1.as_deref(),
+            Some("d7ab58e918e97e30e751df6c2a58383c432d4185")
+        );
+        assert_eq!(config_item.size, Some(20926719));
+
+        write_zip_archive(
+            &config_archive.archive_path,
+            &[
+                ("config/example.cfg", b"enabled=true"),
+                ("scripts/main.zs", b"print('hi');"),
+            ],
+        );
+        let extraction =
+            extract_atlauncher_archives(&plan.extract_archives, &plan.profile, &directories)
+                .expect("configs should extract");
+
+        assert_eq!(extraction.operation, LauncherOperation::ImportProfile);
+        assert!(root
+            .path()
+            .join("data/profiles/atlauncher-sevtechages/config/example.cfg")
+            .is_file());
+        assert!(root
+            .path()
+            .join("data/profiles/atlauncher-sevtechages/scripts/main.zs")
+            .is_file());
+    }
+
+    #[test]
+    fn atlauncher_install_plan_extracts_client_archive_entries() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = atlauncher_install_plan_from_config_json(
+            "ExtractPack",
+            "1.0.0",
+            Some("Extract Pack"),
+            &directories,
+            r#"{
+              "version": "1.0.0",
+              "minecraft": "1.12.2",
+              "loader": {
+                "type": "forge",
+                "metadata": { "version": "14.23.5.2860" }
+              },
+              "mods": [
+                {
+                  "name": "Client Scripts",
+                  "type": "extract",
+                  "extractTo": "root",
+                  "extractFolder": "overrides",
+                  "download": "server",
+                  "url": "packs/ExtractPack/files/1.0.0/client-scripts.zip",
+                  "file": "client-scripts.zip",
+                  "md5": "0123456789abcdef0123456789abcdef",
+                  "filesize": 1234,
+                  "client": true,
+                  "optional": false
+                },
+                {
+                  "name": "Normal Mod",
+                  "type": "mods",
+                  "download": "server",
+                  "url": "packs/ExtractPack/files/1.0.0/normal.jar",
+                  "file": "normal.jar",
+                  "client": true,
+                  "optional": false
+                }
+              ]
+            }"#,
+        )
+        .expect("ATLauncher extract entry should plan");
+
+        let extract_archive = plan
+            .extract_archives
+            .iter()
+            .find(|archive| archive.label == "Client Scripts")
+            .expect("extract archive should be planned");
+        assert_eq!(extract_archive.destination_dir, PathBuf::new());
+        assert_eq!(extract_archive.strip_prefix.as_deref(), Some("overrides"));
+        let extract_item = plan
+            .file_download_plan
+            .items
+            .iter()
+            .find(|item| {
+                item.id
+                    .starts_with("atlauncher-extract-atlauncher-extractpack")
+            })
+            .expect("extract archive download should be included");
+        assert_eq!(
+            extract_item.url,
+            "https://download.nodecdn.net/containers/atl/packs/ExtractPack/files/1.0.0/client-scripts.zip"
+        );
+        assert_eq!(
+            extract_item.md5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+
+        write_zip_archive(
+            &extract_archive.archive_path,
+            &[
+                ("overrides/scripts/main.zs", b"print('hi');"),
+                ("overrides/config/example.cfg", b"enabled=true"),
+                ("server-only/skip.txt", b"skip"),
+            ],
+        );
+        extract_atlauncher_archives(&plan.extract_archives, &plan.profile, &directories)
+            .expect("extract archive should unpack");
+
+        assert!(root
+            .path()
+            .join("data/profiles/atlauncher-extractpack/scripts/main.zs")
+            .is_file());
+        assert!(root
+            .path()
+            .join("data/profiles/atlauncher-extractpack/config/example.cfg")
+            .is_file());
+        assert!(!root
+            .path()
+            .join("data/profiles/atlauncher-extractpack/server-only/skip.txt")
+            .exists());
+    }
+
+    #[test]
+    fn ftb_search_result_extracts_latest_version_targets() {
+        let result = ftb_search_result_from_pack_json(
+            r#"{
+              "id": 126,
+              "name": "FTB Presents Direwolf20 1.21",
+              "synopsis": "Join Direwolf20 for an immersive Minecraft journey.",
+              "installs": 47091,
+              "plays": 239067,
+              "authors": [{ "id": 8, "name": "FTB Team", "type": "team" }],
+              "versions": [
+                {
+                  "id": 12482,
+                  "name": "1.0.0",
+                  "updated": 1726343594,
+                  "targets": [
+                    { "version": "21.1.51", "name": "neoforge", "type": "modloader" },
+                    { "version": "1.21.1", "name": "minecraft", "type": "game" }
+                  ]
+                }
+              ],
+              "art": [
+                { "url": "https://apps.modpacks.ch/modpacks/art/115/logo.png", "type": "square" }
+              ]
+            }"#,
+        )
+        .expect("FTB pack response should parse");
+
+        assert_eq!(result.provider, "ftb");
+        assert_eq!(result.project_id, "126");
+        assert_eq!(result.title, "FTB Presents Direwolf20 1.21");
+        assert_eq!(result.author, "FTB Team");
+        assert_eq!(result.game_versions, vec!["1.21.1"]);
+        assert_eq!(result.loaders, vec!["neoforge"]);
+        assert_eq!(result.latest_version_id.as_deref(), Some("12482"));
+        assert_eq!(
+            result.icon_url.as_deref(),
+            Some("https://apps.modpacks.ch/modpacks/art/115/logo.png")
+        );
+        assert!(result.install_available);
+    }
+
+    #[test]
+    fn ftb_search_index_keeps_only_ftb_pack_ids() {
+        let pack_ids = ftb_modpack_ids_from_index_json(
+            r#"{
+              "packs": [14, 24, 31],
+              "curseforge": [281999, 1103362],
+              "total": 5,
+              "limit": 10,
+              "refreshed": 1782935236
+            }"#,
+        )
+        .expect("FTB search index should parse");
+
+        assert_eq!(pack_ids, vec![14, 24, 31]);
+    }
+
+    #[test]
+    fn ftb_latest_version_resolves_from_pack_detail() {
+        let version = latest_ftb_version_id_from_pack_json(
+            r#"{
+              "id": 126,
+              "name": "FTB Presents Direwolf20 1.21",
+              "versions": [
+                { "id": 12000, "updated": 1700000000, "targets": [] },
+                { "id": 12482, "updated": 1726343594, "targets": [] }
+              ]
+            }"#,
+        )
+        .expect("FTB latest version should resolve");
+
+        assert_eq!(version, "12482");
+    }
+
+    #[test]
+    fn ftb_legacy_search_results_parse_public_feed() {
+        let results = ftb_legacy_search_results_from_xml(
+            r#"<modpacks>
+              <modpack
+                author="The FTB Team"
+                description="Learn modded Minecraft.&lt;br&gt;Quest-guided."
+                name="FTB Academy"
+                version="1.1.0"
+                mcVersion="1.12.2"
+                dir="FTBAcademy"
+                url="FTBAcademy.zip"
+                oldVersions="1.1.0;1.0.0" />
+              <modpack
+                author="Broken"
+                description="No version."
+                name="Broken Pack"
+                version=""
+                mcVersion="1.12.2"
+                dir="Broken"
+                url="Broken.zip"
+                oldVersions="" />
+            </modpacks>"#,
+            "public",
+            None,
+        )
+        .expect("FTB Legacy feed should parse");
+
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.provider, "ftb_legacy");
+        assert_eq!(result.project_id, "public:FTBAcademy:FTBAcademy.zip");
+        assert_eq!(result.slug, "FTBAcademy");
+        assert_eq!(result.title, "FTB Academy");
+        assert_eq!(result.author, "The FTB Team");
+        assert_eq!(result.game_versions, vec!["1.12.2"]);
+        assert_eq!(result.latest_version_id.as_deref(), Some("1.1.0"));
+        assert!(result.install_available);
+        assert!(result
+            .install_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("common FTB Legacy zips"));
+        assert_eq!(result.description, "Learn modded Minecraft. Quest-guided.");
+    }
+
+    #[test]
+    fn ftb_private_search_results_preserve_private_code() {
+        let results = ftb_legacy_search_results_from_xml(
+            r#"<modpacks>
+              <modpack
+                author=""
+                description="Shared with friends."
+                name="Family Pack"
+                version="1.0.0"
+                mcVersion="1.12.2"
+                dir="FamilyPack"
+                url="FamilyPack.zip"
+                oldVersions="" />
+            </modpacks>"#,
+            "private",
+            Some("familycode"),
+        )
+        .expect("FTB private feed should parse");
+
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.provider, "ftb_private");
+        assert_eq!(
+            result.project_id,
+            "private:familycode:FamilyPack:FamilyPack.zip"
+        );
+        assert_eq!(result.author, "Private FTB Legacy");
+        assert_eq!(result.latest_version_id.as_deref(), Some("1.0.0"));
+        assert!(result.install_available);
+    }
+
+    #[test]
+    fn technic_search_results_parse_list_and_single_pack() {
+        let results = technic_search_results_from_json(
+            r#"{
+              "modpacks": [
+                {
+                  "id": "552552",
+                  "name": "Hexxit",
+                  "slug": "hexxit",
+                  "url": "https://www.technicpack.net/modpack/hexxit.552552",
+                  "iconUrl": "https://cdn.technicpack.net/platform2/pack-icons/552552.png"
+                },
+                {
+                  "id": "vanilla",
+                  "name": "Vanilla",
+                  "slug": "vanilla",
+                  "iconUrl": "https://cdn.technicpack.net/platform2/pack-icons/vanilla.png"
+                }
+              ]
+            }"#,
+            12,
+        )
+        .expect("Technic search response should parse");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider, "technic");
+        assert_eq!(results[0].project_id, "hexxit");
+        assert_eq!(results[0].title, "Hexxit");
+        assert!(!results[0].install_available);
+        assert!(results[0]
+            .install_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("metadata/download resolution"));
+
+        let single = technic_search_results_from_json(
+            r#"{
+              "id": 552552,
+              "name": "hexxit",
+              "displayName": "Hexxit",
+              "user": "sct",
+              "minecraft": "1.4.7",
+              "version": "1.0.11",
+              "url": "https://downloads.example.com/hexxit.zip",
+              "installs": 7792104,
+              "runs": 51297193,
+              "description": "Gear up and set forth.",
+              "icon": { "url": "https://cdn.technicpack.net/platform2/pack-icons/552552.png" }
+            }"#,
+            12,
+        )
+        .expect("Technic single response should parse");
+
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].slug, "hexxit");
+        assert_eq!(single[0].game_versions, vec!["1.4.7"]);
+        assert_eq!(single[0].latest_version_id.as_deref(), Some("1.0.11"));
+        assert_eq!(single[0].downloads, 7_792_104);
+        assert!(single[0].install_available);
+        assert!(single[0]
+            .install_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("direct Technic zip"));
+
+        let solder = technic_search_results_from_json(
+            r#"{
+              "name": "the-1122-pack",
+              "displayName": "The 1.12.2 Pack",
+              "minecraft": "1.12.2",
+              "solder": "https://solder.technicpack.net/api/"
+            }"#,
+            12,
+        )
+        .expect("Technic Solder response should parse");
+        assert_eq!(solder.len(), 1);
+        assert!(solder[0].install_available);
+        assert!(solder[0]
+            .install_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Solder"));
+    }
+
+    #[test]
+    fn technic_archive_builds_install_plan_and_extracts_files() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let archive_path = root.path().join("tekxit.zip");
+        write_zip_archive(
+            &archive_path,
+            &[
+                (
+                    "bin/version.json",
+                    br#"{
+                      "inheritsFrom": "1.12.2",
+                      "libraries": [
+                        { "name": "net.minecraftforge:forge:1.12.2-14.23.5.2860" }
+                      ]
+                    }"#,
+                ),
+                ("mods/example.jar", b"mod"),
+                ("config/example.cfg", b"config"),
+            ],
+        );
+        let download_plan = TechnicModpackDownloadPlan {
+            slug: "tekxit-3-official-1122".to_owned(),
+            name: "Tekxit 3 [Official]".to_owned(),
+            minecraft_version: "1.12.2".to_owned(),
+            pack_version: Some("1.3".to_owned()),
+            archive_download_plan: DownloadPlan {
+                version_id: "technic-archive-test".to_owned(),
+                items: Vec::new(),
+            },
+            archive_path: archive_path.clone(),
+            module_archive_paths: Vec::new(),
+            source_kind: TechnicModpackDownloadKind::DirectZip,
+        };
+
+        let plan = build_technic_modpack_archive_install_plan(
+            &archive_path,
+            &download_plan,
+            None,
+            &directories,
+        )
+        .expect("Technic archive should build an install plan");
+        assert_eq!(plan.profile.id, "technic-tekxit-3-official-1122");
+        assert_eq!(plan.profile.loader, ModLoader::Forge);
+        assert_eq!(plan.profile.game_version, "1.12.2");
+        assert_eq!(plan.loader_version.as_deref(), Some("14.23.5.2860"));
+        assert_eq!(plan.profile.installed_pack_version.as_deref(), Some("1.3"));
+
+        extract_technic_modpack_archive(&archive_path, &plan, &directories)
+            .expect("Technic archive should extract");
+        let profile_root =
+            profile_data_dir(&directories, &plan.profile.id).expect("profile root should resolve");
+        assert!(profile_root.join("mods/example.jar").exists());
+        assert!(profile_root.join("config/example.cfg").exists());
+    }
+
+    #[test]
+    fn technic_legacy_modpack_jar_reads_forge_properties() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let nested_jar = root.path().join("modpack.jar");
+        write_zip_archive(
+            &nested_jar,
+            &[(
+                "forgeversion.properties",
+                b"forge.major.number=7\nforge.minor.number=8\nforge.revision.number=1\nforge.build.number=738\n",
+            )],
+        );
+        let nested_bytes = fs::read(&nested_jar).expect("nested jar should read");
+        let archive_path = root.path().join("tekkit-lite.zip");
+        write_zip_archive(
+            &archive_path,
+            &[
+                ("bin/modpack.jar", nested_bytes.as_slice()),
+                ("mods/example.jar", b"mod"),
+                ("config/example.cfg", b"config"),
+            ],
+        );
+        let download_plan = TechnicModpackDownloadPlan {
+            slug: "tekkit-lite".to_owned(),
+            name: "Tekkit Lite".to_owned(),
+            minecraft_version: "1.4.7".to_owned(),
+            pack_version: Some("0.6.6".to_owned()),
+            archive_download_plan: DownloadPlan {
+                version_id: "technic-legacy-archive-test".to_owned(),
+                items: Vec::new(),
+            },
+            archive_path: archive_path.clone(),
+            module_archive_paths: Vec::new(),
+            source_kind: TechnicModpackDownloadKind::DirectZip,
+        };
+
+        let plan = build_technic_modpack_archive_install_plan(
+            &archive_path,
+            &download_plan,
+            None,
+            &directories,
+        )
+        .expect("Technic legacy archive should build an install plan");
+        assert_eq!(plan.profile.loader, ModLoader::Forge);
+        assert_eq!(plan.profile.game_version, "1.4.7");
+        assert_eq!(plan.loader_version.as_deref(), Some("7.8.1.738"));
+
+        extract_technic_modpack_archive(&archive_path, &plan, &directories)
+            .expect("Technic legacy archive should extract");
+        let profile_root =
+            profile_data_dir(&directories, &plan.profile.id).expect("profile root should resolve");
+        assert!(profile_root.join("bin/modpack.jar").exists());
+        assert!(profile_root.join("mods/example.jar").exists());
+        assert!(profile_root.join("config/example.cfg").exists());
+    }
+
+    #[test]
+    fn technic_archive_rejects_unsafe_paths() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let archive_path = root.path().join("unsafe.zip");
+        write_zip_archive(&archive_path, &[("../escape.txt", b"bad")]);
+
+        let result =
+            extract_technic_zip_root_to_profile(&archive_path, &root.path().join("profile"));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Technic archive path"));
+    }
+
+    #[test]
+    fn technic_solder_modules_build_plan_and_extract() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let modules_root = root.path().join("modules");
+        let core_module = modules_root.join("core.zip");
+        let files_module = modules_root.join("files.zip");
+        let nested_version = root.path().join("modpack.jar");
+        write_zip_archive(
+            &nested_version,
+            &[(
+                "version.json",
+                br#"{
+                  "inheritsFrom": "1.12.2",
+                  "libraries": [
+                    { "name": "net.minecraftforge:forge:1.12.2-14.23.5.2860" }
+                  ]
+                }"#,
+            )],
+        );
+        let nested_bytes = fs::read(&nested_version).expect("nested jar should read");
+        write_zip_archive(
+            &core_module,
+            &[("bin/modpack.jar", nested_bytes.as_slice())],
+        );
+        write_zip_archive(
+            &files_module,
+            &[
+                ("mods/example.jar", b"mod"),
+                ("config/example.cfg", b"config"),
+            ],
+        );
+        let metadata = TechnicModpackMetadata {
+            slug: "the-1122-pack".to_owned(),
+            name: "The 1.12.2 Pack".to_owned(),
+            minecraft_version: "1.12.2".to_owned(),
+            pack_version: Some("1.6.6".to_owned()),
+            archive_url: None,
+            solder_url: Some("https://solder.technicpack.net/api/".to_owned()),
+        };
+        let solder_plan = technic_solder_download_plan_from_build_json(
+            &metadata,
+            "The 1.12.2 Pack",
+            "1.6.6",
+            &modules_root,
+            "test",
+            r#"{
+              "minecraft": "1.12.2",
+              "mods": [
+                {
+                  "name": "core",
+                  "version": "1.0.0",
+                  "md5": "0123456789abcdef0123456789abcdef",
+                  "url": "https://mirror.example.com/core.zip",
+                  "filesize": 120
+                },
+                {
+                  "name": "files",
+                  "version": "1.0.0",
+                  "md5": "fedcba9876543210fedcba9876543210",
+                  "url": "https://mirror.example.com/files.zip",
+                  "filesize": 80
+                }
+              ]
+            }"#,
+        )
+        .expect("Solder build should parse");
+        assert_eq!(solder_plan.download_plan.items.len(), 2);
+        assert_eq!(
+            solder_plan.download_plan.items[0].md5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+
+        let download_plan = TechnicModpackDownloadPlan {
+            slug: metadata.slug,
+            name: solder_plan.name,
+            minecraft_version: solder_plan.minecraft_version,
+            pack_version: Some(solder_plan.pack_version),
+            archive_download_plan: solder_plan.download_plan,
+            archive_path: modules_root.clone(),
+            module_archive_paths: vec![core_module, files_module],
+            source_kind: TechnicModpackDownloadKind::SolderModules,
+        };
+        let plan = build_technic_modpack_archive_install_plan(
+            &download_plan.archive_path,
+            &download_plan,
+            None,
+            &directories,
+        )
+        .expect("Technic Solder modules should build install plan");
+        assert_eq!(plan.profile.loader, ModLoader::Forge);
+        assert_eq!(plan.profile.game_version, "1.12.2");
+        assert_eq!(plan.loader_version.as_deref(), Some("14.23.5.2860"));
+
+        extract_technic_modpack_archive(&download_plan.archive_path, &plan, &directories)
+            .expect("Technic Solder modules should extract");
+        let profile_root =
+            profile_data_dir(&directories, &plan.profile.id).expect("profile root should resolve");
+        assert!(profile_root.join("bin/modpack.jar").exists());
+        assert!(profile_root.join("mods/example.jar").exists());
+        assert!(profile_root.join("config/example.cfg").exists());
+    }
+
+    #[test]
+    fn ftb_legacy_metadata_builds_download_and_extract_plan() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let metadata = ftb_legacy_metadata_from_xml(
+            r#"<modpacks>
+              <modpack
+                author="The FTB Team"
+                name="FTB Academy"
+                version="1.1.0"
+                mcVersion="1.12.2"
+                dir="FTBAcademy"
+                url="FTBAcademy.zip"
+                oldVersions="1.1.0;1.0.0" />
+            </modpacks>"#,
+            "public",
+            "FTBAcademy",
+            "FTBAcademy.zip",
+        )
+        .expect("FTB Legacy metadata feed should parse")
+        .expect("metadata should be found");
+
+        assert_eq!(metadata.name, "FTB Academy");
+        assert_eq!(metadata.feed_kind, "public");
+        assert_eq!(metadata.minecraft_version, "1.12.2");
+        assert_eq!(metadata.pack_version, "1.1.0");
+
+        let archive_path = root.path().join("FTBAcademy.zip");
+        write_zip_archive(
+            &archive_path,
+            &[
+                (
+                    "minecraft/pack.json",
+                    br#"{
+                      "libraries": [
+                        { "name": "net.minecraftforge:forge:1.12.2-14.23.5.2860" }
+                      ]
+                    }"#,
+                ),
+                ("minecraft/config/example.cfg", b"enabled=true".as_slice()),
+            ],
+        );
+        let download_plan = FtbLegacyModpackDownloadPlan {
+            name: metadata.name,
+            feed_kind: metadata.feed_kind,
+            directory: metadata.directory,
+            file_name: metadata.file_name,
+            minecraft_version: metadata.minecraft_version,
+            pack_version: metadata.pack_version,
+            archive_download_plan: DownloadPlan {
+                version_id: "ftb-legacy-test-archive".to_owned(),
+                items: Vec::new(),
+            },
+            archive_path: archive_path.clone(),
+        };
+        let plan = build_ftb_legacy_modpack_archive_install_plan(
+            &archive_path,
+            &download_plan,
+            Some("FTB Academy"),
+            &directories,
+        )
+        .expect("FTB Legacy archive plan should build");
+
+        assert_eq!(plan.profile.id, "ftb-legacy-ftb-academy");
+        assert_eq!(plan.profile.loader, ModLoader::Forge);
+        assert_eq!(plan.profile.game_version, "1.12.2");
+        assert_eq!(
+            plan.profile.installed_pack_version.as_deref(),
+            Some("1.1.0")
+        );
+        assert_eq!(plan.loader_version.as_deref(), Some("14.23.5.2860"));
+
+        extract_ftb_legacy_modpack_archive(&archive_path, &plan, &directories)
+            .expect("FTB Legacy archive should extract");
+        assert!(root
+            .path()
+            .join("data/profiles/ftb-legacy-ftb-academy/config/example.cfg")
+            .is_file());
+    }
+
+    #[test]
+    fn ftb_legacy_archive_rejects_path_traversal() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let archive_path = root.path().join("BadLegacy.zip");
+        write_zip_archive(
+            &archive_path,
+            &[
+                (
+                    "minecraft/pack.json",
+                    br#"{
+                      "libraries": [
+                        { "name": "net.minecraftforge:forge:1.12.2-14.23.5.2860" }
+                      ]
+                    }"#,
+                ),
+                ("minecraft/../escape.txt", b"bad".as_slice()),
+            ],
+        );
+        let profile = ProfileSummary {
+            id: "ftb-legacy-bad".to_owned(),
+            name: "Bad Legacy".to_owned(),
+            loader: ModLoader::Forge,
+            game_version: "1.12.2".to_owned(),
+            installed_pack_version: Some("1.0.0".to_owned()),
+            last_played: None,
+            memory_mb: 6144,
+            jvm_args: Vec::new(),
+            resolution: None,
+            default_server: None,
+            java_runtime_override_path: None,
+        };
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = FtbLegacyModpackArchiveInstallPlan {
+            profile,
+            loader_version: Some("14.23.5.2860".to_owned()),
+        };
+        let error = extract_ftb_legacy_modpack_archive(&archive_path, &plan, &directories)
+            .expect_err("path traversal should be rejected");
+        assert!(error
+            .to_string()
+            .contains("FTB Legacy archive Minecraft path"));
+    }
+
+    #[test]
+    fn ftb_install_plan_builds_profile_and_client_file_downloads() {
+        let root = tempfile::tempdir().expect("tempdir should create");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = ftb_install_plan_from_version_json(
+            "126",
+            "12482",
+            Some("FTB Presents Direwolf20 1.21"),
+            &directories,
+            r#"{
+              "status": "success",
+              "targets": [
+                { "version": "21.1.51", "id": 10353, "name": "neoforge", "type": "modloader" },
+                { "version": "1.21.1", "id": 10271, "name": "minecraft", "type": "game" }
+              ],
+              "specs": { "minimum": 4096, "recommended": 6144 },
+              "files": [
+                {
+                  "id": 359393,
+                  "path": "./config/CoroUtil/",
+                  "url": "https://dist.modpacks.ch/modpacks/example/config/CoroUtil/sha",
+                  "sha1": "3bd7d98616d2c4ff4ee7c8e12257bf7e5891d955",
+                  "size": 121,
+                  "serveronly": false,
+                  "optional": false,
+                  "name": "General.toml"
+                },
+                {
+                  "id": 1,
+                  "path": "./mods/",
+                  "url": "https://dist.modpacks.ch/server-only.jar",
+                  "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "size": 1,
+                  "serveronly": true,
+                  "optional": false,
+                  "name": "server-only.jar"
+                },
+                {
+                  "id": 2,
+                  "path": "./mods/",
+                  "url": "https://dist.modpacks.ch/optional.jar",
+                  "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "size": 1,
+                  "serveronly": false,
+                  "optional": true,
+                  "name": "optional.jar"
+                }
+              ]
+            }"#,
+        )
+        .expect("FTB install plan should parse");
+
+        assert_eq!(plan.profile.id, "ftb-126");
+        assert_eq!(plan.profile.name, "FTB Presents Direwolf20 1.21");
+        assert_eq!(plan.profile.loader, ModLoader::Neoforge);
+        assert_eq!(plan.profile.game_version, "1.21.1");
+        assert_eq!(
+            plan.profile.installed_pack_version.as_deref(),
+            Some("12482")
+        );
+        assert_eq!(plan.profile.memory_mb, 6144);
+        assert_eq!(plan.loader_version.as_deref(), Some("21.1.51"));
+        assert_eq!(plan.file_download_plan.items.len(), 1);
+        let item = &plan.file_download_plan.items[0];
+        assert_eq!(item.id, "ftb-file-359393");
+        assert_eq!(item.kind, DownloadKind::PackFile);
+        assert_eq!(
+            item.sha1.as_deref(),
+            Some("3bd7d98616d2c4ff4ee7c8e12257bf7e5891d955")
+        );
+        assert!(item
+            .destination
+            .replace('\\', "/")
+            .ends_with("data/profiles/ftb-126/config/CoroUtil/General.toml"));
+    }
+
+    #[test]
     fn modrinth_archive_resolution_prefers_primary_mrpack_file() {
         let resolution = modrinth_archive_resolution_from_versions_json(
             "1KVo5zza",
@@ -17250,6 +23451,63 @@ hash = "1234"
         .expect_err("versions without .mrpack should fail");
 
         assert!(error.to_string().contains("no downloadable .mrpack"));
+    }
+
+    #[test]
+    fn modrinth_archive_resolution_from_version_json_uses_exact_version() {
+        let resolution = modrinth_archive_resolution_from_version_json(
+            "1KVo5zza",
+            r#"{
+              "id": "exact-version",
+              "name": "Exact version",
+              "files": [
+                {
+                  "url": "https://cdn.modrinth.com/data/1KVo5zza/versions/exact/signature.zip",
+                  "filename": "signature.zip",
+                  "primary": true,
+                  "size": 100,
+                  "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+                },
+                {
+                  "url": "https://cdn.modrinth.com/data/1KVo5zza/versions/exact/pack.mrpack",
+                  "filename": "pack.mrpack",
+                  "primary": false,
+                  "size": 4096,
+                  "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+                }
+              ]
+            }"#,
+        )
+        .expect("version response should resolve an archive");
+
+        assert_eq!(resolution.project_id, "1KVo5zza");
+        assert_eq!(resolution.version_id, "exact-version");
+        assert_eq!(resolution.version_name, "Exact version");
+        assert_eq!(resolution.file_name, "pack.mrpack");
+        assert_eq!(resolution.size, Some(4096));
+    }
+
+    #[test]
+    fn modrinth_archive_resolution_from_version_json_rejects_non_https_archive() {
+        let error = modrinth_archive_resolution_from_version_json(
+            "1KVo5zza",
+            r#"{
+              "id": "bad-version",
+              "name": "Bad version",
+              "files": [
+                {
+                  "url": "http://cdn.modrinth.com/data/1KVo5zza/versions/bad/pack.mrpack",
+                  "filename": "pack.mrpack",
+                  "primary": true,
+                  "size": 4096,
+                  "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+                }
+              ]
+            }"#,
+        )
+        .expect_err("non-HTTPS Modrinth archive should fail");
+
+        assert!(error.to_string().contains("must use HTTPS"));
     }
 
     #[test]
@@ -18013,6 +24271,48 @@ version = "safeVersion"
     }
 
     #[test]
+    fn stored_minecraft_accounts_list_falls_back_when_active_id_is_stale() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let session_path = root.path().join("minecraft-session.json");
+        let accounts_path = root.path().join("minecraft-accounts.json");
+        let session = StoredMinecraftSession {
+            session: MinecraftSession {
+                username: "BuilderOne".to_owned(),
+                uuid: Uuid::parse_str("12345678-1234-5678-9234-567812345678")
+                    .expect("uuid fixture"),
+                access_token: "token-1".to_owned(),
+            },
+            account_id: Some("account-1".to_owned()),
+            expires_at_unix_seconds: Some(2_000),
+            microsoft_refresh_token: Some("refresh-token-1".to_owned()),
+            microsoft_client_id: Some("client-123".to_owned()),
+            microsoft_user_id: Some("ms-user-1".to_owned()),
+            microsoft_scopes: Some("XboxLive.signin offline_access".to_owned()),
+            stored_at_unix_seconds: 1_000,
+        };
+        let document = StoredMinecraftAccountsDocument {
+            active_account_id: Some("missing-account".to_owned()),
+            accounts: vec![session.clone()],
+        };
+
+        save_minecraft_session_to_path(&session_path, session.clone())
+            .expect("legacy active session should save");
+        save_minecraft_accounts_document_to_path(&accounts_path, &document)
+            .expect("accounts document should save");
+
+        let accounts = list_minecraft_accounts_from_paths(&session_path, &accounts_path)
+            .expect("accounts should list");
+        let active = load_active_minecraft_session_from_paths(&session_path, &accounts_path)
+            .expect("active should load")
+            .expect("active should fall back");
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, "account-1");
+        assert!(accounts[0].active);
+        assert_eq!(active.session.username, "BuilderOne");
+    }
+
+    #[test]
     fn stored_minecraft_accounts_fall_back_to_legacy_session_file() {
         let root = tempfile::tempdir().expect("tempdir should be available");
         let session_path = root.path().join("minecraft-session.json");
@@ -18447,6 +24747,12 @@ version = "safeVersion"
                 .find(|field| field.key == "scope")
                 .map(|field| field.value.as_str()),
             Some("XboxLive.signin offline_access")
+        );
+        assert!(
+            plan.form_fields
+                .iter()
+                .all(|field| field.key != "client_secret"),
+            "desktop PKCE token exchange must not require a client secret"
         );
     }
 
@@ -21766,6 +28072,131 @@ JAVA_VERSION="21.0.4"
     }
 
     #[test]
+    fn duplicate_profile_copies_managed_data_as_independent_profile() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let profiles_path = root.path().join("profiles.json");
+        let data_dir = root.path().join("data");
+        let source_profile_dir = data_dir.join("profiles/winterpack");
+        fs::create_dir_all(source_profile_dir.join("config")).expect("profile dir should create");
+        fs::write(source_profile_dir.join("config/options.txt"), b"copied")
+            .expect("profile file should write");
+        save_profiles_to_path(
+            &profiles_path,
+            &[
+                ProfileSummary {
+                    id: "winterpack".to_owned(),
+                    name: "WinterPack".to_owned(),
+                    loader: ModLoader::Fabric,
+                    game_version: "1.21.1".to_owned(),
+                    installed_pack_version: Some("2.3.7".to_owned()),
+                    last_played: Some("unix:1780000000".to_owned()),
+                    memory_mb: 6144,
+                    jvm_args: vec!["-Dexample=true".to_owned()],
+                    resolution: Some(ProfileResolution {
+                        width: 1280,
+                        height: 720,
+                    }),
+                    default_server: Some(ServerLaunchTarget {
+                        name: Some("Friends".to_owned()),
+                        address: "play.example.test".to_owned(),
+                        port: Some(25565),
+                    }),
+                    java_runtime_override_path: Some("C:/Java/bin/java.exe".to_owned()),
+                },
+                ProfileSummary {
+                    id: "winterpack-copy".to_owned(),
+                    name: "WinterPack Copy".to_owned(),
+                    loader: ModLoader::Vanilla,
+                    game_version: "1.21.8".to_owned(),
+                    installed_pack_version: None,
+                    last_played: None,
+                    memory_mb: 4096,
+                    jvm_args: Vec::new(),
+                    resolution: None,
+                    default_server: None,
+                    java_runtime_override_path: None,
+                },
+            ],
+        )
+        .expect("profiles should save");
+
+        let duplicate = duplicate_profile_at_path(
+            &profiles_path,
+            DuplicateProfileRequest {
+                id: "winterpack".to_owned(),
+                name: None,
+            },
+            &LauncherDirectories {
+                data_dir: display_path(&data_dir),
+                config_dir: display_path(root.path()),
+                cache_dir: display_path(root.path()),
+                log_dir: display_path(root.path()),
+            },
+        )
+        .expect("profile should duplicate");
+        let profiles = load_profiles_from_path(&profiles_path).expect("profiles should load");
+        let duplicate_profile_dir = data_dir.join("profiles").join(&duplicate.id);
+
+        assert_eq!(duplicate.id, "winterpack-copy-2");
+        assert_eq!(duplicate.name, "WinterPack Copy 2");
+        assert_eq!(duplicate.loader, ModLoader::Fabric);
+        assert_eq!(duplicate.game_version, "1.21.1");
+        assert_eq!(duplicate.installed_pack_version, None);
+        assert_eq!(duplicate.last_played, None);
+        assert_eq!(duplicate.memory_mb, 6144);
+        assert_eq!(duplicate.jvm_args, vec!["-Dexample=true".to_owned()]);
+        assert_eq!(
+            fs::read(duplicate_profile_dir.join("config/options.txt"))
+                .expect("copied file should read"),
+            b"copied"
+        );
+        assert!(source_profile_dir.join("config/options.txt").is_file());
+        assert!(profiles.iter().any(|profile| profile.id == "winterpack"));
+        assert!(profiles.iter().any(|profile| profile.id == duplicate.id));
+    }
+
+    #[test]
+    fn duplicate_profile_rejects_blank_missing_or_unsafe_ids() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let profiles_path = root.path().join("profiles.json");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("data")),
+            config_dir: display_path(root.path()),
+            cache_dir: display_path(root.path()),
+            log_dir: display_path(root.path()),
+        };
+        load_profiles_from_path(&profiles_path).expect("profiles should seed");
+
+        assert!(duplicate_profile_at_path(
+            &profiles_path,
+            DuplicateProfileRequest {
+                id: " ".to_owned(),
+                name: None,
+            },
+            &directories,
+        )
+        .is_err());
+        assert!(duplicate_profile_at_path(
+            &profiles_path,
+            DuplicateProfileRequest {
+                id: "../winterpack".to_owned(),
+                name: None,
+            },
+            &directories,
+        )
+        .is_err());
+        assert!(duplicate_profile_at_path(
+            &profiles_path,
+            DuplicateProfileRequest {
+                id: "missing-profile".to_owned(),
+                name: None,
+            },
+            &directories,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn delete_profile_removes_catalog_entry_and_managed_profile_directory_only() {
         let root = tempfile::tempdir().expect("tempdir should be available");
         let profiles_path = root.path().join("profiles.json");
@@ -23059,6 +29490,74 @@ JAVA_VERSION="21.0.4"
     }
 
     #[test]
+    fn launcher_event_log_stores_player_facing_download_progress() {
+        let plan = DownloadPlan {
+            version_id: "winterpack-modloader-artifacts".to_owned(),
+            items: vec![
+                DownloadItem {
+                    id: "client-1.21.8".to_owned(),
+                    kind: DownloadKind::ClientJar,
+                    url: "https://cdn.theboys.example/client.jar".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(20),
+                    destination: "C:/cache/versions/1.21.8/client.jar".to_owned(),
+                },
+                DownloadItem {
+                    id: "asset-object-minecraft/sounds/random/click.ogg".to_owned(),
+                    kind: DownloadKind::AssetObject,
+                    url: "https://resources.download.minecraft.net/00/click.ogg".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(16),
+                    destination: "C:/cache/assets/objects/00/click.ogg".to_owned(),
+                },
+                DownloadItem {
+                    id: "forge-bootstrap".to_owned(),
+                    kind: DownloadKind::ModLoaderInstaller,
+                    url: "https://maven.minecraftforge.net/bootstrap.jar".to_owned(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    md5: None,
+                    murmur2: None,
+                    size: Some(12),
+                    destination: "C:/cache/modloaders/forge/bootstrap.jar".to_owned(),
+                },
+            ],
+        };
+        let raw_plan = plan_download_artifacts(&plan);
+        let event_log = LauncherEventLog::new();
+
+        event_log
+            .record_plan(&raw_plan)
+            .expect("plan should record");
+        let events = event_log.list(None).expect("events should list");
+        let messages = events
+            .iter()
+            .map(|event| event.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(messages.contains(&"Waiting to download Minecraft client"));
+        assert!(messages.contains(&"Waiting to download Minecraft assets"));
+        assert!(messages.contains(&"Waiting to download mod loader files"));
+        assert!(messages.contains(&"Checking downloaded files."));
+        assert!(messages.contains(&"Files are ready."));
+        assert!(messages.iter().all(|message| {
+            !message.contains("Artifact pending:")
+                && !message.contains("File download completed")
+                && !message.contains("(client jar")
+                && !message.contains("(modloader installer")
+        }));
+    }
+
+    #[test]
     fn download_plan_rejects_invalid_asset_hashes() {
         let directories = LauncherDirectories {
             data_dir: "C:/data".to_owned(),
@@ -24005,6 +30504,10 @@ JAVA_VERSION="21.0.4"
         assert_eq!(plan.profile.id, "enigmatica9expert");
         assert_eq!(plan.profile.loader, ModLoader::Forge);
         assert_eq!(plan.profile.game_version, "1.19.2");
+        assert_eq!(
+            plan.profile.installed_pack_version.as_deref(),
+            Some("1.27.0")
+        );
         assert_eq!(plan.loader_version.as_deref(), Some("43.4.23"));
         assert_eq!(plan.mod_download_plan.items.len(), 1);
         assert!(plan.mod_download_plan.items[0]
@@ -24100,7 +30603,7 @@ JAVA_VERSION="21.0.4"
         let modrinth_index = br#"{
           "formatVersion": 1,
           "game": "minecraft",
-          "versionId": "1.20.1",
+          "versionId": "modrinth-version-7",
           "name": "More Mod Variants",
           "summary": "Fixture pack",
           "files": [
@@ -24152,6 +30655,10 @@ JAVA_VERSION="21.0.4"
         assert_eq!(plan.profile.id, "more-mod-variants");
         assert_eq!(plan.profile.loader, ModLoader::Fabric);
         assert_eq!(plan.profile.game_version, "1.20.1");
+        assert_eq!(
+            plan.profile.installed_pack_version.as_deref(),
+            Some("modrinth-version-7")
+        );
         assert_eq!(plan.loader_version.as_deref(), Some("0.15.11"));
         assert_eq!(plan.file_download_plan.items.len(), 1);
         assert_eq!(
@@ -24231,16 +30738,21 @@ JAVA_VERSION="21.0.4"
         let multimc = root.path().join("MultiMC/instances/Creative Night");
         let gdlauncher = root.path().join("GDLauncher_next/instances/Sky Lab");
         let atlauncher = root.path().join("ATLauncher/instances/Quest Pack");
+        let ftb_app = root.path().join(".ftba/instances/Direwolf20");
         let minecraft = root.path().join(".minecraft");
 
         fs::create_dir_all(&prism).expect("create prism fixture");
         fs::create_dir_all(&multimc).expect("create multimc fixture");
         fs::create_dir_all(&gdlauncher).expect("create gdlauncher fixture");
         fs::create_dir_all(&atlauncher).expect("create atlauncher fixture");
+        fs::create_dir_all(&ftb_app).expect("create ftb app fixture");
         fs::create_dir_all(&minecraft).expect("create minecraft fixture");
         fs::create_dir_all(prism.join("saves/world")).expect("create prism save fixture");
         fs::write(prism.join("saves/world/level.dat"), "level").expect("write prism save");
         fs::write(prism.join("options.txt"), "fov:0.5").expect("write prism options");
+        fs::create_dir_all(ftb_app.join(".minecraft/config")).expect("create ftb config fixture");
+        fs::write(ftb_app.join(".minecraft/config/ftbquests.snbt"), "quest")
+            .expect("write ftb config");
         fs::write(prism.join("theboys-icon.png"), "png").expect("write prism icon");
         fs::create_dir_all(multimc.join("mods")).expect("create multimc mods fixture");
         fs::write(multimc.join("mods/example.jar"), "mod").expect("write multimc mod");
@@ -24295,6 +30807,16 @@ JAVA_VERSION="21.0.4"
         )
         .expect("write atlauncher metadata");
         fs::write(
+            ftb_app.join("instance.json"),
+            r#"{
+              "instanceName": "FTB Presents Direwolf20 1.21",
+              "synopsis": "FTB App kitchen-sink fixture",
+              "modLoaderType": "neoforge",
+              "mcVersion": "1.21.1"
+            }"#,
+        )
+        .expect("write ftb app metadata");
+        fs::write(
             minecraft.join("launcher_profiles.json"),
             r#"{
               "selectedProfile": "snapshot-night",
@@ -24315,7 +30837,7 @@ JAVA_VERSION="21.0.4"
         let candidates =
             scan_imports_in_roots([root.path().to_path_buf()]).expect("scan should pass");
 
-        assert_eq!(candidates.len(), 5);
+        assert_eq!(candidates.len(), 6);
         assert!(candidates
             .iter()
             .any(|candidate| candidate.kind == ImportKind::Prism
@@ -24359,6 +30881,17 @@ JAVA_VERSION="21.0.4"
                 && candidate.detected_summary.as_deref() == Some("ATLauncher quest fixture")));
         assert!(candidates
             .iter()
+            .any(|candidate| candidate.kind == ImportKind::FtbApp
+                && candidate.source == "FTB App"
+                && candidate.name == "Direwolf20"
+                && candidate.detected_loader == Some(ModLoader::Neoforge)
+                && candidate.detected_game_version.as_deref() == Some("1.21.1")
+                && candidate.detected_name.as_deref() == Some("FTB Presents Direwolf20 1.21")
+                && candidate.detected_summary.as_deref() == Some("FTB App kitchen-sink fixture")
+                && candidate.importable_file_count == Some(1)
+                && candidate.importable_total_bytes == Some(5)));
+        assert!(candidates
+            .iter()
             .any(|candidate| candidate.kind == ImportKind::Minecraft
                 && candidate.detected_loader == Some(ModLoader::Vanilla)
                 && candidate.detected_name.as_deref() == Some("Snapshot Night")
@@ -24383,11 +30916,12 @@ JAVA_VERSION="21.0.4"
     #[test]
     fn minecraft_version_detector_accepts_releases_snapshots_and_prereleases() {
         assert!(looks_like_minecraft_version("1.21.8"));
+        assert!(looks_like_minecraft_version("1.5.2"));
+        assert!(looks_like_minecraft_version("1.4.7"));
         assert!(looks_like_minecraft_version("25w31a"));
         assert!(looks_like_minecraft_version("1.21-pre1"));
         assert!(looks_like_minecraft_version("1.21-rc1"));
         assert!(!looks_like_minecraft_version("2.0"));
-        assert!(!looks_like_minecraft_version("1.5.2"));
         assert!(!looks_like_minecraft_version("1.21-pre"));
         assert!(!looks_like_minecraft_version("profile-latest"));
     }
@@ -24450,6 +30984,55 @@ JAVA_VERSION="21.0.4"
     }
 
     #[test]
+    fn import_plan_uses_nested_minecraft_data_folder_when_present() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("PrismLauncher/instances/WinterPack");
+        fs::create_dir_all(&source).expect("create source fixture");
+        fs::write(
+            source.join("instance.cfg"),
+            "name=WinterPack\nnotes=Nested Minecraft data fixture",
+        )
+        .expect("write metadata marker");
+        fs::create_dir_all(source.join(".minecraft/saves/world-one")).expect("saves fixture");
+        fs::write(source.join(".minecraft/saves/world-one/level.dat"), "level")
+            .expect("save fixture");
+        fs::write(source.join(".minecraft/options.txt"), "fov:0.5").expect("options fixture");
+        fs::write(source.join("options.txt"), "launcher-root-options")
+            .expect("root options should be ignored");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("TheBoysLauncher")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+
+        let plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+
+        assert_eq!(plan.source_path, display_path(&source));
+        assert!(plan.items.iter().any(|item| {
+            item.kind == ImportPlanItemKind::Saves
+                && item.exists
+                && item.source.ends_with("/.minecraft/saves")
+                && item.destination.ends_with("/profiles/winterpack/saves")
+                && item.file_count == Some(1)
+                && item.total_bytes == Some(5)
+        }));
+        assert!(plan.items.iter().any(|item| {
+            item.kind == ImportPlanItemKind::Options
+                && item.exists
+                && item.source.ends_with("/.minecraft/options.txt")
+                && item.total_bytes == Some(7)
+        }));
+    }
+
+    #[test]
     fn import_plan_rejects_missing_source_directory() {
         let root = tempfile::tempdir().expect("tempdir should be available");
         let directories = LauncherDirectories {
@@ -24507,6 +31090,46 @@ JAVA_VERSION="21.0.4"
             events.events.last().map(|event| &event.kind),
             Some(&LauncherEventKind::Completed)
         );
+    }
+
+    #[test]
+    fn import_plan_execution_copies_nested_minecraft_data_items() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let source = root.path().join("PrismLauncher/instances/WinterPack");
+        let save = source.join(".minecraft/saves/world-one");
+        fs::create_dir_all(&save).expect("save fixture");
+        fs::write(save.join("level.dat"), "world").expect("world fixture");
+        fs::write(source.join(".minecraft/options.txt"), "fov:0.5").expect("options fixture");
+        fs::write(source.join("options.txt"), "root").expect("root fixture");
+        let directories = LauncherDirectories {
+            data_dir: display_path(&root.path().join("TheBoysLauncher")),
+            config_dir: display_path(&root.path().join("config")),
+            cache_dir: display_path(&root.path().join("cache")),
+            log_dir: display_path(&root.path().join("logs")),
+        };
+        let plan = build_import_plan(
+            ImportPlanRequest {
+                name: "WinterPack".to_owned(),
+                source_path: display_path(&source),
+            },
+            &directories,
+        )
+        .expect("import plan should build");
+
+        execute_import_plan(&plan).expect("import should execute");
+
+        assert!(Path::new(&plan.destination_path)
+            .join("saves/world-one/level.dat")
+            .is_file());
+        assert_eq!(
+            fs::read_to_string(Path::new(&plan.destination_path).join("options.txt"))
+                .expect("imported options should read"),
+            "fov:0.5"
+        );
+        assert!(source
+            .join(".minecraft/saves/world-one/level.dat")
+            .is_file());
+        assert!(source.join("options.txt").is_file());
     }
 
     #[test]
