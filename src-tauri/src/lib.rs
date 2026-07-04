@@ -91,6 +91,7 @@ use launcher_core::{
     refresh_saved_minecraft_session as core_refresh_saved_minecraft_session,
     remove_minecraft_account as core_remove_minecraft_account,
     required_java_major_for_minecraft as core_required_java_major_for_minecraft,
+    resolve_curseforge_modpack_mod_download_plan as core_resolve_curseforge_modpack_mod_download_plan,
     resolve_minecraft_version as core_resolve_minecraft_version,
     resolve_modrinth_modpack_archive as core_resolve_modrinth_modpack_archive,
     resolve_modrinth_modpack_archive_version as core_resolve_modrinth_modpack_archive_version,
@@ -837,7 +838,8 @@ fn hide_backend_console_window(command: &mut Command) {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x08000000;
-    command.creation_flags(CREATE_NO_WINDOW);
+    const DETACHED_PROCESS: u32 = 0x00000008;
+    command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
 }
 
 #[cfg(not(windows))]
@@ -3329,18 +3331,28 @@ async fn write_packaged_smoke_activity_progress_probe(
         .map(|event| event.message.clone())
         .collect::<Vec<_>>();
     let required_messages = [
-        "Downloading Minecraft client",
-        "Minecraft client ready",
-        "Downloading Minecraft assets",
-        "Minecraft assets ready",
-        "Downloading mod loader files",
-        "mod loader files ready",
+        "Preparing files: 0 of 3 ready. Downloads are starting.",
+        "Checking downloaded files.",
         "Files are ready.",
     ];
     for required in required_messages {
         if !messages.iter().any(|message| message == required) {
             return Err(format!(
                 "packaged activity progress smoke did not record '{required}': {messages:?}"
+            ));
+        }
+    }
+    for required_fragment in [
+        "Downloaded Minecraft client.",
+        "Downloaded Minecraft assets.",
+        "Downloaded mod loader files.",
+    ] {
+        if !messages
+            .iter()
+            .any(|message| message.contains(required_fragment))
+        {
+            return Err(format!(
+                "packaged activity progress smoke did not record '{required_fragment}': {messages:?}"
             ));
         }
     }
@@ -4800,7 +4812,7 @@ fn write_packaged_smoke_long_running_java(fake_java: &Path) -> Result<(), String
     if cfg!(target_os = "windows") {
         fs::write(
             fake_java,
-            b"@echo off\r\nif \"%~1\"==\"-version\" (\r\n  echo openjdk version \"21.0.2\" 2024-01-16 1>&2\r\n  exit /B 0\r\n)\r\necho packaged smoke process started\r\nping -n 5 127.0.0.1 >NUL\r\n",
+            b"@echo off\r\nif \"%~1\"==\"-version\" (\r\n  echo openjdk version \"21.0.2\" 2024-01-16 1>&2\r\n  exit /B 0\r\n)\r\necho packaged smoke process started\r\nfor /L %%i in (1,1,70000000) do @rem\r\n",
         )
         .map_err(|error| error.to_string())?;
     } else {
@@ -6774,10 +6786,19 @@ async fn install_modpack_archive(
                 .map_err(|error| {
                     native_operation_failure_message("Modpack install failed", &error.to_string())
                 })?;
+        let mod_download_plan = core_resolve_curseforge_modpack_mod_download_plan(
+            &archive_path,
+            &install_plan,
+            &directories,
+        )
+        .await
+        .map_err(|error| {
+            native_operation_failure_message("Modpack install failed", &error.to_string())
+        })?;
         (
             profile,
             install_plan.loader_version.clone(),
-            install_plan.mod_download_plan.clone(),
+            mod_download_plan,
             extraction,
         )
     };
@@ -6958,11 +6979,20 @@ async fn install_discover_modpack(
         event_log
             .record_plan(&extraction)
             .map_err(|error| error.to_string())?;
+        let mod_download_plan = core_resolve_curseforge_modpack_mod_download_plan(
+            &download_plan.archive_path,
+            &install_plan,
+            &directories,
+        )
+        .await
+        .map_err(|error| {
+            native_operation_failure_message("Modpack install failed", &error.to_string())
+        })?;
         let _ = cleanup_staged_modpack_archive(&download_plan.archive_path, &directories);
         (
             install_plan.profile,
             install_plan.loader_version,
-            install_plan.mod_download_plan,
+            mod_download_plan,
             Vec::new(),
         )
     } else if provider == "ftb_legacy" || provider == "ftb_private" {
@@ -9275,12 +9305,16 @@ mod tests {
             std::fs::read(&destination).expect("download should write destination"),
             body
         );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message
+                    == "Preparing files: 0 of 1 ready. Downloads are starting.")
+        );
         assert!(events
             .iter()
-            .any(|event| event.message == "Downloading Minecraft client"));
-        assert!(events
-            .iter()
-            .any(|event| event.message == "Minecraft client ready"));
+            .any(|event| event.message
+                == "Preparing files: 1 of 1 ready. Downloaded Minecraft client."));
         assert_eq!(
             events.last().map(|event| &event.kind),
             Some(&LauncherEventKind::Completed)
@@ -9291,11 +9325,15 @@ mod tests {
         }));
         let start_index = events
             .iter()
-            .position(|event| event.message == "Downloading Minecraft client")
+            .position(|event| {
+                event.message == "Preparing files: 0 of 1 ready. Downloads are starting."
+            })
             .expect("start event should be recorded");
         let done_index = events
             .iter()
-            .position(|event| event.message == "Minecraft client ready")
+            .position(|event| {
+                event.message == "Preparing files: 1 of 1 ready. Downloaded Minecraft client."
+            })
             .expect("done event should be recorded");
         assert!(start_index < done_index);
     }
@@ -9527,8 +9565,12 @@ mod tests {
         let registry = ProcessRegistry::new();
         let spawned = registry
             .spawn(ProcessCommandSpec {
-                executable: "cmd.exe".to_owned(),
-                args: vec!["/C".to_owned(), "ping -n 6 127.0.0.1 >NUL".to_owned()],
+                executable: "cmd".to_owned(),
+                args: vec![
+                    "/D".to_owned(),
+                    "/C".to_owned(),
+                    "for /L %i in (1,1,80000000) do @rem".to_owned(),
+                ],
                 working_dir: root.path().to_string_lossy().to_string(),
                 env: vec![shared::ProcessEnvVar {
                     key: "THEBOYSLAUNCHER_PROFILE_ID".to_owned(),
@@ -10447,7 +10489,8 @@ mod tests {
     fn backend_stop_managed_child_clears_running_child() {
         let mut command = if cfg!(windows) {
             let mut command = Command::new("cmd.exe");
-            command.args(["/C", "ping", "-n", "30", "127.0.0.1", ">NUL"]);
+            hide_backend_console_window(&mut command);
+            command.args(["/D", "/C", "for /L %i in (1,1,400000000) do @rem"]);
             command
         } else {
             let mut command = Command::new("sleep");

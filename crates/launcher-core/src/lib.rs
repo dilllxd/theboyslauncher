@@ -114,7 +114,7 @@ const JAVA_RUNTIME_MANIFEST_URL_ENV: &str = "THEBOYS_JAVA_RUNTIME_MANIFEST_URL";
 const PROCESS_OUTPUT_CAPACITY: usize = 1000;
 const JAVA_ARG_FILE_THRESHOLD_CHARS: usize = 24_000;
 #[cfg(windows)]
-const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
+const WINDOWS_WINDOWLESS_PROCESS_FLAGS: u32 = 0x08000000 | 0x00000008;
 const DOWNLOAD_MAX_ATTEMPTS: usize = 3;
 const DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DOWNLOAD_CONCURRENCY_ENV: &str = "THEBOYS_DOWNLOAD_CONCURRENCY";
@@ -1673,6 +1673,25 @@ pub fn build_curseforge_modpack_archive_install_plan(
     })
 }
 
+pub async fn resolve_curseforge_modpack_mod_download_plan(
+    archive_path: &Path,
+    plan: &CurseForgeModpackArchiveInstallPlan,
+    directories: &LauncherDirectories,
+) -> Result<DownloadPlan> {
+    let manifest = read_curseforge_modpack_manifest_from_archive(archive_path)?;
+    let profile_root = profile_data_dir(directories, &plan.profile.id)?;
+    let Ok(api_key) = curseforge_api_key() else {
+        return Ok(plan.mod_download_plan.clone());
+    };
+    build_curseforge_modpack_mod_download_plan_with_api(
+        &manifest,
+        &plan.profile.id,
+        &profile_root,
+        &api_key,
+    )
+    .await
+}
+
 pub fn extract_curseforge_modpack_archive(
     archive_path: &Path,
     plan: &CurseForgeModpackArchiveInstallPlan,
@@ -1828,6 +1847,177 @@ fn build_curseforge_modpack_mod_download_plan(
     Ok(DownloadPlan {
         version_id: format!("{profile_id}-curseforge-mods"),
         items,
+    })
+}
+
+async fn build_curseforge_modpack_mod_download_plan_with_api(
+    manifest: &CurseForgeModpackManifest,
+    profile_id: &str,
+    profile_root: &Path,
+    api_key: &str,
+) -> Result<DownloadPlan> {
+    let required_files = manifest
+        .files
+        .iter()
+        .filter(|file| file.required)
+        .collect::<Vec<_>>();
+    let file_ids = required_files
+        .iter()
+        .map(|file| file.file_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let resolved_files = fetch_curseforge_files(api_key, &file_ids).await?;
+    let mods_dir = profile_root.join("mods");
+    let mut items = Vec::new();
+    for file in required_files {
+        let item = if let Some(resolved) = resolved_files.get(&file.file_id) {
+            curseforge_manifest_download_item_from_resolved_file(
+                file,
+                resolved,
+                profile_root,
+                &mods_dir,
+            )?
+        } else {
+            curseforge_manifest_download_item(file, profile_root, &mods_dir)?
+        };
+        items.push(item);
+    }
+
+    Ok(DownloadPlan {
+        version_id: format!("{profile_id}-curseforge-mods"),
+        items,
+    })
+}
+
+async fn fetch_curseforge_files(
+    api_key: &str,
+    file_ids: &[u64],
+) -> Result<HashMap<u64, CurseForgeFileResponse>> {
+    let mut files = HashMap::new();
+    for chunk in file_ids.chunks(50) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let response = metadata_http_client()
+            .post(format!("{CURSEFORGE_API_BASE_URL}/mods/files"))
+            .header("User-Agent", THEBOYS_USER_AGENT)
+            .header("x-api-key", api_key)
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .json(&serde_json::json!({ "fileIds": chunk }))
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        ensure!(
+            status == 200,
+            "CurseForge file batch request failed with HTTP {status}"
+        );
+        let envelope = serde_json::from_str::<CurseForgeFilesEnvelope>(&body)?;
+        for file in envelope.data {
+            files.insert(file.id, file);
+        }
+    }
+    Ok(files)
+}
+
+fn curseforge_manifest_download_item(
+    file: &CurseForgeManifestFile,
+    profile_root: &Path,
+    mods_dir: &Path,
+) -> Result<DownloadItem> {
+    let url = curseforge_manifest_file_download_url(file)?;
+    let filename = curseforge_manifest_file_destination_name(file, &url)?;
+    curseforge_manifest_download_item_from_parts(
+        file.project_id,
+        file.file_id,
+        &filename,
+        &url,
+        None,
+        None,
+        None,
+        profile_root,
+        mods_dir,
+    )
+}
+
+fn curseforge_manifest_download_item_from_resolved_file(
+    manifest_file: &CurseForgeManifestFile,
+    resolved: &CurseForgeFileResponse,
+    profile_root: &Path,
+    mods_dir: &Path,
+) -> Result<DownloadItem> {
+    let file_name = resolved
+        .file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| manifest_file.file_name.as_deref().map(str::trim))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "CurseForge file {} is missing a resolved file name",
+                manifest_file.file_id
+            )
+        })?;
+    let url = resolved
+        .download_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .unwrap_or(curseforge_public_file_download_url(
+            manifest_file.project_id,
+            manifest_file.file_id,
+        )?);
+    let url = url.as_str();
+    validate_http_download_url(url)?;
+    ensure!(
+        url.starts_with("https://"),
+        "CurseForge mod file URL must use HTTPS"
+    );
+    curseforge_manifest_download_item_from_parts(
+        manifest_file.project_id,
+        manifest_file.file_id,
+        file_name,
+        url,
+        curseforge_file_hash(resolved, 1),
+        curseforge_file_hash(resolved, 2),
+        resolved.file_length,
+        profile_root,
+        mods_dir,
+    )
+}
+
+fn curseforge_manifest_download_item_from_parts(
+    project_id: u64,
+    file_id: u64,
+    file_name: &str,
+    url: &str,
+    sha1: Option<String>,
+    md5: Option<String>,
+    size: Option<u64>,
+    profile_root: &Path,
+    mods_dir: &Path,
+) -> Result<DownloadItem> {
+    ensure_safe_path_segment(file_name, "CurseForge mod filename")?;
+    let destination = mods_dir.join(file_name);
+    ensure!(
+        path_starts_with(&destination, profile_root),
+        "CurseForge mod destination is outside the profile directory"
+    );
+    Ok(DownloadItem {
+        id: format!("curseforge-mod-{project_id}-{file_id}"),
+        kind: DownloadKind::PackFile,
+        url: url.to_owned(),
+        sha1,
+        sha256: None,
+        sha512: None,
+        md5,
+        murmur2: None,
+        size,
+        destination: display_path(&destination),
     })
 }
 
@@ -4336,7 +4526,7 @@ fn process_output_tail(bytes: &[u8]) -> String {
 fn apply_windowless_child_process(command: &mut Command) {
     use std::os::windows::process::CommandExt;
 
-    command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+    command.creation_flags(WINDOWS_WINDOWLESS_PROCESS_FLAGS);
 }
 
 #[cfg(not(windows))]
@@ -6355,12 +6545,13 @@ fn player_facing_download_event_message(message: &str, subject_id: &str) -> Stri
     let Some((state, label)) = download_event_state_and_label(trimmed) else {
         return trimmed.to_owned();
     };
+    let (label, count_suffix) = download_event_label_and_count(label);
     let category = download_event_category(label, subject_id);
     match state {
-        DownloadEventState::Pending => format!("Waiting to download {category}"),
-        DownloadEventState::Started => format!("Downloading {category}"),
-        DownloadEventState::Finished => format!("{category} ready"),
-        DownloadEventState::Failed => format!("{category} failed"),
+        DownloadEventState::Pending => format!("Waiting to download {category}{count_suffix}"),
+        DownloadEventState::Started => format!("Downloading {category}{count_suffix}"),
+        DownloadEventState::Finished => format!("{category} ready{count_suffix}"),
+        DownloadEventState::Failed => format!("{category} failed{count_suffix}"),
     }
 }
 
@@ -6390,6 +6581,24 @@ fn download_event_state_and_label(message: &str) -> Option<(DownloadEventState, 
         }
     }
     None
+}
+
+fn download_event_label_and_count(label: &str) -> (&str, String) {
+    let trimmed = label.trim();
+    let Some((label, count)) = trimmed.rsplit_once(" [") else {
+        return (trimmed, String::new());
+    };
+    let Some(count) = count.strip_suffix(']') else {
+        return (trimmed, String::new());
+    };
+    if count
+        .split(" of ")
+        .all(|value| value.parse::<usize>().is_ok_and(|number| number > 0))
+    {
+        (label.trim(), format!(" ({count})"))
+    } else {
+        (trimmed, String::new())
+    }
 }
 
 fn download_event_category(label: &str, subject_id: &str) -> &'static str {
@@ -12680,22 +12889,24 @@ where
     let mut join_set = tokio::task::JoinSet::new();
     let mut next_index = 0usize;
     let mut completed = 0usize;
+    push_download_event(
+        &mut events,
+        &mut on_event,
+        download_operation_event(
+            operation_id,
+            plan,
+            LauncherEventKind::Downloading,
+            format!(
+                "Preparing files: 0 of {} ready. Downloads are starting.",
+                plan.items.len()
+            ),
+            Some(10),
+        ),
+    )?;
 
     while next_index < plan.items.len() || !join_set.is_empty() {
         while next_index < plan.items.len() && join_set.len() < concurrency {
             let item = plan.items[next_index].clone();
-            let start_progress = 10 + ((next_index * 10) / total) as u8;
-            push_download_event(
-                &mut events,
-                &mut on_event,
-                download_operation_event(
-                    operation_id,
-                    plan,
-                    LauncherEventKind::Downloading,
-                    format!("Downloading file: {}", download_item_label(&item)),
-                    Some(start_progress.min(20)),
-                ),
-            )?;
             let writer = writer.clone();
             join_set.spawn(async move {
                 let outcome = writer(item.clone()).await;
@@ -12710,7 +12921,8 @@ where
             .ok_or_else(|| anyhow!("download worker set ended unexpectedly"))?;
         let (item, outcome) = joined.map_err(|error| anyhow!("download worker failed: {error}"))?;
         completed += 1;
-        let progress = 20 + ((completed * 65) / total) as u8;
+        let progress = (20 + ((completed * 65) / total) as u8).min(85);
+        let category = download_item_category(&item, &plan.version_id);
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -12721,8 +12933,13 @@ where
                         operation_id,
                         plan,
                         LauncherEventKind::Failed,
-                        format!("Failed file: {}", download_item_label(&item)),
-                        Some(progress.min(85)),
+                        format!(
+                            "Preparing files failed after {} of {} files. Problem area: {}.",
+                            completed.saturating_sub(1),
+                            plan.items.len(),
+                            category
+                        ),
+                        Some(progress),
                     ),
                 )?;
                 return Err(download_artifact_error(&item, error));
@@ -12730,10 +12947,20 @@ where
         };
         let message = match outcome {
             DownloadOutcome::AlreadyPresent => {
-                format!("File already present: {}", download_item_label(&item))
+                format!(
+                    "Preparing files: {} of {} ready. Already had {}.",
+                    completed,
+                    plan.items.len(),
+                    category
+                )
             }
             DownloadOutcome::Downloaded => {
-                format!("Downloaded file: {}", download_item_label(&item))
+                format!(
+                    "Preparing files: {} of {} ready. Downloaded {}.",
+                    completed,
+                    plan.items.len(),
+                    category
+                )
             }
         };
         outcomes.insert(item.id.clone(), outcome);
@@ -12745,7 +12972,7 @@ where
                 plan,
                 LauncherEventKind::Downloading,
                 message,
-                Some(progress.min(85)),
+                Some(progress),
             ),
         )?;
     }
@@ -12963,6 +13190,31 @@ fn download_item_label(item: &DownloadItem) -> String {
             format_download_size(size)
         ),
         None => format!("{} ({})", item.id, download_kind_label(&item.kind)),
+    }
+}
+
+fn download_item_category(item: &DownloadItem, subject_id: &str) -> &'static str {
+    let subject = subject_id.to_ascii_lowercase();
+    let category = match item.kind {
+        DownloadKind::VersionJson => "Minecraft version metadata",
+        DownloadKind::ClientJar => "Minecraft client",
+        DownloadKind::AssetIndex | DownloadKind::AssetObject => "Minecraft assets",
+        DownloadKind::Library => "Minecraft libraries",
+        DownloadKind::NativeLibrary => "Minecraft native files",
+        DownloadKind::PackFile | DownloadKind::PreservedPackFile => "pack files",
+        DownloadKind::ModLoaderMetadata | DownloadKind::ModLoaderInstaller => "mod loader files",
+        DownloadKind::JavaRuntimeArchive => "Java files",
+    };
+    if matches!(category, "pack files" | "Minecraft libraries")
+        && (subject.contains("modloader")
+            || subject.contains("forge")
+            || subject.contains("neoforge")
+            || subject.contains("fabric")
+            || subject.contains("quilt"))
+    {
+        "mod loader files"
+    } else {
+        category
     }
 }
 
@@ -17317,7 +17569,11 @@ mod tests {
         #[cfg(windows)]
         let (executable, args) = (
             "cmd".to_owned(),
-            vec!["/C".to_owned(), "ping -n 6 127.0.0.1 >NUL".to_owned()],
+            vec![
+                "/D".to_owned(),
+                "/C".to_owned(),
+                "for /L %i in (1,1,80000000) do @rem".to_owned(),
+            ],
         );
         #[cfg(not(windows))]
         let (executable, args) = ("sh".to_owned(), vec!["-c".to_owned(), "sleep 5".to_owned()]);
@@ -17361,8 +17617,9 @@ mod tests {
         let (executable, args) = (
             "cmd".to_owned(),
             vec![
+                "/D".to_owned(),
                 "/C".to_owned(),
-                "echo live stdout && ping -n 4 127.0.0.1 >NUL".to_owned(),
+                "echo live stdout && for /L %i in (1,1,50000000) do @rem".to_owned(),
             ],
         );
         #[cfg(not(windows))]
@@ -22226,6 +22483,107 @@ hash = "1234"
     }
 
     #[test]
+    fn curseforge_manifest_resolved_file_builds_mod_download_item() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let profile_root = root.path().join("profiles/stoneblock-4");
+        let mods_dir = profile_root.join("mods");
+        let manifest_file = CurseForgeManifestFile {
+            project_id: 12345,
+            file_id: 67890,
+            file_name: None,
+            download_url: None,
+            required: true,
+        };
+        let resolved = CurseForgeFileResponse {
+            id: 67890,
+            display_name: Some("Example Mod".to_owned()),
+            file_name: Some("example-neoforge.jar".to_owned()),
+            file_length: Some(42),
+            download_url: Some(
+                "https://edge.forgecdn.net/files/67/890/example-neoforge.jar".to_owned(),
+            ),
+            game_versions: vec!["1.21.1".to_owned(), "NeoForge".to_owned()],
+            hashes: vec![
+                CurseForgeFileHashResponse {
+                    value: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                    algo: 1,
+                },
+                CurseForgeFileHashResponse {
+                    value: "0123456789abcdef0123456789abcdef".to_owned(),
+                    algo: 2,
+                },
+            ],
+        };
+
+        let item = curseforge_manifest_download_item_from_resolved_file(
+            &manifest_file,
+            &resolved,
+            &profile_root,
+            &mods_dir,
+        )
+        .expect("resolved CurseForge file should build a mod download item");
+
+        assert_eq!(item.id, "curseforge-mod-12345-67890");
+        assert_eq!(item.kind, DownloadKind::PackFile);
+        assert_eq!(
+            item.url,
+            "https://edge.forgecdn.net/files/67/890/example-neoforge.jar"
+        );
+        assert_eq!(
+            item.sha1.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            item.md5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(item.size, Some(42));
+        assert!(item
+            .destination
+            .ends_with("profiles/stoneblock-4/mods/example-neoforge.jar"));
+    }
+
+    #[test]
+    fn curseforge_manifest_resolved_file_falls_back_to_public_download_url() {
+        let root = tempfile::tempdir().expect("tempdir should be available");
+        let profile_root = root.path().join("profiles/stoneblock-4");
+        let mods_dir = profile_root.join("mods");
+        let manifest_file = CurseForgeManifestFile {
+            project_id: 448233,
+            file_id: 8287097,
+            file_name: None,
+            download_url: None,
+            required: true,
+        };
+        let resolved = CurseForgeFileResponse {
+            id: 8287097,
+            display_name: None,
+            file_name: Some("entityculling-neoforge-1.10.5-mc1.21.1.jar".to_owned()),
+            file_length: Some(123),
+            download_url: None,
+            game_versions: Vec::new(),
+            hashes: Vec::new(),
+        };
+
+        let item = curseforge_manifest_download_item_from_resolved_file(
+            &manifest_file,
+            &resolved,
+            &profile_root,
+            &mods_dir,
+        )
+        .expect("resolved CurseForge file without direct URL should use public fallback");
+
+        assert_eq!(
+            item.url,
+            "https://www.curseforge.com/api/v1/mods/448233/files/8287097/download"
+        );
+        assert!(item
+            .destination
+            .ends_with("profiles/stoneblock-4/mods/entityculling-neoforge-1.10.5-mc1.21.1.jar"));
+        assert_eq!(item.size, Some(123));
+    }
+
+    #[test]
     fn curseforge_exact_project_file_links_build_keyless_download_plan() {
         let root = tempfile::tempdir().expect("tempdir should be available");
         let directories = LauncherDirectories {
@@ -26201,7 +26559,13 @@ version = "safeVersion"
     #[cfg(windows)]
     #[test]
     fn windows_child_processes_use_no_console_creation_flag() {
-        assert_eq!(WINDOWS_CREATE_NO_WINDOW, 0x08000000);
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+
+        assert_eq!(
+            WINDOWS_WINDOWLESS_PROCESS_FLAGS,
+            CREATE_NO_WINDOW | DETACHED_PROCESS
+        );
     }
 
     #[test]
@@ -26476,7 +26840,7 @@ version = "safeVersion"
         let latest = wait_for_managed_process(
             &registry,
             summary.id,
-            120,
+            300,
             Duration::from_millis(25),
             |process| {
                 process.state == ManagedProcessState::Exited
@@ -26572,7 +26936,7 @@ version = "safeVersion"
         let output_update = (0..10)
             .map(|_| {
                 subscriber
-                    .recv_timeout(Duration::from_millis(250))
+                    .recv_timeout(Duration::from_millis(750))
                     .expect("process update should be broadcast")
             })
             .find(|update| {
