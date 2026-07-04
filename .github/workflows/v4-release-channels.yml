@@ -243,6 +243,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           THEBOYS_RELEASE_TAG: ${{ needs.resolve.outputs.channel == 'dev' && 'dev-latest' || needs.resolve.outputs.tag }}
           THEBOYS_UPDATER_MANIFEST_NAME: ${{ needs.resolve.outputs.manifest_name }}
+          THEBOYS_CURSEFORGE_API_KEY: ${{ secrets.THEBOYS_CURSEFORGE_API_KEY }}
           VITE_THEBOYS_RELEASE_CHANNEL: ${{ needs.resolve.outputs.channel }}
 
       - name: Smoke packaged executable

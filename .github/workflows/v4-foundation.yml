@@ -237,6 +237,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           THEBOYS_RELEASE_TAG: ${{ inputs.release_tag }}
+          THEBOYS_CURSEFORGE_API_KEY: ${{ secrets.THEBOYS_CURSEFORGE_API_KEY }}
 
       - name: Smoke packaged executable
         run: npm run smoke:packaged-exe -- --wait-ms 60000

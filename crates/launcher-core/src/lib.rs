@@ -8898,11 +8898,29 @@ pub async fn search_curseforge_modpacks(
         Ok(api_key) => api_key,
         Err(_) => return curseforge_keyless_search_results(query, limit),
     };
-    let limit = limit.clamp(1, 24).to_string();
+    if let Some(project_id) = curseforge_exact_project_id_query(query)? {
+        let response = metadata_http_client()
+            .get(format!("{CURSEFORGE_API_BASE_URL}/mods/{project_id}"))
+            .header("User-Agent", THEBOYS_USER_AGENT)
+            .header("x-api-key", api_key)
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        ensure!(
+            status == 200,
+            "CurseForge project request failed with HTTP {status}"
+        );
+        return Ok(vec![curseforge_search_result_from_project_json(&body)?]);
+    }
+    let limit = limit.clamp(1, 25).to_string();
     let mut url = reqwest::Url::parse(&format!("{CURSEFORGE_API_BASE_URL}/mods/search"))?;
     url.query_pairs_mut()
         .append_pair("gameId", "432")
         .append_pair("classId", "4471")
+        .append_pair("index", "0")
         .append_pair("pageSize", &limit)
         .append_pair("sortField", if query.is_empty() { "2" } else { "6" })
         .append_pair("sortOrder", "desc");
@@ -9201,6 +9219,13 @@ pub async fn fetch_curseforge_modpack_download_plan(
         request.provider.trim() == "curseforge",
         "only CurseForge provider installs are supported by this command right now"
     );
+    if let Ok(api_key) = curseforge_api_key() {
+        if let Some(plan) =
+            curseforge_api_download_plan_from_request(&api_key, request, directories).await?
+        {
+            return Ok(plan);
+        }
+    }
     if let Some(plan) = curseforge_exact_project_file_download_plan(request, directories)? {
         return Ok(plan);
     }
@@ -9211,7 +9236,21 @@ pub async fn fetch_curseforge_modpack_download_plan(
         return Ok(plan);
     }
     let api_key = curseforge_api_key()?;
-    let project_id = resolve_curseforge_project_id(&api_key, request.project_id.trim()).await?;
+    curseforge_api_download_plan_from_request(&api_key, request, directories)
+        .await?
+        .ok_or_else(|| anyhow!("CurseForge modpack has no downloadable client pack files"))
+}
+
+async fn curseforge_api_download_plan_from_request(
+    api_key: &str,
+    request: &InstallDiscoveredModpackRequest,
+    directories: &LauncherDirectories,
+) -> Result<Option<CurseForgeModpackDownloadPlan>> {
+    let project_id_or_slug = request.project_id.trim();
+    if project_id_or_slug.is_empty() {
+        return Ok(None);
+    }
+    let project_id = resolve_curseforge_project_id(api_key, project_id_or_slug).await?;
     ensure!(project_id > 0, "CurseForge project id is required");
     let file_id = request
         .version_id
@@ -9226,18 +9265,20 @@ pub async fn fetch_curseforge_modpack_download_plan(
         .transpose()?
         .unwrap_or(0);
     let file_url = if file_id > 0 {
-        format!("{CURSEFORGE_API_BASE_URL}/mods/{project_id}/files/{file_id}")
+        reqwest::Url::parse(&format!(
+            "{CURSEFORGE_API_BASE_URL}/mods/{project_id}/files/{file_id}"
+        ))?
     } else {
         let mut url = reqwest::Url::parse(&format!(
             "{CURSEFORGE_API_BASE_URL}/mods/{project_id}/files"
         ))?;
-        url.query_pairs_mut().append_pair("pageSize", "50");
-        url.to_string()
+        url.query_pairs_mut().append_pair("pageSize", "10000");
+        url
     };
     let response = metadata_http_client()
         .get(file_url)
         .header("User-Agent", THEBOYS_USER_AGENT)
-        .header("x-api-key", api_key)
+        .header("x-api-key", api_key.to_owned())
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
         .send()
@@ -9253,7 +9294,12 @@ pub async fn fetch_curseforge_modpack_download_plan(
     } else {
         curseforge_latest_modpack_file_from_files_json(&body)?
     };
-    curseforge_download_plan_from_file(project_id, request.name.as_deref(), &selected, directories)
+    Ok(Some(curseforge_download_plan_from_file(
+        project_id,
+        request.name.as_deref(),
+        &selected,
+        directories,
+    )?))
 }
 
 fn curseforge_exact_project_file_download_plan(
@@ -10161,46 +10207,73 @@ fn curseforge_search_results_from_json(
     json_text: &str,
 ) -> Result<Vec<DiscoverModpackSearchResult>> {
     let response = serde_json::from_str::<CurseForgeSearchResponse>(json_text)?;
-    let mut results = Vec::new();
-    for pack in response.data {
-        let latest_file = curseforge_select_latest_modpack_file(pack.latest_files.as_slice());
-        let latest_version_id = latest_file.map(|file| file.id.to_string());
-        let game_versions = latest_file
-            .map(|file| curseforge_file_game_versions(file))
-            .unwrap_or_else(|| curseforge_latest_indexes_game_versions(&pack.latest_files_indexes));
-        let loaders = latest_file
-            .map(|file| curseforge_file_loaders(file))
-            .unwrap_or_default();
-        results.push(DiscoverModpackSearchResult {
-            provider: "curseforge".to_owned(),
-            project_id: pack.id.to_string(),
-            slug: pack.slug,
-            title: pack.name,
-            description: pack
-                .summary
-                .filter(|summary| !summary.trim().is_empty())
-                .unwrap_or_else(|| "CurseForge modpack.".to_owned()),
-            author: pack
-                .authors
-                .first()
-                .map(|author| author.name.clone())
-                .unwrap_or_else(|| "CurseForge".to_owned()),
-            icon_url: pack
-                .logo
-                .as_ref()
-                .and_then(|logo| logo.thumbnail_url.clone().or_else(|| logo.url.clone())),
-            downloads: pack.download_count.unwrap_or_default(),
-            follows: 0,
-            game_versions,
-            loaders,
-            latest_version_id,
-            install_available: latest_file.is_some(),
-            install_note: Some(
-                "Installs CurseForge pack exports through the automatic zip importer.".to_owned(),
-            ),
-        });
+    Ok(response
+        .data
+        .into_iter()
+        .map(curseforge_mod_response_to_discover_result)
+        .collect())
+}
+
+fn curseforge_exact_project_id_query(query: &str) -> Result<Option<u64>> {
+    let Some(exact) = query.trim().strip_prefix('#').map(str::trim) else {
+        return Ok(None);
+    };
+    if exact.is_empty() {
+        return Ok(None);
     }
-    Ok(results)
+    let project_id = exact
+        .parse::<u64>()
+        .context("CurseForge exact project search must be a numeric #id")?;
+    ensure!(project_id > 0, "CurseForge project id is required");
+    Ok(Some(project_id))
+}
+
+fn curseforge_search_result_from_project_json(
+    json_text: &str,
+) -> Result<DiscoverModpackSearchResult> {
+    let response = serde_json::from_str::<CurseForgeModEnvelope>(json_text)?;
+    Ok(curseforge_mod_response_to_discover_result(response.data))
+}
+
+fn curseforge_mod_response_to_discover_result(
+    pack: CurseForgeModResponse,
+) -> DiscoverModpackSearchResult {
+    let latest_file = curseforge_select_latest_modpack_file(pack.latest_files.as_slice());
+    let latest_version_id = latest_file.map(|file| file.id.to_string());
+    let game_versions = latest_file
+        .map(|file| curseforge_file_game_versions(file))
+        .unwrap_or_else(|| curseforge_latest_indexes_game_versions(&pack.latest_files_indexes));
+    let loaders = latest_file
+        .map(|file| curseforge_file_loaders(file))
+        .unwrap_or_default();
+    DiscoverModpackSearchResult {
+        provider: "curseforge".to_owned(),
+        project_id: pack.id.to_string(),
+        slug: pack.slug,
+        title: pack.name,
+        description: pack
+            .summary
+            .filter(|summary| !summary.trim().is_empty())
+            .unwrap_or_else(|| "CurseForge modpack.".to_owned()),
+        author: pack
+            .authors
+            .first()
+            .map(|author| author.name.clone())
+            .unwrap_or_else(|| "CurseForge".to_owned()),
+        icon_url: pack
+            .logo
+            .as_ref()
+            .and_then(|logo| logo.thumbnail_url.clone().or_else(|| logo.url.clone())),
+        downloads: pack.download_count.unwrap_or_default(),
+        follows: 0,
+        game_versions,
+        loaders,
+        latest_version_id,
+        install_available: latest_file.is_some(),
+        install_note: Some(
+            "Installs CurseForge pack exports through the automatic zip importer.".to_owned(),
+        ),
+    }
 }
 
 fn curseforge_project_id_from_search_json(json_text: &str, slug: &str) -> Result<u64> {
@@ -15996,6 +16069,11 @@ struct ModrinthSearchHit {
 struct CurseForgeSearchResponse {
     #[serde(default)]
     data: Vec<CurseForgeModResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct CurseForgeModEnvelope {
+    data: CurseForgeModResponse,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -21987,6 +22065,59 @@ hash = "1234"
         .expect("CurseForge slug should resolve");
 
         assert_eq!(project_id, 890405);
+    }
+
+    #[test]
+    fn curseforge_exact_project_id_query_accepts_prism_style_hash_id() {
+        assert_eq!(
+            curseforge_exact_project_id_query("#890405").expect("exact project query should parse"),
+            Some(890405)
+        );
+        assert_eq!(
+            curseforge_exact_project_id_query("enigmatica").expect("non exact query should parse"),
+            None
+        );
+    }
+
+    #[test]
+    fn curseforge_project_response_builds_search_result_with_icon() {
+        let result = curseforge_search_result_from_project_json(
+            r#"{
+              "data": {
+                "id": 890405,
+                "name": "Enigmatica 9 Expert",
+                "slug": "enigmatica9expert",
+                "summary": "An expert pack.",
+                "downloadCount": 2400000,
+                "authors": [{ "name": "EnigmaticaModpacks" }],
+                "logo": {
+                  "title": "icon.png",
+                  "thumbnailUrl": "https://media.forgecdn.net/avatars/890/icon.png",
+                  "url": "https://media.forgecdn.net/avatars/890/full.png"
+                },
+                "latestFiles": [
+                  {
+                    "id": 5650506,
+                    "displayName": "1.27.0",
+                    "fileName": "Enigmatica9Expert-1.27.0.zip",
+                    "downloadUrl": "https://edge.forgecdn.net/files/5650/506/Enigmatica9Expert-1.27.0.zip",
+                    "gameVersions": ["1.19.2", "Forge"]
+                  }
+                ]
+              }
+            }"#,
+        )
+        .expect("CurseForge project response should parse");
+
+        assert_eq!(result.provider, "curseforge");
+        assert_eq!(result.project_id, "890405");
+        assert_eq!(result.slug, "enigmatica9expert");
+        assert_eq!(
+            result.icon_url.as_deref(),
+            Some("https://media.forgecdn.net/avatars/890/icon.png")
+        );
+        assert_eq!(result.latest_version_id.as_deref(), Some("5650506"));
+        assert!(result.install_available);
     }
 
     #[test]
