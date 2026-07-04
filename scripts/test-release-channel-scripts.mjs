@@ -1088,7 +1088,8 @@ function testTauriSecurityVerifierGuardsBackendConsoleSuppression() {
     "hide_backend_console_window(&mut command);",
     "std::os::windows::process::CommandExt",
     "CREATE_NO_WINDOW",
-    "command.creation_flags(CREATE_NO_WINDOW);",
+    "DETACHED_PROCESS",
+    "command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);",
     "packaged friends-service process console window",
   ]) {
     if (!verifier.includes(token)) {
@@ -1751,9 +1752,9 @@ function testPackagedExeSmokeChecksActivityProgressProbe() {
     "THEBOYS_PACKAGED_SMOKE_ACTIVITY_PROGRESS",
     "validatePackagedActivityProgressProbe",
     "packaged-activity-progress-smoke.json",
-    "Downloading Minecraft client",
-    "Minecraft assets ready",
-    "Downloading mod loader files",
+    "Preparing files: 0 of 3 ready. Downloads are starting.",
+    "Downloaded Minecraft assets.",
+    "Downloaded mod loader files.",
     "rawInternalTermsAbsent",
     "Activity progress:",
   ]) {

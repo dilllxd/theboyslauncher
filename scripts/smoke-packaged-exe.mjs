@@ -910,23 +910,28 @@ function validatePackagedActivityProgressProbe(rootPath) {
   if (probe?.operation !== "download_artifacts" || probe.subjectId !== "packaged-activity-progress") {
     throw new Error(`Packaged activity progress operation must be download_artifacts for packaged-activity-progress, received ${JSON.stringify(probe)}`);
   }
-  if (!Number.isInteger(probe.eventCount) || probe.eventCount < 9) {
+  if (!Number.isInteger(probe.eventCount) || probe.eventCount < 8) {
     throw new Error(`Packaged activity progress must record a live file event stream, received ${JSON.stringify(probe.eventCount)}`);
   }
   if (!Array.isArray(probe.messages)) {
     throw new Error("Packaged activity progress messages must be an array");
   }
   for (const expected of [
-    "Downloading Minecraft client",
-    "Minecraft client ready",
-    "Downloading Minecraft assets",
-    "Minecraft assets ready",
-    "Downloading mod loader files",
-    "mod loader files ready",
+    "Preparing files: 0 of 3 ready. Downloads are starting.",
+    "Checking downloaded files.",
     "Files are ready.",
   ]) {
     if (!probe.messages.includes(expected)) {
       throw new Error(`Packaged activity progress did not include ${JSON.stringify(expected)}: ${JSON.stringify(probe.messages)}`);
+    }
+  }
+  for (const expectedFragment of [
+    "Downloaded Minecraft client.",
+    "Downloaded Minecraft assets.",
+    "Downloaded mod loader files.",
+  ]) {
+    if (!probe.messages.some((message) => message.includes(expectedFragment))) {
+      throw new Error(`Packaged activity progress did not include ${JSON.stringify(expectedFragment)}: ${JSON.stringify(probe.messages)}`);
     }
   }
   if (probe.rawInternalTermsAbsent !== true) {
