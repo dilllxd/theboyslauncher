@@ -1651,6 +1651,41 @@ function capturedProcessOutputLines(capturedOutput) {
   );
 }
 
+function tailLines(text, maxLines = 80) {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  return lines.slice(-maxLines);
+}
+
+function formatSmokeFailureDiagnostics(rootPath, capturedOutput) {
+  const sections = [];
+  const processLines = capturedProcessOutputLines(capturedOutput).slice(-80);
+  if (processLines.length > 0) {
+    sections.push(
+      ["Captured packaged exe stdout/stderr:", ...processLines.map(({ streamName, line }) => `${streamName}: ${line}`)].join("\n"),
+    );
+  }
+  if (capturedOutput.truncated) {
+    sections.push("Captured packaged exe stdout/stderr was truncated after 64 KB.");
+  }
+
+  const logDir = resolve(rootPath, "logs");
+  const logFiles = listFilesRecursive(logDir)
+    .filter((path) => statSync(path).size > 0)
+    .sort();
+  if (logFiles.length > 0) {
+    const logSections = logFiles.slice(-5).map((path) => {
+      const lines = tailLines(readFileSync(path, "utf8"), 80);
+      return [`Launcher log tail ${path}:`, ...lines].join("\n");
+    });
+    sections.push(logSections.join("\n"));
+  }
+
+  if (sections.length === 0) {
+    return "";
+  }
+  return `\nSmoke failure diagnostics:\n${sections.join("\n\n")}`;
+}
+
 function validateNoSevereProcessOutput(capturedOutput) {
   if (capturedOutput.truncated) {
     throw new Error("Packaged startup wrote more than 64 KB to stdout/stderr; GUI release builds should not emit noisy console output.");
@@ -2032,6 +2067,12 @@ try {
     console.log("- Local social-backend started: no");
     console.log("- Local friends-service state created: no");
   }
+} catch (error) {
+  const diagnostics = formatSmokeFailureDiagnostics(options.rootPath, processOutput);
+  if (diagnostics) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)}${diagnostics}`, { cause: error });
+  }
+  throw error;
 } finally {
   await closeProcess(child.pid);
   await waitForExit(child, 5000);
